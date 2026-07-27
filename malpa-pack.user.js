@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Pack v3
 // @namespace    https://malpa.canary7.com
-// @version      3.3.82
+// @version      3.3.83
 // @updateURL    https://raw.githubusercontent.com/zaynnev/malpa3pl/main/malpa-pack.user.js
 // @downloadURL  https://raw.githubusercontent.com/zaynnev/malpa3pl/main/malpa-pack.user.js
 // @description  High-throughput packing station for Canary7 WMS — optimistic scanning, async API queue, dynamic profiles
@@ -88,23 +88,26 @@
     promise: null,
     byShipment: new Map(),
 
-    load() {
-      if (this.promise) return this.promise;
-      this.promise = new Promise(resolve => {
-        const finish = () => {
-          this.loaded = true;
-          resolve(this.byShipment);
-        };
-        const ingest = payload => {
-          const rows = payload?.data?.rows || payload?.result?.data?.rows || payload?.rows || [];
-          for (const r of rows || []) {
-            const shipment = normPackPromptValue(r?.[0]);
-            const label = r?.[1];
-            if (shipment && label) this.byShipment.set(shipment, String(label));
-          }
-          console.log(`[MalpaPack] Cached ${this.byShipment.size} expected carton labels`);
-        };
+    // v3.3.83: the lookup used to be a one-shot snapshot taken at tab-open — any
+    // shipment that entered C7 afterwards was permanently UNKNOWN until logout.
+    // These fields drive a guarded background refresh (see refresh() below).
+    available: false,          // did the last successful fetch return ≥ 1 row?
+    lastFetchOk: false,        // did the last fetch complete without error?
+    lastFetchAt: 0,            // Date.now() of the last fetch ATTEMPT (debounce)
+    _refreshPromise: null,     // single in-flight refresh guard
+    _notifiedUnavailable: false, // EventLog.err fired once per failure, not per render
+    REFRESH_MIN_MS: 60000,     // debounce — at most one refetch per 60s
 
+    // v3.3.83: one network call for card 581, shared by load() and refresh() so
+    // the fetch/payload-shape handling lives in a single place. Resolves with the
+    // raw rows array on success; rejects on network/timeout/parse failure. It is
+    // deliberately non-destructive — callers decide whether to rebuild the map.
+    _query() {
+      this.lastFetchAt = Date.now();
+      const parseRows = payload =>
+        payload?.data?.rows || payload?.result?.data?.rows || payload?.rows || [];
+
+      return new Promise((resolve, reject) => {
         if (typeof GM_xmlhttpRequest === 'function') {
           GM_xmlhttpRequest({
             method: 'POST',
@@ -117,12 +120,11 @@
             data: JSON.stringify({ parameters: [] }),
             timeout: 20000,
             onload: res => {
-              try { ingest(res.responseText ? JSON.parse(res.responseText) : null); }
-              catch (e) { console.warn('[MalpaPack] expected carton label load error:', e.message); }
-              finish();
+              try { resolve(parseRows(res.responseText ? JSON.parse(res.responseText) : null)); }
+              catch (e) { reject(e); }
             },
-            onerror: () => finish(),
-            ontimeout: () => finish(),
+            onerror: () => reject(new Error('network error')),
+            ontimeout: () => reject(new Error('timeout')),
           });
           return;
         }
@@ -137,11 +139,99 @@
           body: JSON.stringify({ parameters: [] }),
         })
           .then(r => r.json())
-          .then(ingest)
-          .catch(err => console.warn('[MalpaPack] expected carton label load error:', err.message))
-          .finally(finish);
+          .then(payload => resolve(parseRows(payload)))
+          .catch(reject);
       });
+    },
+
+    // v3.3.83: build a fresh Map from raw rows (never mutates byShipment).
+    _buildMap(rows) {
+      const list = rows || [];
+      const map = new Map();
+      for (const r of list) {
+        const shipment = normPackPromptValue(r?.[0]);
+        const label = r?.[1];
+        if (shipment && label) map.set(shipment, String(label));
+      }
+      // v3.3.83: Metabase /api/card/:id/query caps at ~2000 rows by default; an
+      // exact 2000 almost certainly means card 581 is being truncated at the tail.
+      if (list.length === 2000) {
+        console.warn('[MalpaPack] expected carton fetch returned exactly 2000 rows — Metabase row limit may be truncating card 581.');
+      }
+      return map;
+    },
+
+    // v3.3.83: surface a lookup failure to the operator ONCE (not per render).
+    _notifyUnavailable() {
+      if (this._notifiedUnavailable) return;
+      this._notifiedUnavailable = true;
+      try { EventLog.err('Expected carton lookup unavailable — scan the carton E-code from the label to close.'); }
+      catch (_) {}
+    },
+
+    // Initial bulk load — memoised exactly as before (short-circuits on promise).
+    load() {
+      if (this.promise) return this.promise;
+      this.promise = this._query()
+        .then(rows => {
+          this.byShipment = this._buildMap(rows);
+          this.lastFetchOk = true;
+          this.available = this.byShipment.size > 0;
+          console.log(`[MalpaPack] Cached ${this.byShipment.size} expected carton labels`);
+          if (this.available) this._notifiedUnavailable = false;
+          else this._notifyUnavailable(); // 0 rows = unusable lookup
+        })
+        .catch(e => {
+          // Non-destructive: byShipment stays the empty Map it started as.
+          this.lastFetchOk = false;
+          this.available = false;
+          console.warn('[MalpaPack] expected carton label load error:', e && e.message);
+          this._notifyUnavailable();
+        })
+        .then(() => {
+          this.loaded = true;
+          return this.byShipment;
+        });
       return this.promise;
+    },
+
+    // v3.3.83: re-query card 581 and REBUILD the map so shipments waved after
+    // tab-open resolve without a page reload. Guarded three ways:
+    //   • single in-flight — concurrent callers share one promise;
+    //   • debounced — at most one refetch per REFRESH_MIN_MS;
+    //   • never destructive — only swaps in the new map if it has ≥ 1 row; a
+    //     failed/empty refetch leaves existing entries intact and marks the
+    //     lookup unavailable. Does NOT touch load()'s `promise` semantics.
+    refresh() {
+      if (this._refreshPromise) return this._refreshPromise;
+      if (Date.now() - this.lastFetchAt < this.REFRESH_MIN_MS) return Promise.resolve(this.byShipment);
+      this._refreshPromise = this._query()
+        .then(rows => {
+          const next = this._buildMap(rows);
+          this.lastFetchOk = true;
+          if (next.size > 0) {
+            this.byShipment = next;
+            this.available = true;
+            this._notifiedUnavailable = false;
+            console.log(`[MalpaPack] Refreshed ${next.size} expected carton labels`);
+          } else {
+            // Empty result — keep the existing entries, mark unavailable.
+            this.available = false;
+            console.warn('[MalpaPack] expected carton refresh returned 0 rows — keeping existing lookup.');
+            this._notifyUnavailable();
+          }
+        })
+        .catch(e => {
+          this.lastFetchOk = false;
+          this.available = false;
+          console.warn('[MalpaPack] expected carton refresh error:', e && e.message);
+          this._notifyUnavailable();
+        })
+        .then(() => {
+          this._refreshPromise = null;
+          return this.byShipment;
+        });
+      return this._refreshPromise;
     },
 
     get(shipmentNumber) {
@@ -3903,6 +3993,7 @@ color: #b91c1c;
       ShipmentCache.loadFromGPC(containers);
       ShipmentCache.sourceContainerNo = Session.sibpSourceContainerNo;
       _shipmentGen++; // v3.3.80 — a new shipment is now active
+      refreshExpectedCartonForCurrentShipment(); // v3.3.83 — fire-and-forget; pick up post-tab-open shipments
 
       // Update ship badge with the real shipment number now that GPC has resolved
       updateShipBadge(ShipmentCache.shipmentHeader?.shipment_number || Session.sibpSourceContainerNo);
@@ -4104,6 +4195,7 @@ color: #b91c1c;
       ShipmentCache.loadFromGPC(containers);
       ShipmentCache.sourceContainerNo = containerNo;
       _shipmentGen++; // v3.3.80 — a new shipment is now active
+      refreshExpectedCartonForCurrentShipment(); // v3.3.83 — fire-and-forget; pick up post-tab-open shipments
 
       // Now we have the shipmentHeaderId — fetch open containers for this shipment
       const shipmentHeaderId = ShipmentCache.shipmentHeader?.id;
@@ -4670,6 +4762,39 @@ color: #b91c1c;
     return label;
   }
 
+  // v3.3.83: the expected-carton lookup is a snapshot taken at tab-open; shipments
+  // that entered C7 afterwards (client integrations wave new orders all shift) are
+  // absent from it, so the panel showed UNKNOWN until the operator logged out.
+  // Called on every shipment load: if the current shipment is missing, fire a
+  // debounced background refresh and repaint the panel when it lands. STRICTLY
+  // fire-and-forget — never awaited on the tote-scan critical path (see v3.3.81/82).
+  function refreshExpectedCartonForCurrentShipment() {
+    const sh = ShipmentCache.shipmentHeader || {};
+    const ji = ShipmentCache.jobInstruction || {};
+    const shipment =
+      sh.shipment_number ||
+      sh.shipment_no     ||
+      ji.reference_number ||
+      ji.job?.job_no;
+    if (!shipment) return;
+    // Hit — the snapshot already has it; nothing to do (the common case, O(1)).
+    if (ExpectedCartonCache.get(shipment)) return;
+
+    // Miss — log once per shipment, then fire the debounced refresh.
+    console.log(`[MalpaPack] expected carton miss for shipment ${shipment} (lookup size ${ExpectedCartonCache.byShipment.size}) — background refresh`);
+    const genAtTrigger = _shipmentGen; // v3.3.80 pattern — guard against a newer shipment
+    ExpectedCartonCache.refresh()
+      .then(() => {
+        // Repaint ONLY if this is still the current shipment AND no carton has been
+        // confirmed — a late updateCartonConfirmUI(confirmed=false) would otherwise
+        // knock a confirmed panel back to unconfirmed. Both guards are mandatory.
+        if (_shipmentGen !== genAtTrigger) return;
+        if (Session.confirmedCartonType !== null) return;
+        updateCartonConfirmUI();
+      })
+      .catch(() => {}); // a lookup failure must never break packing
+  }
+
   function getSuggestedCartonType() {
     const label = getExpectedCartonLabelForCurrentShipment();
     if (!label) return null;
@@ -4713,7 +4838,14 @@ color: #b91c1c;
 
   function updateCartonConfirmUI(ct = Session.confirmedCartonType || getSuggestedCartonType(), confirmed = false) {
     const expectedLabel = !confirmed ? getExpectedCartonLabelForCurrentShipment() : null;
-    const displayName = confirmed ? cartonLabel(ct) : (expectedLabel || 'UNKNOWN');
+    // v3.3.83: split the old single UNKNOWN into two honest states —
+    //   • lookup working but shipment absent → NOT IN LOOKUP
+    //   • lookup empty / failed to load      → LOOKUP UNAVAILABLE
+    // Both stay non-blocking: the operator can still scan the carton E-code to close.
+    let displayName;
+    if (confirmed) displayName = cartonLabel(ct);
+    else if (expectedLabel) displayName = expectedLabel;
+    else displayName = ExpectedCartonCache.available ? 'NOT IN LOOKUP' : 'LOOKUP UNAVAILABLE';
     if (R.expectedCartonName) R.expectedCartonName.textContent = displayName;
     if (R.expectedCartonDims) R.expectedCartonDims.textContent = ct ? cartonDimsLabel(ct) : 'Dimensions —';
     if (R.dimsSection) R.dimsSection.classList.toggle('mp-carton-confirmed', !!confirmed);
