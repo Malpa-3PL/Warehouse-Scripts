@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Pack v3
 // @namespace    https://malpa.canary7.com
-// @version      3.3.83
+// @version      3.3.84
 // @updateURL    https://raw.githubusercontent.com/zaynnev/malpa3pl/main/malpa-pack.user.js
 // @downloadURL  https://raw.githubusercontent.com/zaynnev/malpa3pl/main/malpa-pack.user.js
 // @description  High-throughput packing station for Canary7 WMS — optimistic scanning, async API queue, dynamic profiles
@@ -386,7 +386,9 @@
     if (res.status === 401) throw new Error('Session expired — please log in again.');
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
-      throw new Error(`${body.message || `API error ${res.status}`} [${res.status}]`);
+      const e = new Error(`${body.message || `API error ${res.status}`} [${res.status}]`);
+      e._body = body; e._status = res.status; // v3.3.84: carry full body so the consign path can surface real server detail
+      throw e;
     }
     return res.json();
   }
@@ -399,7 +401,9 @@
     if (res.status === 401) throw new Error('Session expired — please log in again.');
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
-      throw new Error(body.message || `API error ${res.status}`);
+      const e = new Error(body.message || `API error ${res.status}`);
+      e._body = body; e._status = res.status; // v3.3.84: carry full body so the consign path can surface real server detail
+      throw e;
     }
     return res.json();
   }
@@ -1465,13 +1469,9 @@
         console.log('[MalpaPack] SIBP pre-consigned carrier piece associated', tracking || consignmentId);
       })
       .catch(err => {
-        // Surface the error to the operator with validation context, same as
-        // the standard consign path — don't silently swallow SIBP failures.
-        const warnings = preConsignValidation();
-        if (warnings.length) {
-          throw new Error(`${err.message} — possible cause: ${warnings.join(' | ')}`);
-        }
-        throw err;
+        // v3.3.84: surface the server's ACTUAL error, same as the standard consign
+        // path — don't bury a specific carrier error under unrelated guesses.
+        throw annotateConsignError(err);
       });
   }
 
@@ -1509,6 +1509,52 @@
     return warnings;
   }
 
+  // v3.3.84: build the fullest human-readable error from a C7 API failure. C7 can
+  // return a generic top-level message ("No Print Route") while the real carrier /
+  // validation reason sits in a nested field (code / cause / errors / data). We
+  // surface all of it so the operator sees the ACTUAL failure, not a downstream
+  // symptom. Falls back to err.message when there is nothing richer.
+  function consignErrorDetail(err) {
+    const b = err && err._body;
+    if (!b || typeof b !== 'object') return (err && err.message) || 'Unknown error';
+    const parts = [];
+    if (b.message) parts.push(String(b.message));
+    const nested = b.cause || b.detail || b.errors || b.error || b.data;
+    if (nested != null) {
+      const s = typeof nested === 'string' ? nested : JSON.stringify(nested);
+      if (s && s !== '{}' && s !== '[]' && !parts.some(p => p.includes(s))) parts.push(s);
+    }
+    if (b.code != null && !parts.some(p => p.includes(String(b.code)))) parts.push(`(code ${b.code})`);
+    const out = (parts.length ? parts.join(' — ') : ((err && err.message) || 'Unknown error'))
+      .replace(/\s+/g, ' ').trim();
+    return out.length > 500 ? out.slice(0, 497) + '…' : out;
+  }
+
+  // v3.3.84: only C7's genuinely non-specific failures warrant the phone/email/
+  // weight heuristics. A specific carrier error must never be buried under guesses.
+  function isVagueConsignError(msg) {
+    const m = String(msg || '').toLowerCase().trim();
+    return !m
+      || m === 'no print route'
+      || /^api error \d+/.test(m)
+      || /^server error \d+/.test(m);
+  }
+
+  // v3.3.84: turn a raw consign failure into the operator-facing Error — real
+  // server detail first, phone/email/weight hints only when the server was vague.
+  // Also logs the raw error body to the console for DevTools diagnosis.
+  function annotateConsignError(err) {
+    if (err && err._body) {
+      try { console.warn('[MalpaPack] consign error body:', JSON.stringify(err._body)); } catch (_) {}
+    }
+    const detail = consignErrorDetail(err);
+    if (isVagueConsignError(detail)) {
+      const warnings = preConsignValidation();
+      if (warnings.length) return new Error(`${detail} — possible cause: ${warnings.join(' | ')}`);
+    }
+    return new Error(detail);
+  }
+
   function startPostCloseConsigning(consignmentId, closeResp = {}) {
     // SIBP is pre-consigned. Do not create pieces and do not call
     // set-carrier-piece-no here; live tests returned C7 500s for that endpoint.
@@ -1539,14 +1585,10 @@
         if (tracking) console.log('[MalpaPack] Tracking number assigned:', tracking);
       })
       .catch(err => {
-        // Consign failed — run validation checks to give operator a human-readable
-        // explanation of the likely cause before re-throwing to the caller.
-        // Validation only runs on failure — it never blocks a successful consign.
-        const warnings = preConsignValidation();
-        if (warnings.length) {
-          throw new Error(`${err.message} — possible cause: ${warnings.join(' | ')}`);
-        }
-        throw err;
+        // v3.3.84: surface the server's ACTUAL error (nested carrier detail and
+        // all), and only fall back to the phone/email/weight heuristics when C7's
+        // message is genuinely vague — never bury a specific carrier error.
+        throw annotateConsignError(err);
       });
   }
 
