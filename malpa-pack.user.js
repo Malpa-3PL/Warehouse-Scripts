@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Pack v3
 // @namespace    https://malpa.canary7.com
-// @version      3.3.84
+// @version      3.3.85
 // @updateURL    https://raw.githubusercontent.com/zaynnev/malpa3pl/main/malpa-pack.user.js
 // @downloadURL  https://raw.githubusercontent.com/zaynnev/malpa3pl/main/malpa-pack.user.js
 // @description  High-throughput packing station for Canary7 WMS — optimistic scanning, async API queue, dynamic profiles
@@ -83,6 +83,22 @@
     return String(v || '').toLowerCase().replace(/\s+/g, '').trim();
   }
 
+  // v3.3.85: OpenReplay only captures the page's fetch/XHR. The two GM_xmlhttpRequest
+  // calls in this script (Metabase card 581, Retool tote-detail proxy) run in the
+  // Tampermonkey sandbox and bypass it entirely, so they never appear in a session.
+  // Emit a breadcrumb for each: a structured console line (captured by OpenReplay's
+  // console plugin) plus a best-effort custom event if C7's tracker is exposed. Never
+  // logs headers or API keys, and is fully wrapped — a logging failure cannot break a call.
+  function orBreadcrumb(name, info) {
+    try {
+      const payload = Object.assign({ src: 'MalpaPack', gm_xhr: true }, info || {});
+      console.log(`[MalpaPack][net] ${name}`, payload);
+      const g = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+      const tracker = g && (g.OpenReplay || g.__OPENREPLAY__);
+      if (tracker && typeof tracker.event === 'function') tracker.event(`malpa_${name}`, payload);
+    } catch (_) {}
+  }
+
   const ExpectedCartonCache = {
     loaded: false,
     promise: null,
@@ -108,6 +124,7 @@
         payload?.data?.rows || payload?.result?.data?.rows || payload?.rows || [];
 
       return new Promise((resolve, reject) => {
+        const t0 = perfNow(); // v3.3.85: for the OpenReplay breadcrumb below
         if (typeof GM_xmlhttpRequest === 'function') {
           GM_xmlhttpRequest({
             method: 'POST',
@@ -120,11 +137,12 @@
             data: JSON.stringify({ parameters: [] }),
             timeout: 20000,
             onload: res => {
+              orBreadcrumb('metabase_card581', { status: res.status, ms: Math.round(perfNow() - t0) });
               try { resolve(parseRows(res.responseText ? JSON.parse(res.responseText) : null)); }
               catch (e) { reject(e); }
             },
-            onerror: () => reject(new Error('network error')),
-            ontimeout: () => reject(new Error('timeout')),
+            onerror: () => { orBreadcrumb('metabase_card581', { status: 0, error: 'network', ms: Math.round(perfNow() - t0) }); reject(new Error('network error')); },
+            ontimeout: () => { orBreadcrumb('metabase_card581', { status: 0, error: 'timeout', ms: Math.round(perfNow() - t0) }); reject(new Error('timeout')); },
           });
           return;
         }
@@ -1027,6 +1045,7 @@
 
     if (typeof GM_xmlhttpRequest === 'function') {
         return new Promise((resolve, reject) => {
+        const t0 = perfNow(); // v3.3.85: for the OpenReplay breadcrumb below
         GM_xmlhttpRequest({
           method: 'POST',
           url: RETOOL_TOTE_DETAILS_WORKFLOW_URL,
@@ -1034,7 +1053,8 @@
           data: JSON.stringify(body),
           timeout: 20000,
           onload: (res) => {
-                            let payload = null;
+            orBreadcrumb('retool_tote_details', { status: res.status, ms: Math.round(perfNow() - t0) });
+            let payload = null;
             try { payload = res.responseText ? JSON.parse(res.responseText) : null; }
             catch (_) { payload = res.responseText; }
             if (res.status < 200 || res.status >= 300) {
@@ -1043,8 +1063,8 @@
             }
             resolve(payload);
           },
-          onerror:   (e) => { console.error('[MalpaPack] retoolWorkflowRequest: onerror', e); reject(new Error('Retool workflow request failed')); },
-          ontimeout: ()  => { console.error('[MalpaPack] retoolWorkflowRequest: timeout'); reject(new Error('Retool workflow request timed out')); },
+          onerror:   (e) => { orBreadcrumb('retool_tote_details', { status: 0, error: 'network', ms: Math.round(perfNow() - t0) }); console.error('[MalpaPack] retoolWorkflowRequest: onerror', e); reject(new Error('Retool workflow request failed')); },
+          ontimeout: ()  => { orBreadcrumb('retool_tote_details', { status: 0, error: 'timeout', ms: Math.round(perfNow() - t0) }); console.error('[MalpaPack] retoolWorkflowRequest: timeout'); reject(new Error('Retool workflow request timed out')); },
         });
       });
     }
