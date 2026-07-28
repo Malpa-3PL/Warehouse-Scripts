@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Pack v3
 // @namespace    https://malpa.canary7.com
-// @version      3.3.85
+// @version      3.3.86
 // @updateURL    https://raw.githubusercontent.com/zaynnev/malpa3pl/main/malpa-pack.user.js
 // @downloadURL  https://raw.githubusercontent.com/zaynnev/malpa3pl/main/malpa-pack.user.js
 // @description  High-throughput packing station for Canary7 WMS — optimistic scanning, async API queue, dynamic profiles
@@ -1568,6 +1568,10 @@
       try { console.warn('[MalpaPack] consign error body:', JSON.stringify(err._body)); } catch (_) {}
     }
     const detail = consignErrorDetail(err);
+    // v3.3.86: breadcrumb so consign failures are findable in an OpenReplay session
+    // (console line + custom event) even when C7's tracker isn't capturing the fetch
+    // itself. gm_xhr:false — this goes through page fetch, unlike the two GM calls.
+    orBreadcrumb('consign_error', { status: (err && err._status) || 0, detail, gm_xhr: false });
     if (isVagueConsignError(detail)) {
       const warnings = preConsignValidation();
       if (warnings.length) return new Error(`${detail} — possible cause: ${warnings.join(' | ')}`);
