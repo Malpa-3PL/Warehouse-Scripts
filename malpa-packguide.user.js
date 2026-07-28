@@ -449,6 +449,7 @@
                 .tm-card-yellow { border-left-color: #f59e0b; }
                 .tm-card-red    { border-left-color: #ef4444; }
                 .tm-card-green  { border-left-color: #10b981; }
+                .tm-card-grey   { border-left-color: #9ca3af; }
 
                 .tm-icon-box {
                     width: 58px;
@@ -480,6 +481,11 @@
                     color: #10b981;
                 }
 
+                .tm-icon-grey {
+                    background: rgba(156,163,175,0.12);
+                    color: #6b7280;
+                }
+
                 .tm-icon { font-size: 28px; }
 
                 .tm-card-content { flex: 1; }
@@ -496,6 +502,7 @@
                 .tm-yellow-text { color: #f59e0b; }
                 .tm-red-text    { color: #ef4444; }
                 .tm-green-text  { color: #10b981; }
+                .tm-grey-text   { color: #6b7280; }
 
                 .tm-bullet-list {
                     margin: 0;
@@ -744,13 +751,28 @@
     ========================================================
     */
 
-    function formatBullets(text) {
+    // True only if the field has something a packer can actually read.
+    // Covers null, undefined, '', whitespace, and the string "null" that
+    // occasionally comes back from the workflow.
+    function hasContent(text) {
 
-        if (!text || !String(text).trim()) {
+        if (text === null || text === undefined) return false;
+
+        const t = String(text).trim();
+
+        return t !== '' && t.toLowerCase() !== 'null';
+    }
+
+    // fallback is what shows when the field is empty, for the cards that are
+    // always rendered (voidfill uses "N/A"). Cards that hide when empty never
+    // reach this branch.
+    function formatBullets(text, fallback) {
+
+        if (!hasContent(text)) {
 
             return `
                 <ul class="tm-bullet-list">
-                    <li>-</li>
+                    <li>${fallback || '-'}</li>
                 </ul>
             `;
         }
@@ -792,34 +814,40 @@
             select.value = key;
         }
 
-        const thankyouCard = guide.thankyou
-            ? `
-            <div class="tm-guide-card tm-card-green">
+        // Always render this card - a packer needs an explicit answer either
+        // way, so "false" shows "Not required" rather than nothing at all.
+        const thankyouTone = guide.thankyou ? 'green' : 'grey';
 
-                <div class="tm-icon-box tm-icon-green">
+        const thankyouText = guide.thankyou
+            ? 'Required - include a thank you card in every order'
+            : 'Not required - do not include a thank you card';
+
+        const thankyouCard = `
+            <div class="tm-guide-card tm-card-${thankyouTone}">
+
+                <div class="tm-icon-box tm-icon-${thankyouTone}">
                     <div class="tm-icon">💌</div>
                 </div>
 
                 <div class="tm-card-content">
 
-                    <div class="tm-card-label tm-green-text">
+                    <div class="tm-card-label tm-${thankyouTone}-text">
                         THANK YOU CARD
                     </div>
 
                     <ul class="tm-bullet-list">
-                        <li>Required - include a thank you card in every order</li>
+                        <li>${thankyouText}</li>
                     </ul>
 
                 </div>
 
             </div>
-            `
-            : '';
+        `;
 
-        container.innerHTML = `
-
-            ${thankyouCard}
-
+        // Considerations is null/blank for a lot of clients - drop the whole
+        // card rather than showing an empty "-" warning card.
+        const considerationsCard = hasContent(guide.considerations)
+            ? `
             <div class="tm-guide-card tm-card-red">
 
                 <div class="tm-icon-box tm-icon-red">
@@ -837,6 +865,38 @@
                 </div>
 
             </div>
+            `
+            : '';
+
+        // Packing method is blank for roughly a third of clients - hide the
+        // card rather than showing an empty one.
+        const packingMethodCard = hasContent(guide.packingMethod)
+            ? `
+            <div class="tm-guide-card">
+
+                <div class="tm-icon-box tm-icon-blue">
+                    <div class="tm-icon">📋</div>
+                </div>
+
+                <div class="tm-card-content">
+
+                    <div class="tm-card-label tm-blue-text">
+                        PACKING METHOD
+                    </div>
+
+                    ${formatBullets(guide.packingMethod)}
+
+                </div>
+
+            </div>
+            `
+            : '';
+
+        container.innerHTML = `
+
+            ${thankyouCard}
+
+            ${considerationsCard}
 
             <div class="tm-guide-card">
 
@@ -868,29 +928,13 @@
                         VOIDFILL
                     </div>
 
-                    ${formatBullets(guide.voidfill)}
+                    ${formatBullets(guide.voidfill, 'N/A')}
 
                 </div>
 
             </div>
 
-            <div class="tm-guide-card">
-
-                <div class="tm-icon-box tm-icon-blue">
-                    <div class="tm-icon">📋</div>
-                </div>
-
-                <div class="tm-card-content">
-
-                    <div class="tm-card-label tm-blue-text">
-                        PACKING METHOD
-                    </div>
-
-                    ${formatBullets(guide.packingMethod)}
-
-                </div>
-
-            </div>
+            ${packingMethodCard}
         `;
     }
 
