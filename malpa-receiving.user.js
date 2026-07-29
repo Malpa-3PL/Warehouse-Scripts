@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Receiving
 // @namespace    https://malpa.canary7.com
-// @version      2.2.0
+// @version      2.2.1
 // @description  Fast single-screen receiving for Canary7 WMS - TC51 optimised
 // @author       Malpa 3PL
 // @updateURL    https://raw.githubusercontent.com/zaynnev/malpa3pl/main/malpa-receiving.user.js
@@ -269,6 +269,18 @@
         padding:.55rem .75rem .7rem;
       }
 
+      /* With the native keyboard up the visible area is small - drop the header
+         and tighten every row so the live field and its context still fit. */
+      #mrc-root.compact .mrc-card-hdr,
+      #mrc-root.compact .mrc-prog { display:none; }
+      #mrc-root.compact .mrc-card-body { padding:.3rem .6rem .4rem; }
+      #mrc-root.compact .mrc-done { padding:2px 0; font-size:11px; }
+      #mrc-root.compact .mrc-fg { margin:.3rem 0 .2rem; }
+      #mrc-root.compact .mrc-static { padding:1px 0; }
+      #mrc-root.compact .mrc-keep { padding:3px 0 0; }
+      #mrc-root.compact .mrc-actions { padding:.3rem .6rem; }
+      #mrc-root.compact .mrc-btn { min-height:36px; }
+
       /* ---- completed rows: one compact line each, so the whole flow fits ---- */
       .mrc-done {
         display:flex; align-items:center; gap:7px; padding:4px 0;
@@ -479,15 +491,47 @@
     return !!p && p.classList.contains('active');
   }
 
+  // Size to the VISUAL viewport, not window.innerHeight. When Android's keyboard
+  // slides up, innerHeight often does not change - the visual viewport shrinks
+  // instead. Measuring the wrong one leaves the panel full height, so the browser
+  // scrolls the document to reach the focused field and the form disappears
+  // behind the keyboard. Tracking visualViewport keeps the form in the space
+  // above the keyboard, the way C7 behaves.
   function measureHeight() {
     const panel = document.getElementById('mrc-tab-view');
     if (!panel || !panel.classList.contains('active')) return;
-    const avail = Math.floor(window.innerHeight - panel.getBoundingClientRect().top);
-    if (avail > 100) {
-      panel.style.height = avail + 'px';
+    const vv = window.visualViewport;
+    const viewH  = vv ? vv.height : window.innerHeight;
+    const offset = vv ? vv.offsetTop : 0;
+    const top    = panel.getBoundingClientRect().top - offset;
+    const avail  = Math.floor(viewH - top);
+    if (avail > 80) {
+      panel.style.height    = avail + 'px';
       panel.style.maxHeight = avail + 'px';
       panel.style.minHeight = avail + 'px';
     }
+    // With the keyboard up there is very little room, so shed the chrome.
+    const root = document.getElementById('mrc-root');
+    if (root) root.classList.toggle('compact', avail < 330);
+  }
+
+  function attachViewportWatch() {
+    if (R._vvWatch) return;
+    R._vvWatch = () => measureHeight();
+    window.addEventListener('resize', R._vvWatch);
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', R._vvWatch);
+      window.visualViewport.addEventListener('scroll', R._vvWatch);
+    }
+  }
+  function detachViewportWatch() {
+    if (!R._vvWatch) return;
+    window.removeEventListener('resize', R._vvWatch);
+    if (window.visualViewport) {
+      window.visualViewport.removeEventListener('resize', R._vvWatch);
+      window.visualViewport.removeEventListener('scroll', R._vvWatch);
+    }
+    R._vvWatch = null;
   }
 
   function minimiseSelf() {
@@ -534,6 +578,25 @@
     tabBar.addEventListener('click', R._tabGuard, true);
   }
 
+  // The click guard only catches tab-BAR clicks. C7 also switches or opens tabs
+  // from the sidebar and programmatically, and those routes left our panel
+  // active and stacked on top of the real one. Watching tab-content for a
+  // sibling panel becoming active covers every route.
+  function attachPanelWatcher(tabContent) {
+    if (R._panelObs) return;
+    R._panelObs = new MutationObserver(() => {
+      const panel = document.getElementById('mrc-tab-view');
+      if (!panel || !panel.classList.contains('active')) return;
+      const actives = tabContent.querySelectorAll(':scope > tab.active, :scope > .tab-pane.active');
+      for (const p of actives) {
+        if (p !== panel) { minimiseSelf(); return; }
+      }
+    });
+    R._panelObs.observe(tabContent, {
+      attributes: true, attributeFilter: ['class'], childList: true, subtree: false,
+    });
+  }
+
   function buildShell() {
     if (document.getElementById('mrc-tab-view')) return;
     const tabBar     = document.querySelector('ul.nav.nav-tabs[role="tablist"]');
@@ -571,8 +634,9 @@
     R._brandWasMinimized   = document.body.classList.contains('brand-minimized');
 
     attachTabSwitchGuard(tabBar);
+    attachPanelWatcher(tabContent);
     activateSelf();
-    window.addEventListener('resize', measureHeight);
+    attachViewportWatch();
 
     Audio.init();
     render();
@@ -901,9 +965,21 @@
     return `<div class="mrc-fg"><label class="mrc-lbl">${label}</label>${inputHtml}${extra}</div>`;
   }
 
+  // True when focus is ours to take: either it is already inside our form, or
+  // nothing at all holds it. If the operator has tapped into a C7 field, the
+  // sidebar, or any other control, we must leave focus exactly where it is.
+  function focusIsOurs() {
+    const root = document.getElementById('mrc-root');
+    const a = document.activeElement;
+    if (!a || a === document.body || a === document.documentElement) return true;
+    return !!root && root.contains(a);
+  }
+
   function render() {
     const root = document.getElementById('mrc-root');
     if (!root) return;
+    // Decide BEFORE the rebuild wipes activeElement.
+    const mayFocus = focusIsOurs();
 
     const c       = State.cur;
     const hasRcpt = !!State.header;
@@ -1069,7 +1145,7 @@
       </div>`;
 
     wire(stage);
-    focusStage(stage);
+    if (mayFocus) focusStage(stage);
     setTimeout(measureHeight, 20);
   }
 
@@ -1622,13 +1698,15 @@
   // 13. FOCUS RECOVERY  (TC51 sleep / notification steals focus)
   // ---------------------------------------------------------------------------
 
+  // Recover the scan target after the TC51 sleeps or a notification steals
+  // focus. Deliberately timid: it only acts when NOTHING holds focus, so it can
+  // never pull the cursor out of a C7 field or another menu.
   function _refocus() {
     if (!isForeground()) return;
-    // Only reclaim focus if it has drifted off our form entirely - never fight
-    // the operator while they are in one of our fields.
+    const a = document.activeElement;
+    if (a && a !== document.body && a !== document.documentElement) return;
     const root = document.getElementById('mrc-root');
-    if (!root || root.contains(document.activeElement)) return;
-    const el = root.querySelector('input:not([disabled]), select:not([disabled])');
+    const el = root && root.querySelector('input:not([disabled]), select:not([disabled])');
     if (el) el.focus();
   }
 
@@ -1636,7 +1714,6 @@
     if (document.visibilityState === 'visible') setTimeout(_refocus, 300);
   });
   window.addEventListener('focus', () => setTimeout(_refocus, 200));
-  setInterval(() => { if (isForeground()) _refocus(); }, 2500);
 
   // ---------------------------------------------------------------------------
   // 14. CLOSE / KEYBOARD
@@ -1644,7 +1721,8 @@
 
   function closeUI() {
     document.removeEventListener('keydown', onGlobalKey);
-    window.removeEventListener('resize', measureHeight);
+    detachViewportWatch();
+    if (R._panelObs) { R._panelObs.disconnect(); R._panelObs = null; }
     Voice.cancel();
 
     if (!R._sidebarWasMinimized) document.body.classList.remove('sidebar-minimized');
