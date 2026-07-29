@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Receiving
 // @namespace    https://malpa.canary7.com
-// @version      2.2.4
+// @version      2.2.5
 // @description  Fast single-screen receiving for Canary7 WMS - TC51 optimised
 // @author       Malpa 3PL
 // @updateURL    https://raw.githubusercontent.com/zaynnev/malpa3pl/main/malpa-receiving.user.js
@@ -210,6 +210,7 @@
     failedItems: [],
     busy: null,        // label shown while an async step runs
     err: '',           // banner text
+    notice: '',        // sticky confirmation, e.g. a receipt closing
     fb: '',            // inline feedback under the active field
     fbType: 'dim',
     focusTarget: null, // element id to focus after the next render
@@ -217,7 +218,8 @@
     resetReceipt() {
       this.header = null; this.receiptId = ''; this.details = [];
       this.itemsById = {}; this.refMap = {}; this.cur = null;
-      this.done = 0; this.failedItems = []; this.err = ''; this.fb = ''; this.busy = null;
+      this.done = 0; this.failedItems = [];
+      this.err = ''; this.fb = ''; this.busy = null; this.notice = '';
     },
     resetLine() {
       this.cur = null; this.fb = ''; this.fbType = 'dim'; this.err = '';
@@ -364,6 +366,10 @@
         color:#c62828; font-size:12px; line-height:1.4;
       }
       .mrc-banner.info { background:#f0f8fd; border-color:#b8e4f5; color:#1a7fa8; }
+      .mrc-banner.ok {
+        background:#f1f9ec; border-color:#c6e5b3; color:#3d7a22;
+        font-size:14px; font-weight:500;
+      }
 
       /* ---- keep location: ONLY the box is a hit target, not the whole row ---- */
       .mrc-keep { display:flex; align-items:center; gap:8px; padding:7px 0 2px; }
@@ -1221,6 +1227,7 @@
         </div>
         <div class="mrc-prog"><div class="mrc-prog-fill" style="width:${pct}%"></div></div>
         <div class="mrc-card-body" id="mrc-body">
+          ${State.notice ? `<div class="mrc-banner ok">${_esc(State.notice)}</div>` : ''}
           ${State.err ? `<div class="mrc-banner">${_esc(State.err)}</div>` : ''}
           ${State.failedItems.length ? `<div class="mrc-banner">Could not load ${
             _esc(State.failedItems.join(', '))} - use the standard C7 window for those lines.</div>` : ''}
@@ -1439,7 +1446,7 @@
     const id = _normaliseScan(String(raw || '').trim()).toUpperCase();
     if (!id) return;
     State.busy = 'Loading receipt...';
-    State.err = ''; State.fb = '';
+    State.err = ''; State.fb = ''; State.notice = '';
     State.receiptId = id;
     render();
     try {
@@ -1809,15 +1816,24 @@
 
       State.busy = null;
       State.cur  = null;
+
       if (remaining <= 0) {
+        // Receipt is closed. Say so plainly and go back to the receipt prompt -
+        // leaving the item row up would invite scans against a finished receipt.
+        const num   = State.header?.receipt_num || State.receiptId;
+        const lines = totalDetailLines();
         Audio.chime('receipt_done');
         Voice.speak('Receipt complete');
         if (navigator.vibrate) navigator.vibrate([30, 50, 30, 50, 60]);
-        say(`Receipt complete - ${linesCompleted()} of ${totalDetailLines()} lines received`, 'ok');
+        State.resetReceipt();
+        State.notice = `${num} closed - all ${lines} line${lines === 1 ? '' : 's'} received. ` +
+                       `Scan the next receipt.`;
       } else {
         say(`Checked in ${qty} ${uomLabel} to ${locRec.location_code}`, 'ok');
       }
       flash('ok');
+      // Lands on the item row with the receipt still open, or on the receipt
+      // row once it has closed - either way the next scan has a home.
       render();
     } catch (err) {
       console.error('[MalpaRecv] checkin failed:', err);
