@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Malpa Receiving
 // @namespace    https://malpa.canary7.com
-// @version      2.1.0
-// @description  Fast receiving interface for Canary7 WMS - TC51 optimised
+// @version      2.2.0
+// @description  Fast single-screen receiving for Canary7 WMS - TC51 optimised
 // @author       Malpa 3PL
 // @updateURL    https://raw.githubusercontent.com/zaynnev/malpa3pl/main/malpa-receiving.user.js
 // @downloadURL  https://raw.githubusercontent.com/zaynnev/malpa3pl/main/malpa-receiving.user.js
@@ -22,27 +22,26 @@
   const WMS_BASE     = 'https://malpa.canary7.com/inbound/api/wms/v1/';
   const WAREHOUSE_ID = 10;
 
-  // Receiving profile is ALWAYS Putaway (one-step: check in + locate together).
-  // Matched by receiving_process === 3, name fallback 'Putaway'.
+  // Receiving profile is ALWAYS Putaway (one step: check in + locate together).
   const PUTAWAY_PROCESS_ID = 3;
-
-  // Storage location class - the only class an operator may put away into.
-  const STORAGE_CLASS_ID = 1;
-
+  // Storage class - the only class an operator may put away into.
+  const STORAGE_CLASS_ID   = 1;
   // The location endpoint pages at 20 rows unless per-page is supplied.
   const LOCATION_PAGE_SIZE = 200;
 
-  // QUANTITY SEMANTICS - confirmed against a live factor-6 receive:
-  // the `quantity` sent to checkin is in BASE units, NOT in the selected UoM.
-  // A 100-each line received as 10 cartons (factor 6) posts quantity=60 with
-  // item_unit_of_measure_id set to the carton UoM, and the line's open_quantity
-  // drops 100 -> 40. So the operator types base units, and when the selected UoM
-  // has factor > 1 that number must divide evenly by the factor.
+  // A locating rule that returns location_code 'NEW' means the item has no
+  // existing home - do not suggest anything, make the operator scan a bin.
+  const NO_LOCATION_TOKENS = ['new', 'n/a', 'none', ''];
 
-  // The receipt_detail object C7 expects inside the checkin body - EXACTLY these keys.
-  // The header expand hangs a nested `item` (and friends) off each detail; sending
-  // that back would bloat the payload and can trip C7's model validation, so the
-  // detail is whitelisted down to these fields before every write.
+  // QUANTITY SEMANTICS - confirmed against a live factor-6 receive:
+  // `quantity` on checkin is in BASE units, NOT in the selected UoM. A 100-each
+  // line received as 10 cartons (factor 6) posts quantity=60 with the carton
+  // item_unit_of_measure_id, and open_quantity drops 100 -> 40. So the number
+  // must divide evenly by the factor whenever that factor is > 1.
+
+  // The receipt_detail object C7 expects inside the checkin body - EXACTLY these
+  // keys. The header expand hangs a nested `item` off each detail; sending that
+  // back bloats the payload and can trip C7's validation.
   const DETAIL_KEYS = [
     'id', 'receipt_header_id', 'item_id', 'quantity', 'erp_order_line_number',
     'receipt_date', 'created_at', 'updated_at', 'created_by', 'updated_by',
@@ -58,11 +57,8 @@
     return out;
   }
 
-  // Locating-rule responses that mean "no existing home for this item".
-  const NO_LOCATION_TOKENS = ['new', 'n/a', 'none', ''];
-
   // ---------------------------------------------------------------------------
-  // 1. AUTH + API LAYER   (lifted from Malpa Pick 4.9.0 - same session plumbing)
+  // 1. AUTH + API
   // ---------------------------------------------------------------------------
 
   function getToken() {
@@ -86,18 +82,14 @@
         for (let i = 0; i < store.length; i++) {
           const key = store.key(i);
           const val = store.getItem(key);
-          if (
-            key &&
-            (key.toLowerCase().includes('session') || key.toLowerCase().includes('shift')) &&
-            val && /^\d+$/.test(val.trim())
-          ) {
+          if (key && (key.toLowerCase().includes('session') || key.toLowerCase().includes('shift')) &&
+              val && /^\d+$/.test(val.trim())) {
             _sessionId = val.trim();
             return;
           }
         }
       } catch (_) {}
     }
-    // Steal x-session-id off the next Angular XHR
     if (!window._mrcXHRPatched) {
       window._mrcXHRPatched = true;
       const origSet = XMLHttpRequest.prototype.setRequestHeader;
@@ -127,27 +119,18 @@
   async function waitForSession() {
     if (_sessionId) return;
     captureSessionId();
-    for (let i = 0; i < 5 && !_sessionId; i++) {
-      await new Promise(r => setTimeout(r, 50));
-    }
+    for (let i = 0; i < 5 && !_sessionId; i++) await new Promise(r => setTimeout(r, 50));
   }
 
   async function _handle(res) {
-    if (res.status === 401) {
-      _showSessionExpired();
-      throw new Error('Session expired');
-    }
-    if (res.status === 404) {
-      const e = new Error('Not found');
-      e.notFound = true;
-      throw e;
-    }
+    if (res.status === 401) { _showSessionExpired(); throw new Error('Session expired'); }
+    if (res.status === 404) { const e = new Error('Not found'); e.notFound = true; throw e; }
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
       const e = new Error(body.message || `API error ${res.status}`);
       // C7 returns business rejections as a 500 carrying a numeric `code`
-      // (e.g. 1087 "Multiple Items not allowed in this location"). Those are
-      // deterministic refusals, NOT transport failures - never retry them.
+      // (e.g. 1087 "Multiple Items not allowed in this location"). Deterministic
+      // refusals, not transport failures - never retry them.
       if (body.code !== undefined && body.code !== null) e.c7Code = body.code;
       e.httpStatus = res.status;
       throw e;
@@ -159,15 +142,12 @@
     await waitForSession();
     return _handle(await fetch(API_BASE + path, { method: 'GET', headers: mkHeaders() }));
   }
-
   async function apiPost(path, data) {
     await waitForSession();
     return _handle(await fetch(API_BASE + path, {
       method: 'POST', headers: mkHeaders(), body: JSON.stringify(data),
     }));
   }
-
-  // Second Canary7 surface - location master lives here, not on index.php?r=
   async function wmsGet(path) {
     await waitForSession();
     return _handle(await fetch(WMS_BASE + path, { method: 'GET', headers: mkHeaders() }));
@@ -179,28 +159,21 @@
     _sessionExpiredShown = true;
     const root = document.getElementById('mrc-root');
     if (!root) return;
-    const banner = document.createElement('div');
-    banner.style.cssText = [
-      'position:absolute;inset:0;z-index:9999;background:rgba(0,0,0,.78)',
-      'display:flex;flex-direction:column;align-items:center;justify-content:center',
-      'padding:24px;gap:14px;text-align:center',
-    ].join(';');
-    banner.innerHTML = `
-      <div style="font-size:20px;font-weight:700;color:#fff">LOCKED</div>
-      <div style="font-size:18px;font-weight:700;color:#fff">Session Expired</div>
+    const b = document.createElement('div');
+    b.style.cssText = 'position:absolute;inset:0;z-index:9999;background:rgba(0,0,0,.78);' +
+      'display:flex;flex-direction:column;align-items:center;justify-content:center;' +
+      'padding:24px;gap:14px;text-align:center';
+    b.innerHTML = `
+      <div style="font-size:18px;font-weight:500;color:#fff">Session expired</div>
       <div style="font-size:13px;color:rgba(255,255,255,.75);line-height:1.5">
         Your C7 session has timed out.<br>Log back in to continue receiving.
       </div>
-      <button id="mrc-session-dismiss" style="margin-top:8px;padding:12px 24px;background:#20a8d8;
-        color:#fff;border:none;font-size:15px;font-weight:600;font-family:Roboto,sans-serif;
-        cursor:pointer;border-radius:4px;">Dismiss</button>`;
+      <button id="mrc-sess-x" style="margin-top:8px;padding:11px 22px;background:#20a8d8;color:#fff;
+        border:none;font-size:14px;font-family:Roboto,sans-serif;cursor:pointer">Dismiss</button>`;
     root.style.position = 'relative';
-    root.appendChild(banner);
-    document.getElementById('mrc-session-dismiss')?.addEventListener('click', () => {
-      banner.remove();
-      _sessionExpiredShown = false;
-      State.resetReceipt();
-      renderReceiptEntry();
+    root.appendChild(b);
+    document.getElementById('mrc-sess-x')?.addEventListener('click', () => {
+      b.remove(); _sessionExpiredShown = false; State.resetReceipt(); render();
     });
   }
 
@@ -209,24 +182,20 @@
   // ---------------------------------------------------------------------------
 
   const State = {
-    screen: 'RECEIPT_ENTRY',
+    profile:   null,
+    header:    null,
+    receiptId: '',
+    details:   [],
 
-    profile:   null,   // Putaway receiving profile
-    header:    null,   // receipt header record
-    receiptId: '',     // exactly what the operator scanned, uppercased
-    companyId: null,
-    details:   [],     // receiptDetails, open_quantity maintained locally
-
-    // Caches - each fetched ONCE per receipt / per session
-    itemsById:  {},    // item_id  -> item (with itemUnitOfMeasures expanded)
-    refMap:     {},    // barcode/ref lower -> { itemId, uomId }
-    locByCode:  {},    // LOCATION-CODE -> location record
+    itemsById:  {},
+    refMap:     {},
+    locByCode:  {},
     locsLoaded: false,
 
-    // Current line being received
-    cur: null,         // { detail, item, uom, qty, batchNo, expiry, location, suggested }
+    // The line being received. null until an item is verified.
+    // { detail, item, uom, qty, batchNo, expiry, location, locResolved, viaKeep }
+    cur: null,
 
-    // Keep Location - overrides the suggestion with the last location used
     keepLocation: (() => {
       try { return sessionStorage.getItem('mrc_keeploc') === '1'; } catch (_) { return false; }
     })(),
@@ -237,341 +206,224 @@
       catch (_) { return true; }
     })(),
 
-    done: 0,           // check-ins performed against this receipt
-    totalLines: 0,     // open lines at load - stable progress denominator
-    linesDone: new Set(), // detail ids driven fully to zero (accurate line count)
-    failedItems: [],   // item codes whose verify call failed - must be surfaced
+    done: 0,
+    failedItems: [],
+    busy: null,        // label shown while an async step runs
+    err: '',           // banner text
+    fb: '',            // inline feedback under the active field
+    fbType: 'dim',
+    focusTarget: null, // element id to focus after the next render
 
     resetReceipt() {
-      this.header = null;
-      this.receiptId = '';
-      this.companyId = null;
-      this.details = [];
-      this.itemsById = {};
-      this.refMap = {};
-      this.cur = null;
-      this.done = 0;
-      this.totalLines = 0;
-      this.linesDone = new Set();
-      this.failedItems = [];
-      // keepLocation / lastLocation / voice deliberately persist
+      this.header = null; this.receiptId = ''; this.details = [];
+      this.itemsById = {}; this.refMap = {}; this.cur = null;
+      this.done = 0; this.failedItems = []; this.err = ''; this.fb = ''; this.busy = null;
+    },
+    resetLine() {
+      this.cur = null; this.fb = ''; this.fbType = 'dim'; this.err = '';
     },
   };
 
-  let R = {};   // live DOM refs
+  let R = {};
 
   // ---------------------------------------------------------------------------
-  // 3. CSS
+  // 3. CSS  (C7's own form tokens: .form-control padding .5rem .75rem,
+  //          border 1px #e1e6ef, focus #8ad4ee, readonly bg #e1e6ef,
+  //          .card-header bg #f9f9fa, heading #374767)
   // ---------------------------------------------------------------------------
 
   function injectCSS() {
     if (document.getElementById('mrc-styles')) return;
-    const style = document.createElement('style');
-    style.id = 'mrc-styles';
-    style.textContent = `
+    const s = document.createElement('style');
+    s.id = 'mrc-styles';
+    s.textContent = `
       #mrc-tab-view {
-        display:flex; flex-direction:column;
-        height:calc(100vh - 55px); max-height:100vh;
-        overflow:hidden; background:#fff; padding:0; position:relative;
+        display:flex; flex-direction:column; height:calc(100vh - 55px);
+        max-height:100vh; overflow:hidden; background:#f0f3f6; padding:0; position:relative;
       }
       #mrc-root {
-        flex:1; display:flex; flex-direction:column; overflow:hidden;
-        font-family:Roboto,sans-serif; font-size:.875rem; color:#384042;
-        box-sizing:border-box; min-width:0; justify-content:flex-start;
+        flex:1; display:flex; flex-direction:column; overflow:hidden; min-width:0;
+        font-family:Roboto,sans-serif; font-size:.875rem; color:#374767; box-sizing:border-box;
       }
       #mrc-root *, #mrc-root *::before, #mrc-root *::after { box-sizing:border-box; }
-      #mrc-root input[inputmode="none"] { caret-color:transparent; -webkit-user-select:text; user-select:text; }
+
+      /* ---- card ---- */
+      .mrc-card {
+        flex:1; min-height:0; display:flex; flex-direction:column;
+        background:#fff; border:1px solid #e1e6ef;
+      }
+      .mrc-card-hdr {
+        flex-shrink:0; display:flex; align-items:center; gap:8px;
+        padding:.5rem .75rem; background:#f9f9fa; border-bottom:1px solid #e1e6ef;
+      }
+      .mrc-card-title { font-size:14px; font-weight:500; color:#374767; flex-shrink:0; }
+      .mrc-card-meta {
+        flex:1; text-align:right; font-size:11px; color:#9faecb; font-weight:500;
+        white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+      }
+      .mrc-prog { height:2px; background:#e1e6ef; flex-shrink:0; }
+      .mrc-prog-fill { height:2px; background:#20a8d8; transition:width .3s ease; }
+
+      .mrc-card-body {
+        flex:1; min-height:0; overflow-y:auto; -webkit-overflow-scrolling:touch;
+        padding:.55rem .75rem .7rem;
+      }
+
+      /* ---- completed rows: one compact line each, so the whole flow fits ---- */
+      .mrc-done {
+        display:flex; align-items:center; gap:7px; padding:4px 0;
+        border-bottom:1px solid #f2f4f8; font-size:12px; line-height:1.3;
+      }
+      .mrc-done-lbl { color:#9faecb; flex-shrink:0; }
+      .mrc-done-val {
+        color:#374767; font-weight:500; flex:1; min-width:0;
+        overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+      }
+      .mrc-done-val.emph { color:#b5551d; }
+      .mrc-pencil {
+        flex-shrink:0; border:none; background:transparent; color:#20a8d8;
+        font-size:14px; line-height:1; padding:2px 4px; cursor:pointer;
+        -webkit-tap-highlight-color:transparent; touch-action:manipulation;
+      }
+      .mrc-pencil:active { color:#1985ac; }
+
+      /* ---- active form group (C7 .form-group / label / .form-control) ---- */
+      .mrc-fg { margin:.5rem 0 .35rem; }
+      .mrc-lbl { display:block; margin-bottom:.3rem; font-size:12px; color:#5d7d9a; }
+      .mrc-fc {
+        display:block; width:100%; padding:.5rem .75rem; font-size:.875rem;
+        line-height:1.25; color:#374767; background:#fff; background-image:none;
+        border:1px solid #e1e6ef; border-radius:0; outline:none;
+        transition:border-color .15s ease-in-out; font-family:Roboto,sans-serif;
+        -webkit-tap-highlight-color:transparent;
+      }
+      .mrc-fc:focus { border-color:#8ad4ee; }
+      .mrc-fc::placeholder { color:#c0cadd; }
+      .mrc-fc[readonly], .mrc-fc:disabled { background:#e1e6ef; opacity:1; }
+      .mrc-fc.big { font-size:19px; font-weight:500; min-height:44px; letter-spacing:.02em; }
+      .mrc-fc.qty { font-size:22px; font-weight:500; min-height:46px; color:#b5551d; }
+      .mrc-fc.nolocation { border:1px solid #ff5454; background:#fff8f8; }
+      select.mrc-fc {
+        -webkit-appearance:none; appearance:none; cursor:pointer; min-height:38px;
+        background:#fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%239faecb' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E") no-repeat right 10px center;
+      }
+
+      .mrc-static { font-size:12px; color:#374767; padding:3px 0; line-height:1.35; }
+      .mrc-static b { font-weight:500; }
+      .mrc-static .v { color:#b5551d; }
+
+      .mrc-fb { font-size:12px; font-weight:500; min-height:16px; padding-top:3px; }
+      .mrc-fb.ok { color:#4a9c2d; } .mrc-fb.err { color:#e03131; } .mrc-fb.dim { color:#9faecb; }
+
+      .mrc-warn-red {
+        font-size:12px; font-weight:500; color:#e03131; padding:2px 0 4px; letter-spacing:.01em;
+      }
+      .mrc-banner {
+        padding:7px 10px; margin:0 0 .5rem; background:#fff5f5; border:1px solid #ffcdd2;
+        color:#c62828; font-size:12px; line-height:1.4;
+      }
+      .mrc-banner.info { background:#f0f8fd; border-color:#b8e4f5; color:#1a7fa8; }
+
+      /* ---- keep location ---- */
+      .mrc-keep {
+        display:flex; align-items:center; gap:8px; padding:6px 0 2px; cursor:pointer;
+        -webkit-tap-highlight-color:transparent; touch-action:manipulation;
+      }
+      .mrc-keep-box {
+        width:17px; height:17px; border:1px solid #9faecb; flex-shrink:0;
+        display:flex; align-items:center; justify-content:center;
+        font-size:12px; line-height:1; color:#fff;
+      }
+      .mrc-keep.on .mrc-keep-box { border-color:#20a8d8; background:#20a8d8; }
+      .mrc-keep-txt { font-size:12px; color:#374767; }
+      .mrc-keep-sub { font-size:11px; color:#9faecb; }
 
       /* ---- buttons ---- */
-      #mrc-root .mrc-btn {
-        display:inline-flex; align-items:center; justify-content:center;
-        min-height:44px; padding:.5rem 1rem; font-size:.875rem; font-weight:400;
-        font-family:Roboto,sans-serif; border:1px solid transparent; border-radius:0;
-        cursor:pointer; transition:all .2s ease-in-out; white-space:nowrap; width:100%;
-        -webkit-tap-highlight-color:transparent; touch-action:manipulation; text-align:center;
-      }
-      #mrc-root .mrc-btn:active { opacity:.85; }
-      #mrc-root .mrc-btn-primary   { background:#20a8d8; border-color:#20a8d8; color:#fff; }
-      #mrc-root .mrc-btn-primary:disabled { opacity:.55; cursor:not-allowed; }
-      #mrc-root .mrc-btn-secondary { background:#fff; border-color:#e1e6ef; color:#384042; }
-      #mrc-root .mrc-btn-danger    { background:#ff5454; border-color:#ff5454; color:#fff; }
-
-      #mrc-root .mrc-input {
-        display:block; width:100%; padding:.5rem .75rem; font-size:16px;
-        font-family:Roboto,sans-serif; color:#020202; background:#fff;
-        border:1px solid #e1e6ef; border-radius:0; outline:none; min-height:44px;
-        transition:border-color .15s ease-in-out; -webkit-tap-highlight-color:transparent;
-      }
-      #mrc-root .mrc-input:focus { border-color:#8ad4ee; }
-      #mrc-root .mrc-input::placeholder { color:#c0cadd; }
-      #mrc-root .mrc-input.big {
-        font-size:30px; font-weight:700; text-align:center; min-height:56px; letter-spacing:.04em;
-      }
-      #mrc-root .mrc-input.nolocation { border:2px solid #ff5454; background:#fff8f8; }
-
-      #mrc-root .mrc-select {
-        display:block; width:100%; min-height:44px; padding:.5rem .75rem; font-size:15px;
-        font-family:Roboto,sans-serif; color:#020202; border:1px solid #e1e6ef;
-        border-radius:0; outline:none; -webkit-appearance:none; appearance:none; cursor:pointer;
-        background:#fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%239faecb' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E") no-repeat right 12px center;
-      }
-      #mrc-root .mrc-select:focus { border-color:#8ad4ee; }
-
-      /* ---- sidebar nav ---- */
-      #mrc-nav-li { order:-1; }
-      #mrc-nav {
-        display:flex !important; align-items:center; gap:10px; padding:10px 12px;
-        color:#79c447 !important; font-weight:500; cursor:pointer; transition:background .1s;
-        text-decoration:none !important; position:relative;
-      }
-      #mrc-nav:hover { background:rgba(121,196,71,.10); }
-      #mrc-nav .mrc-nav-icon {
-        width:20px; height:20px; flex-shrink:0; border-radius:4px; overflow:hidden;
-        display:flex; align-items:center; justify-content:center;
-      }
-      #mrc-nav .mrc-nav-label { font-size:17px; font-weight:500; }
-
-      /* ---- generic screen frame (never scrolls) ---- */
-      /* position:relative keeps the keyboard and modal overlays inside the screen
-         area, so the action bar underneath stays visible and tappable. */
-      .mrc-screen {
-        flex:1; min-height:0; display:flex; flex-direction:column; overflow:hidden;
-        background:#f5f7fa; position:relative;
-      }
-      .mrc-hdr { background:#20a8d8; padding:8px 14px 7px; flex-shrink:0; }
-      .mrc-hdr.green  { background:#3a8f3a; }
-      .mrc-hdr.amber  { background:#d18700; }
-      .mrc-hdr.red    { background:#d13b3b; }
-      .mrc-hdr-top {
-        display:flex; align-items:center; justify-content:space-between; margin-bottom:3px; gap:6px;
-      }
-      .mrc-hdr-label {
-        font-size:10px; font-weight:600; color:rgba(255,255,255,.72);
-        text-transform:uppercase; letter-spacing:.08em;
-      }
-      .mrc-hdr-right { display:flex; align-items:center; gap:6px; flex-shrink:0; }
-      .mrc-hdr-prog { font-size:10px; font-weight:600; color:rgba(255,255,255,.72); letter-spacing:.04em; }
-      .mrc-hdr-code {
-        font-size:22px; font-weight:700; color:#fff; letter-spacing:.03em; line-height:1.1;
-        white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
-      }
-      .mrc-hdr-sub { font-size:10px; color:rgba(255,255,255,.72); font-weight:500; margin-top:1px; }
-      .mrc-prog-track { height:3px; background:rgba(255,255,255,.25); width:100%; margin-top:6px; border-radius:2px; }
-      .mrc-prog-fill  { height:3px; background:#fff; transition:width .35s ease; min-width:3px; border-radius:2px; }
-
-      .mrc-voice {
-        display:inline-flex; align-items:center; justify-content:center;
-        width:30px; height:26px; border:none; border-radius:4px;
-        background:rgba(255,255,255,.18); color:#fff; font-size:14px; cursor:pointer;
-        -webkit-tap-highlight-color:transparent; touch-action:manipulation; flex-shrink:0;
-      }
-      .mrc-voice.muted { opacity:.45; background:rgba(0,0,0,.15); }
-
-      /* ---- item block ---- */
-      .mrc-item {
-        padding:10px 14px 8px; flex-shrink:0; background:#fff; border-bottom:1px solid #e1e6ef;
-        display:flex; flex-direction:column; align-items:center; text-align:center;
-      }
-      .mrc-item.verified { background:#f0fff4; border-bottom-color:#79c447; }
-      .mrc-item-sku { font-size:16px; font-weight:700; color:#384042; letter-spacing:.01em; }
-      .mrc-item-desc {
-        font-size:11px; color:#9faecb; font-weight:500; margin-top:1px; line-height:1.25;
-        max-height:2.5em; overflow:hidden;
-      }
-      .mrc-open-row { display:flex; gap:16px; margin-top:6px; align-items:flex-end; }
-      .mrc-open-cell { display:flex; flex-direction:column; align-items:center; }
-      .mrc-open-lbl {
-        font-size:9px; font-weight:600; color:#9faecb; letter-spacing:.08em; text-transform:uppercase;
-      }
-      .mrc-open-val { font-size:26px; font-weight:700; color:#384042; line-height:1.05; }
-      .mrc-open-val.hi { color:#20a8d8; }
-
-      /* ---- body / scan zone ---- */
-      .mrc-body {
-        flex:1; min-height:0; display:flex; flex-direction:column;
-        justify-content:center; padding:10px 16px; gap:8px; overflow:hidden;
-      }
-      .mrc-zone {
-        width:100%; border:2px dashed #20a8d8; background:#f0f8fd; border-radius:6px;
-        padding:12px 14px; display:flex; flex-direction:column; align-items:center; gap:5px;
-        position:relative;
-      }
-      .mrc-zone.amber { border-color:#e0a300; background:#fffbef; }
-      .mrc-zone.red   { border-color:#ff5454; background:#fff5f5; }
-      .mrc-zone-lbl {
-        font-size:11px; font-weight:700; color:#20a8d8; text-transform:uppercase; letter-spacing:.1em;
-      }
-      .mrc-zone.amber .mrc-zone-lbl { color:#ba8a00; }
-      .mrc-zone.red   .mrc-zone-lbl { color:#d13b3b; }
-      .mrc-arrows { font-size:20px; color:#b8dff5; letter-spacing:4px; line-height:1; }
-      .mrc-hidden-in {
-        position:absolute; width:1px; height:1px; opacity:0; top:0; left:0;
-        caret-color:transparent; -webkit-user-select:text; user-select:text;
-      }
-      .mrc-fb { font-size:12px; font-weight:600; min-height:17px; text-align:center; }
-      .mrc-fb.ok { color:#79c447; } .mrc-fb.err { color:#ff5454; } .mrc-fb.dim { color:#9faecb; }
-
-      .mrc-field-lbl {
-        font-size:11px; font-weight:600; color:#9faecb; text-transform:uppercase;
-        letter-spacing:.07em; margin-bottom:-2px;
-      }
-      .mrc-warn-red {
-        font-size:12px; font-weight:700; color:#ff5454; text-align:center; letter-spacing:.02em;
-      }
-
-      /* ---- keep-location pill ---- */
-      .mrc-keep {
-        display:flex; align-items:center; justify-content:center; gap:8px;
-        padding:8px 12px; border:1px solid #e1e6ef; background:#fff; cursor:pointer;
-        -webkit-tap-highlight-color:transparent; touch-action:manipulation; flex-shrink:0;
-      }
-      .mrc-keep.on { border-color:#79c447; background:#f0fff4; }
-      .mrc-keep-box {
-        width:18px; height:18px; border:2px solid #9faecb; border-radius:3px; flex-shrink:0;
-        display:flex; align-items:center; justify-content:center; font-size:13px;
-        font-weight:700; color:#fff; line-height:1;
-      }
-      .mrc-keep.on .mrc-keep-box { border-color:#79c447; background:#79c447; }
-      .mrc-keep-txt { font-size:13px; font-weight:600; color:#384042; }
-      .mrc-keep-sub { font-size:11px; color:#9faecb; font-weight:500; }
-
-      /* ---- action bar ---- */
       .mrc-actions {
-        display:flex; gap:8px; padding:7px 14px 9px; flex-shrink:0;
-        border-top:1px solid #e1e6ef; background:#fff;
+        flex-shrink:0; display:flex; gap:6px; padding:.5rem .75rem;
+        background:#f9f9fa; border-top:1px solid #e1e6ef;
       }
-      .mrc-actions .mrc-btn { flex:1; min-height:44px; font-size:13px; padding:0 8px; }
+      .mrc-btn {
+        flex:1; min-height:42px; display:inline-flex; align-items:center; justify-content:center;
+        padding:.5rem .75rem; font-size:13px; font-family:Roboto,sans-serif;
+        border:1px solid transparent; border-radius:0; cursor:pointer; white-space:nowrap;
+        -webkit-tap-highlight-color:transparent; touch-action:manipulation;
+      }
+      .mrc-btn:active { opacity:.85; }
+      .mrc-btn-primary { background:#20a8d8; border-color:#20a8d8; color:#fff; }
+      .mrc-btn-primary:disabled { opacity:.5; cursor:not-allowed; }
+      .mrc-btn-secondary { background:#fff; border-color:#e1e6ef; color:#374767; }
+      .mrc-btn-danger { background:#ff5454; border-color:#ff5454; color:#fff; }
 
       /* ---- overlays ---- */
-      /* Top-aligned so the docked keyboard never covers the modal's input. */
       .mrc-ov {
-        position:absolute; inset:0; background:rgba(0,0,0,.62); display:flex;
+        position:absolute; inset:0; background:rgba(0,0,0,.6); display:flex;
         align-items:flex-start; justify-content:center; z-index:200; padding:14px;
       }
-      .mrc-ov-card { background:#fff; width:100%; border-radius:8px; overflow:hidden; }
-      .mrc-ov-hdr {
-        padding:11px 15px; font-size:14px; font-weight:700; color:#fff; background:#ff5454;
-      }
-      .mrc-ov-body { padding:15px; font-size:13px; color:#384042; line-height:1.5; }
-      .mrc-ov-body strong { color:#ff5454; font-weight:700; }
-      .mrc-ov-acts { display:flex; flex-direction:column; gap:8px; padding:0 15px 15px; }
+      .mrc-ov-card { background:#fff; width:100%; border:1px solid #e1e6ef; }
+      .mrc-ov-hdr { padding:10px 14px; font-size:14px; font-weight:500; color:#fff; background:#ff5454; }
+      .mrc-ov-body { padding:14px; font-size:13px; color:#374767; line-height:1.5; }
+      .mrc-ov-body strong { color:#e03131; font-weight:500; }
+      .mrc-ov-acts { display:flex; flex-direction:column; gap:6px; padding:0 14px 14px; }
 
-      /* ---- edit-location pencil ---- */
-      .mrc-edit {
-        display:inline-flex; align-items:center; justify-content:center;
-        width:30px; height:26px; border:none; border-radius:4px; flex-shrink:0;
-        background:rgba(255,255,255,.20); color:#fff; font-size:14px; cursor:pointer;
+      .mrc-voice {
+        flex-shrink:0; border:none; background:transparent; color:#9faecb;
+        font-size:15px; padding:2px 4px; cursor:pointer; line-height:1;
         -webkit-tap-highlight-color:transparent; touch-action:manipulation;
       }
-      .mrc-edit:active { background:rgba(255,255,255,.42); }
-      .mrc-hdr-code-row { display:flex; align-items:center; gap:8px; }
-      .mrc-hdr-code-row .mrc-hdr-code { flex:1; min-width:0; }
-
-      /* ---- on-screen keyboard: docked strip, NOT a full-screen takeover ----
-         No dark backdrop and no oversized display of its own - it sits at the
-         bottom of the screen area and the field it is editing stays visible and
-         readable above it. .kb-open pads the body so nothing gets covered. */
-      .mrc-kb-ov {
-        position:absolute; left:0; right:0; bottom:0; z-index:300;
-      }
-      .mrc-kb {
-        width:100%; background:#fff; border-top:1px solid #d8dee9;
-        border-radius:8px 8px 0 0; padding:5px 6px 6px;
-        display:flex; flex-direction:column; gap:3px;
-        box-shadow:0 -2px 10px rgba(0,0,0,.14);
-      }
-      .mrc-kb-bar {
-        display:flex; align-items:center; justify-content:space-between;
-        padding:0 2px 3px; gap:8px;
-      }
-      .mrc-kb-bar-lbl {
-        font-size:10px; font-weight:600; color:#9faecb;
-        text-transform:uppercase; letter-spacing:.08em;
-        white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
-      }
-      .mrc-kb-hide {
-        border:none; background:#eef2f7; color:#5b6b82; font-size:11px;
-        font-weight:600; font-family:Roboto,sans-serif; padding:3px 9px;
-        border-radius:4px; cursor:pointer; flex-shrink:0;
-        -webkit-tap-highlight-color:transparent; touch-action:manipulation;
-      }
-      .mrc-kb-row { display:flex; gap:3px; }
-      .mrc-kb-key {
-        flex:1; min-width:0; height:34px; display:flex; align-items:center;
-        justify-content:center; font-size:16px; font-weight:600; color:#384042;
-        background:#f5f7fa; border:none; border-radius:4px; cursor:pointer;
-        font-family:Roboto,sans-serif; -webkit-tap-highlight-color:transparent;
-        touch-action:manipulation; -webkit-user-select:none; user-select:none;
-      }
-      .mrc-kb-key:active { background:#20a8d8; color:#fff; }
-      .mrc-kb-key.del  { background:#fff0f0; color:#d13b3b; }
-      .mrc-kb-key.mode { background:#eef2f7; color:#5b6b82; font-size:12px; }
-      .mrc-kb-key.go   { background:#20a8d8; color:#fff; flex:2.2; font-size:14px; }
-      .mrc-kb-key.go:active { background:#1985ac; }
-      /* Numeric layout has 3 columns, so the keys can afford to be taller. */
-      .mrc-kb-num .mrc-kb-key { height:40px; font-size:20px; }
-      /* Keep the live field clear of the docked keyboard. */
-      .mrc-screen.kb-open .mrc-body { padding-bottom:var(--kb-h, 190px); }
-      @keyframes mrc-blink { 50% { opacity:0; } }
+      .mrc-voice.muted { opacity:.45; }
 
       .mrc-flash {
         position:absolute; inset:0; z-index:9999; opacity:0; pointer-events:none;
         transition:opacity .06s ease-in;
       }
-      .mrc-flash.ok  { background:#79c447; }
-      .mrc-flash.err { background:#ff5454; }
+      .mrc-flash.ok { background:#79c447; } .mrc-flash.err { background:#ff5454; }
 
-      .mrc-spinner {
-        display:inline-block; width:20px; height:20px; border:2px solid #e1e6ef;
+      .mrc-spin {
+        display:inline-block; width:15px; height:15px; border:2px solid #e1e6ef;
         border-top-color:#20a8d8; border-radius:50%; animation:mrc-spin .7s linear infinite;
-        flex-shrink:0;
+        vertical-align:-2px; margin-right:6px;
       }
       @keyframes mrc-spin { to { transform:rotate(360deg); } }
-      .mrc-loading {
-        flex:1; display:flex; align-items:center; justify-content:center; gap:10px;
-        color:#9faecb; font-size:13px;
+
+      /* ---- sidebar nav ---- */
+      #mrc-nav-li { order:-1; }
+      #mrc-nav {
+        display:flex !important; align-items:center; gap:10px; padding:10px 12px;
+        color:#79c447 !important; font-weight:500; cursor:pointer;
+        text-decoration:none !important;
       }
-      .mrc-err-banner {
-        margin:0 14px; padding:9px 13px; background:#fff5f5; border:1px solid #ffcdd2;
-        color:#c62828; font-size:12px; flex-shrink:0; line-height:1.4;
-      }
-      .mrc-spacer { flex:1; min-height:6px; max-height:20px; }
-      .mrc-center {
-        flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center;
-        gap:9px; text-align:center; padding:16px; overflow:hidden;
-      }
+      #mrc-nav:hover { background:rgba(121,196,71,.10); }
+      #mrc-nav .mrc-nav-label { font-size:17px; font-weight:500; }
     `;
-    document.head.appendChild(style);
+    document.head.appendChild(s);
   }
 
   // ---------------------------------------------------------------------------
-  // 4. NAV INJECTION
+  // 4. NAV
   // ---------------------------------------------------------------------------
 
   const NAV_ICON = 'data:image/svg+xml;utf8,' + encodeURIComponent(
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><rect width="20" height="20" rx="4" fill="#79c447"/>` +
     `<path d="M4 13.5V7l3 2.6L10 7l3 2.6L16 7v6.5" fill="none" stroke="#fff" stroke-width="1.7" ` +
-    `stroke-linecap="round" stroke-linejoin="round"/></svg>`
-  );
+    `stroke-linecap="round" stroke-linejoin="round"/></svg>`);
 
-  let _navClickAttached = false;
-  function _attachNavClickListener() {
-    if (_navClickAttached) return;
-    _navClickAttached = true;
+  let _navClick = false;
+  function attachNavClick() {
+    if (_navClick) return;
+    _navClick = true;
     document.addEventListener('click', (e) => {
       const nav = document.getElementById('mrc-nav');
-      if (!nav) return;
-      if (nav === e.target || nav.contains(e.target)) openReceiving();
+      if (nav && (nav === e.target || nav.contains(e.target))) openReceiving();
     }, true);
   }
 
   let _prefetched = false;
   function injectNav() {
-    _attachNavClickListener();
+    attachNavClick();
     if (document.getElementById('mrc-nav')) return;
     const ul = document.querySelector('div.sidebar nav ul.nav');
     if (!ul) return;
-
     const li = document.createElement('li');
     li.id = 'mrc-nav-li';
     li.className = 'nav-item ng-star-inserted';
@@ -579,14 +431,12 @@
     a.id = 'mrc-nav';
     a.className = 'nav-link ng-star-inserted';
     a.setAttribute('href', 'javascript:void(0)');
-    a.innerHTML =
-      `<span class="mrc-nav-icon"><img src="${NAV_ICON}" style="width:20px;height:20px"/></span>` +
+    a.innerHTML = `<span style="width:20px;height:20px;display:flex;flex-shrink:0">` +
+      `<img src="${NAV_ICON}" style="width:20px;height:20px"/></span>` +
       `<span class="mrc-nav-label">Malpa Receiving</span>`;
     li.appendChild(a);
     ul.insertBefore(li, ul.firstChild);
 
-    // Warm the profile + location caches while the operator is still on C7,
-    // so the very first receipt loads with zero cold-start cost.
     if (!_prefetched) {
       _prefetched = true;
       setTimeout(() => { loadProfile().catch(() => {}); loadLocations().catch(() => {}); }, 600);
@@ -594,34 +444,13 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 5. SHELL
+  // 5. TAB SHELL
   // ---------------------------------------------------------------------------
+  // C7's panels have to be hidden with an inline style while we are in front,
+  // but an inline style BEATS the .active class - so if one is left behind,
+  // clicking that C7 tab shows a blank panel. Every panel we touch is recorded
+  // and restored exactly, both when stepping aside and when closing.
 
-  // True only when our tab is built AND in front of C7's tabs.
-  function isForeground() {
-    const p = document.getElementById('mrc-tab-view');
-    return !!p && p.classList.contains('active');
-  }
-
-  function measureHeight() {
-    const panel = document.getElementById('mrc-tab-view');
-    if (!panel || !panel.classList.contains('active')) return;
-    const rect = panel.getBoundingClientRect();
-    const available = Math.floor(window.innerHeight - rect.top);
-    if (available > 100) {
-      panel.style.height    = available + 'px';
-      panel.style.maxHeight = available + 'px';
-      panel.style.minHeight = available + 'px';
-    }
-  }
-
-  // --- C7 panel bookkeeping -------------------------------------------------
-  // We hide C7's own tab panels while our tab is in front. That has to be done
-  // with an inline style (class removal alone is not reliable across C7's tab
-  // markup), but an inline style BEATS the .active class - so if it is left
-  // behind, clicking any other C7 tab shows a blank panel: Angular adds .active
-  // and our display:none quietly wins. Every panel we touch is recorded here and
-  // put back exactly as found, both when stepping aside and when closing.
   let _hiddenPanels = [];
 
   function hideC7Panels(tabContent) {
@@ -632,31 +461,38 @@
       p.style.display = 'none';
     });
   }
-
-  // Hand display control back to C7's stylesheet.
   function restoreC7Panels() {
     for (const rec of _hiddenPanels) {
       if (document.contains(rec.el)) rec.el.style.display = rec.display;
     }
     _hiddenPanels = [];
   }
-
   function _setTabActive(li, on) {
     if (!li) return;
     li.classList.toggle('active', on);
     const a = li.querySelector('a.nav-link');
-    if (a) {
-      a.classList.toggle('active', on);
-      a.setAttribute('aria-selected', on ? 'true' : 'false');
+    if (a) { a.classList.toggle('active', on); a.setAttribute('aria-selected', on ? 'true' : 'false'); }
+  }
+
+  function isForeground() {
+    const p = document.getElementById('mrc-tab-view');
+    return !!p && p.classList.contains('active');
+  }
+
+  function measureHeight() {
+    const panel = document.getElementById('mrc-tab-view');
+    if (!panel || !panel.classList.contains('active')) return;
+    const avail = Math.floor(window.innerHeight - panel.getBoundingClientRect().top);
+    if (avail > 100) {
+      panel.style.height = avail + 'px';
+      panel.style.maxHeight = avail + 'px';
+      panel.style.minHeight = avail + 'px';
     }
   }
 
-  // Step aside so a C7 tab can take the foreground. Our tab and state stay put,
-  // so tapping "Malpa Receiving" again resumes mid-receipt.
   function minimiseSelf() {
     const panel = document.getElementById('mrc-tab-view');
     if (!panel) return;
-    Keyboard.close();
     restoreC7Panels();
     panel.classList.remove('active');
     panel.style.display = 'none';
@@ -672,7 +508,6 @@
     const panel      = document.getElementById('mrc-tab-view');
     if (!tabBar || !tabContent || !panel) return;
 
-    // Remember where to hand control back to on close.
     const curLi    = tabBar.querySelector('li.nav-item.active');
     const curPanel = tabContent.querySelector(':scope > .tab-pane.active, :scope > tab.active');
     if (curLi    && curLi    !== li)    R._prevActiveLi    = curLi;
@@ -688,7 +523,6 @@
     setTimeout(measureHeight, 50);
   }
 
-  // Capture-phase, so we clear our inline styles BEFORE Angular switches tab.
   function attachTabSwitchGuard(tabBar) {
     if (R._tabGuard) return;
     R._tabGuard = (e) => {
@@ -704,28 +538,23 @@
     if (document.getElementById('mrc-tab-view')) return;
     const tabBar     = document.querySelector('ul.nav.nav-tabs[role="tablist"]');
     const tabContent = document.querySelector('div.tab-content');
-    if (!tabBar || !tabContent) {
-      console.warn('[MalpaRecv] C7 tab bar / tab content not found.');
-      return;
-    }
+    if (!tabBar || !tabContent) { console.warn('[MalpaRecv] C7 tabs not found'); return; }
 
     const tabLi = document.createElement('li');
     tabLi.id = 'mrc-tab-li';
-    tabLi.className = 'nav-item active';
+    tabLi.className = 'nav-item';
     tabLi.innerHTML = `
-      <a class="nav-link active" aria-selected="true" href="javascript:void(0)"
+      <a class="nav-link" href="javascript:void(0)"
          style="display:inline-flex;align-items:center;gap:6px;padding-right:8px;">
         Malpa Receiving
         <span id="mrc-tab-close" title="Close (Esc)" style="display:inline-flex;align-items:center;
-          justify-content:center;width:18px;height:18px;border-radius:3px;font-size:14px;line-height:1;
-          color:#384042;cursor:pointer;opacity:.6;margin-left:2px;
-          -webkit-tap-highlight-color:transparent;">x</span>
+          justify-content:center;width:18px;height:18px;font-size:14px;line-height:1;color:#374767;
+          cursor:pointer;opacity:.6;-webkit-tap-highlight-color:transparent;">&times;</span>
       </a>`;
     tabBar.appendChild(tabLi);
     tabLi.querySelector('#mrc-tab-close').addEventListener('click', (e) => {
       e.stopPropagation(); closeUI();
     });
-    // Clicking our own tab label brings us back to the front, mid-receipt.
     tabLi.querySelector('a.nav-link').addEventListener('click', (e) => {
       if (e.target.closest('#mrc-tab-close')) return;
       activateSelf();
@@ -738,32 +567,27 @@
     tabContent.appendChild(panel);
 
     document.addEventListener('keydown', onGlobalKey);
-
     R._sidebarWasMinimized = document.body.classList.contains('sidebar-minimized');
     R._brandWasMinimized   = document.body.classList.contains('brand-minimized');
 
     attachTabSwitchGuard(tabBar);
-    activateSelf();   // records the outgoing tab, hides C7's panels, shows ours
-
+    activateSelf();
     window.addEventListener('resize', measureHeight);
 
     Audio.init();
-    renderReceiptEntry();
-
-    // Make sure profile + locations are in hand (no-ops if prefetch already ran)
-    loadProfile().catch(e => console.warn('[MalpaRecv] profile load:', e.message));
-    loadLocations().catch(e => console.warn('[MalpaRecv] location load:', e.message));
+    render();
+    loadProfile().catch(e => console.warn('[MalpaRecv] profile:', e.message));
+    loadLocations().catch(e => console.warn('[MalpaRecv] locations:', e.message));
   }
 
   // ---------------------------------------------------------------------------
-  // 6. DATA LOADERS  (each cached - fetched once, not per scan)
+  // 6. LOADERS  (each cached - fetched once, never per scan)
   // ---------------------------------------------------------------------------
 
   async function loadProfile() {
     if (State.profile) return State.profile;
     const data = await apiGet('configuration/receiving-profile/my-list&expand=dynamicInput');
     const list = Array.isArray(data) ? data : (data?.items || []);
-    // Always Putaway - the operator never picks a profile.
     State.profile =
       list.find(p => p.receiving_process === PUTAWAY_PROCESS_ID) ||
       list.find(p => (p.name || '').trim().toLowerCase() === 'putaway') ||
@@ -773,23 +597,17 @@
 
   async function loadLocations() {
     if (State.locsLoaded) return;
-    // Without per-page this endpoint returns only 20 rows.
     const data = await wmsGet(
       `location?warehouse_id=${WAREHOUSE_ID}&location_class_id=${STORAGE_CLASS_ID}` +
-      `&per-page=${LOCATION_PAGE_SIZE}&page=1&search=`
-    );
+      `&per-page=${LOCATION_PAGE_SIZE}&page=1&search=`);
     const list = Array.isArray(data) ? data : (data?.items || []);
     const map = {};
-    for (const l of list) {
-      if (l?.location_code) map[String(l.location_code).trim().toUpperCase()] = l;
-    }
+    for (const l of list) if (l?.location_code) map[String(l.location_code).trim().toUpperCase()] = l;
     State.locByCode = map;
     State.locsLoaded = true;
     console.log('[MalpaRecv] cached', Object.keys(map).length, 'storage locations');
   }
 
-  // Resolve a scanned location code. Cache first; single-location lookup as fallback
-  // so a brand-new bin that post-dates the cache still works.
   async function resolveLocation(code) {
     const key = String(code || '').trim().toUpperCase();
     if (!key) return null;
@@ -797,8 +615,7 @@
     try {
       const data = await wmsGet(
         `location?warehouse_id=${WAREHOUSE_ID}&location_class_id=${STORAGE_CLASS_ID}` +
-        `&search=${encodeURIComponent(key)}`
-      );
+        `&per-page=${LOCATION_PAGE_SIZE}&page=1&search=${encodeURIComponent(key)}`);
       const list = Array.isArray(data) ? data : (data?.items || []);
       const hit = list.find(l => String(l.location_code).trim().toUpperCase() === key);
       if (hit) State.locByCode[key] = hit;
@@ -819,101 +636,72 @@
     const data = await apiGet(
       `receiving/receipt-header/get-by-num&id=${encodeURIComponent(receiptId)}` +
       `&location_code=${encodeURIComponent(dock)}&checkin_reference=${ref}` +
-      `&expand=${encodeURIComponent(EXPAND)}`
-    );
+      `&expand=${encodeURIComponent(EXPAND)}`);
     const arr = Array.isArray(data) ? data : (data ? [data] : []);
     return arr[0] || null;
   }
 
-  // ONE verify call per distinct item on the receipt, run in parallel, cached.
-  // C7 fires this on every single scan - we do not.
+  // ONE verify call per distinct item, in parallel, cached. C7 fires this on
+  // every single scan - we do not.
   async function buildItemCache(header) {
-    const EXPAND = [
-      'itemUnitOfMeasures.unitOfMeasure',
+    const EXPAND = ['itemUnitOfMeasures.unitOfMeasure',
       'itemUnitOfMeasures.itemUnitOfMeasureReference',
-      'permanentLocation', 'defaultImage',
-    ].join(',');
-
-    const codes = [...new Set(
-      (header.receiptDetails || [])
-        .map(d => d.item?.item_code)
-        .filter(Boolean)
-    )];
+      'permanentLocation', 'defaultImage'].join(',');
+    const codes = [...new Set((header.receiptDetails || [])
+      .map(d => d.item?.item_code).filter(Boolean))];
 
     const results = await Promise.all(codes.map(code =>
-      apiGet(
-        `receiving/receiving/verify-item-and-reference-by-code&id=${header.id}` +
+      apiGet(`receiving/receiving/verify-item-and-reference-by-code&id=${header.id}` +
         `&item_code=${encodeURIComponent(code)}&company_id=${header.company_id}` +
-        `&expand=${encodeURIComponent(EXPAND)}`
-      ).catch(e => {
-        console.warn('[MalpaRecv] verify failed for', code, e.message);
-        return null;
-      })
-    ));
+        `&expand=${encodeURIComponent(EXPAND)}`)
+        .catch(e => { console.warn('[MalpaRecv] verify', code, e.message); return null; })));
 
-    const itemsById = {};
-    const refMap    = {};
-    const failed    = [];
-
+    const itemsById = {}, refMap = {}, failed = [];
     results.forEach((item, i) => {
       if (!item?.id) { failed.push(codes[i]); return; }
       itemsById[item.id] = item;
-
-      // UoM references first, so a reference always carries its UoM. Doing the
-      // item_code mapping first would leave uomId null for items where a UoM
-      // reference happens to equal the item code (very common in C7), and the
-      // scan would then fall back to a guessed UoM.
+      // UoM references first, so every reference carries its UoM. Mapping the
+      // item_code first would leave uomId null for items where a UoM reference
+      // equals the item code (common in C7).
       for (const uom of (item.itemUnitOfMeasures || [])) {
         for (const r of (uom.itemUnitOfMeasureReference || [])) {
-          const key = String(r.reference || '').trim().toLowerCase();
-          if (key && !(key in refMap)) refMap[key] = { itemId: item.id, uomId: uom.id };
+          const k = String(r.reference || '').trim().toLowerCase();
+          if (k && !(k in refMap)) refMap[k] = { itemId: item.id, uomId: uom.id };
         }
       }
-      // item_code is always scannable, but must not overwrite a reference above.
-      const codeKey = String(item.item_code).trim().toLowerCase();
-      if (!(codeKey in refMap)) refMap[codeKey] = { itemId: item.id, uomId: null };
+      const ck = String(item.item_code).trim().toLowerCase();
+      if (!(ck in refMap)) refMap[ck] = { itemId: item.id, uomId: null };
     });
-
-    State.itemsById   = itemsById;
-    State.refMap      = refMap;
+    State.itemsById = itemsById;
+    State.refMap = refMap;
     State.failedItems = failed;
     console.log('[MalpaRecv] cached', Object.keys(itemsById).length, 'items,',
       Object.keys(refMap).length, 'barcodes');
   }
 
-  // Suggested putaway bin from the locating rule.
   async function fetchSuggestedLocation(detail, item, uom, qty, batchNo) {
     const p = State.profile;
-    const path =
-      `receiving/receipt-detail/get-location-by-locating-rule` +
-      `&item_id=${item.id}` +
-      `&locating_rule_id=${detail.locating_rule_id}` +
+    const path = `receiving/receipt-detail/get-location-by-locating-rule` +
+      `&item_id=${item.id}&locating_rule_id=${detail.locating_rule_id}` +
       `&default_receiving_dock_id=${p.default_receiving_dock}` +
       `&default_inventory_status=${encodeURIComponent(p.default_inventory_status || 'available')}` +
-      `&item_uom_id=${uom.id}` +
-      `&quantity=${qty}` +
+      `&item_uom_id=${uom.id}&quantity=${qty}` +
       `&receiving_process_id=${p.receiving_process}` +
       `&receipt_number=${encodeURIComponent(State.header.receipt_num)}` +
-      `&pre_check=true` +
-      `&batch=${batchNo ? encodeURIComponent(batchNo) : 'null'}`;
+      `&pre_check=true&batch=${batchNo ? encodeURIComponent(batchNo) : 'null'}`;
     try { return await apiGet(path); } catch (_) { return null; }
   }
 
-  // Refresh a single detail line - used only on a checkin retry, never on the happy path.
   async function refreshDetail(detail, item) {
-    const cur = State.cur;
-    const path =
-      `receiving/receipt-detail/get-detail-by-item` +
+    const c = State.cur;
+    return apiGet(`receiving/receipt-detail/get-detail-by-item` +
       `&receipt_header_id=${State.header.id}&item_id=${item.id}` +
       `&profile_id=${State.profile.id}` +
-      `&batch_no=${cur?.batchNo ? encodeURIComponent(cur.batchNo) : 'null'}` +
-      `&expiry=${cur?.expiry ? encodeURIComponent(cur.expiry) : 'null'}` +
-      `&detail_id=${detail.id}`;
-    return apiGet(path);
+      `&batch_no=${c?.batchNo ? encodeURIComponent(c.batchNo) : 'null'}` +
+      `&expiry=${c?.expiry ? encodeURIComponent(c.expiry) : 'null'}` +
+      `&detail_id=${detail.id}`);
   }
 
-  // The write. Mirrors the C7 payload exactly, with label_quantity and
-  // no_of_pieces hard-wired to 0 and the profile hard-wired to Putaway.
   async function postCheckin(detail, item, uom, qty, locationId) {
     const p = State.profile;
     return apiPost('receiving/receiving/checkin', {
@@ -936,50 +724,47 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 7. VOICE + AUDIO  (carried over from Malpa Pick)
+  // 7. VOICE + AUDIO
   // ---------------------------------------------------------------------------
 
   function _formatLocForSpeech(loc, prevLoc) {
     if (!loc) return '';
-    const segs     = String(loc).split('-');
-    const prevSegs = prevLoc ? String(prevLoc).split('-') : [];
+    const segs = String(loc).split('-');
+    const prev = prevLoc ? String(prevLoc).split('-') : [];
     let skip = 0;
     for (let i = 0; i < segs.length - 1; i++) {
-      if (prevSegs[i] && prevSegs[i].toUpperCase() === segs[i].toUpperCase()) skip++;
-      else break;
+      if (prev[i] && prev[i].toUpperCase() === segs[i].toUpperCase()) skip++; else break;
     }
     return segs.slice(skip).map(seg => {
       const m = seg.match(/^([A-Za-z]*)(\d+)$/);
       if (!m) return seg;
-      const letters = m[1], num = parseInt(m[2], 10);
-      return letters ? letters + ' ' + num : String(num);
+      return m[1] ? m[1] + ' ' + parseInt(m[2], 10) : String(parseInt(m[2], 10));
     }).join(', ');
   }
 
   const Voice = {
-    speak(text) {
+    speak(t) {
       if (!State.voiceEnabled || !window.speechSynthesis) return;
       window.speechSynthesis.cancel();
-      const u = new SpeechSynthesisUtterance(String(text));
-      u.rate = 1.8; u.pitch = 1.0; u.volume = 1.0;
+      const u = new SpeechSynthesisUtterance(String(t));
+      u.rate = 1.8; u.volume = 1;
       window.speechSynthesis.speak(u);
     },
-    announcePutaway(qty, uomName, locCode, prevLoc) {
-      let uomStr = '';
-      if (uomName && uomName.toLowerCase() !== 'each') {
-        const plural = qty > 1 && !uomName.toLowerCase().endsWith('s') ? uomName + 's' : uomName;
-        uomStr = ' ' + plural;
+    putaway(qty, uom, loc, prev) {
+      let s = '';
+      if (uom && uom.toLowerCase() !== 'each') {
+        s = ' ' + (qty > 1 && !uom.toLowerCase().endsWith('s') ? uom + 's' : uom);
       }
-      this.speak(`Put ${qty}${uomStr} to ${_formatLocForSpeech(locCode, prevLoc)}`);
+      this.speak(`Put ${qty}${s} to ${_formatLocForSpeech(loc, prev)}`);
     },
-    announceNoLocation() { this.speak('No existing location. Scan a bin.'); },
+    noLocation() { this.speak('No existing location. Scan a bin.'); },
     cancel() { if (window.speechSynthesis) window.speechSynthesis.cancel(); },
-    // Errors bypass the mute toggle - an operator must always hear a reject.
-    error(msg) {
+    // Errors bypass the mute toggle - a reject must always be audible.
+    error(m) {
       if (!window.speechSynthesis) return;
       window.speechSynthesis.cancel();
-      const u = new SpeechSynthesisUtterance(String(msg));
-      u.rate = 1.7; u.pitch = 1.0; u.volume = 1.0;
+      const u = new SpeechSynthesisUtterance(String(m));
+      u.rate = 1.7; u.volume = 1;
       window.speechSynthesis.speak(u);
     },
   };
@@ -988,44 +773,30 @@
     _ctx: null,
     init() {
       if (this._ctx) return;
-      try { this._ctx = new (window.AudioContext || window.webkitAudioContext)(); }
-      catch (e) { console.warn('[MalpaRecv] AudioContext unavailable:', e.message); }
+      try { this._ctx = new (window.AudioContext || window.webkitAudioContext)(); } catch (_) {}
     },
-    _tone(freq, dur, type = 'sine', gainVal = 0.4, delay = 0) {
+    _tone(f, dur, type = 'sine', g = .4, delay = 0) {
       if (!this._ctx) return;
       try {
-        const osc = this._ctx.createOscillator();
-        const g   = this._ctx.createGain();
-        osc.connect(g); g.connect(this._ctx.destination);
-        osc.type = type;
-        osc.frequency.setValueAtTime(freq, this._ctx.currentTime + delay);
-        g.gain.setValueAtTime(gainVal, this._ctx.currentTime + delay);
-        g.gain.exponentialRampToValueAtTime(0.001, this._ctx.currentTime + delay + dur);
-        osc.start(this._ctx.currentTime + delay);
-        osc.stop(this._ctx.currentTime + delay + dur);
+        const o = this._ctx.createOscillator(), gain = this._ctx.createGain();
+        o.connect(gain); gain.connect(this._ctx.destination);
+        o.type = type;
+        o.frequency.setValueAtTime(f, this._ctx.currentTime + delay);
+        gain.gain.setValueAtTime(g, this._ctx.currentTime + delay);
+        gain.gain.exponentialRampToValueAtTime(.001, this._ctx.currentTime + delay + dur);
+        o.start(this._ctx.currentTime + delay);
+        o.stop(this._ctx.currentTime + delay + dur);
       } catch (_) {}
     },
-    chime(type) {
+    chime(t) {
       this.init();
       if (!this._ctx) return;
       if (this._ctx.state === 'suspended') this._ctx.resume();
-      if (type === 'item_ok') {            // item verified
-        this._tone(880, 0.15, 'sine', 0.35, 0);
-        this._tone(880, 0.10, 'sine', 0.15, 0.15);
-      } else if (type === 'line_done') {   // detail checked in
-        this._tone(660, 0.12, 'sine', 0.30, 0);
-        this._tone(880, 0.20, 'sine', 0.40, 0.13);
-      } else if (type === 'receipt_done') { // whole receipt finished
-        this._tone(660, 0.12, 'sine', 0.30, 0);
-        this._tone(880, 0.12, 'sine', 0.35, 0.13);
-        this._tone(1175, 0.24, 'sine', 0.40, 0.26);
-      } else if (type === 'error') {
-        this._tone(180, 0.08, 'square', 0.30, 0);
-        this._tone(180, 0.08, 'square', 0.30, 0.12);
-      } else if (type === 'warn') {        // over-receive prompt
-        this._tone(420, 0.14, 'triangle', 0.32, 0);
-        this._tone(330, 0.18, 'triangle', 0.32, 0.15);
-      }
+      if (t === 'item_ok')      { this._tone(880, .15, 'sine', .35); this._tone(880, .10, 'sine', .15, .15); }
+      else if (t === 'line_done')    { this._tone(660, .12, 'sine', .30); this._tone(880, .20, 'sine', .40, .13); }
+      else if (t === 'receipt_done') { this._tone(660, .12, 'sine', .30); this._tone(880, .12, 'sine', .35, .13); this._tone(1175, .24, 'sine', .40, .26); }
+      else if (t === 'error')   { this._tone(180, .08, 'square', .30); this._tone(180, .08, 'square', .30, .12); }
+      else if (t === 'warn')    { this._tone(420, .14, 'triangle', .32); this._tone(330, .18, 'triangle', .32, .15); }
     },
   };
 
@@ -1035,810 +806,271 @@
 
   function _esc(str) {
     return String(str ?? '').replace(/[&<>"']/g, c => ({
-      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-    }[c]));
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   }
 
-  // TC51 scanners occasionally emit shifted digits when Android's shift state
-  // is stuck during focus(). Same fix as Malpa Pick.
-  const _SHIFT_NUMS = {
-    '!': '1', '@': '2', '#': '3', '$': '4', '%': '5',
-    '^': '6', '&': '7', '*': '8', '(': '9', ')': '0',
-  };
-  function _normaliseScan(val) {
-    return String(val).split('').map(c => _SHIFT_NUMS[c] || c).join('');
+  // TC51 scanners sometimes emit shifted digits when Android's shift state is
+  // stuck during focus().
+  const _SHIFT_NUMS = { '!': '1', '@': '2', '#': '3', '$': '4', '%': '5',
+                        '^': '6', '&': '7', '*': '8', '(': '9', ')': '0' };
+  function _normaliseScan(v) {
+    return String(v).split('').map(c => _SHIFT_NUMS[c] || c).join('');
   }
 
-  // ---------------------------------------------------------------------------
-  // 8b. ON-SCREEN KEYBOARD
-  // ---------------------------------------------------------------------------
-  // Every input carries inputmode="none" so Android's keyboard never appears -
-  // it is cramped, covers the screen unpredictably and fights the scanner. This
-  // keyboard is a proxy for the real input: keys write into it and fire an
-  // `input` event, so the hardware scanner keeps working the whole time the
-  // keyboard is up (keys use pointerdown + preventDefault so focus never moves).
+  function isBatch(item) { return item?.enable_batch === 1 || item?.enable_batch === true; }
+  function uomName(u) { return u?.unitOfMeasure?.name || u?.unitOfMeasure?.description || 'Each'; }
 
-  const KB_LAYOUTS = {
-    num: [
-      ['1', '2', '3'],
-      ['4', '5', '6'],
-      ['7', '8', '9'],
-      ['-', '0', '⌫'],
-    ],
-    alpha: [
-      ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'],
-      ['Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P'],
-      ['A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', '-'],
-      ['Z', 'X', 'C', 'V', 'B', 'N', 'M', '⌫'],
-    ],
-  };
-  const KB_DEL = '⌫';
+  // Bias to the BASE unit when only an item_code was scanned: guessing a carton
+  // would silently multiply the received quantity by its factor.
+  function defaultUomFor(item) {
+    const u = item?.itemUnitOfMeasures || [];
+    if (!u.length) return null;
+    return u.find(x => x.unit_of_measure_id === item.base_unit_of_measure)
+        || u.find(x => (x.factor || 1) === 1)
+        || u.slice().sort((a, b) => (a.factor || 1) - (b.factor || 1))[0];
+  }
 
-  const Keyboard = {
-    targetId: null, focusId: null, mode: 'alpha', onEnter: null, label: '',
-    // When true the next character key REPLACES the field instead of appending.
-    // Used where a scan has pre-filled a value that typing should overwrite.
-    replaceNext: false,
+  function openLines()  { return State.details.filter(d => (d.open_quantity || 0) > 0).length; }
+  function openUnits()  { return State.details.reduce((s, d) => s + Math.max(0, d.open_quantity || 0), 0); }
+  // Progress is DETAIL LINES: fully-received details out of total details.
+  function linesCompleted() { return State.details.filter(d => (d.open_quantity || 0) <= 0).length; }
+  function totalDetailLines() { return State.details.length; }
 
-    get input() { return this.targetId ? document.getElementById(this.targetId) : null; },
-    isOpen() { return !!document.getElementById('mrc-kb-ov'); },
+  function openDetailForItem(itemId) {
+    return State.details
+      .filter(d => d.item_id === itemId && (d.open_quantity || 0) > 0)
+      .sort((a, b) => (a.line_number || 0) - (b.line_number || 0))[0] || null;
+  }
 
-    close() {
-      document.getElementById('mrc-kb-ov')?.remove();
-      const s = document.getElementById('mrc-screen');
-      if (s) { s.classList.remove('kb-open'); s.style.removeProperty('--kb-h'); }
-    },
-
-    // focusId: element that keeps keyboard focus. Defaults to the target, but on
-    // screens with a dedicated scan input the scanner must keep it instead.
-    open(targetId, mode, onEnter, label, focusId) {
-      this.targetId = targetId;
-      this.focusId  = focusId || targetId;
-      this.mode     = mode || 'alpha';
-      this.onEnter  = onEnter || null;
-      this.label    = label || '';
-      this.render();
-    },
-
-    toggle(targetId, mode, onEnter, label, focusId) {
-      if (this.isOpen() && this.targetId === targetId) {
-        this.close(); this.focusInput();
-      } else {
-        this.open(targetId, mode, onEnter, label, focusId);
+  // Every barcode that identifies the current item (its code + all UoM refs).
+  function refsForItem(item) {
+    const out = [String(item.item_code || '').trim().toLowerCase()];
+    for (const u of (item.itemUnitOfMeasures || [])) {
+      for (const r of (u.itemUnitOfMeasureReference || [])) {
+        const k = String(r.reference || '').trim().toLowerCase();
+        if (k) out.push(k);
       }
-    },
+    }
+    return out.filter(Boolean);
+  }
 
-    render() {
-      const screen = document.getElementById('mrc-screen');
-      if (!screen) return;
-      this.close();
-
-      const rows = KB_LAYOUTS[this.mode] || KB_LAYOUTS.alpha;
-      const ov = document.createElement('div');
-      ov.className = 'mrc-kb-ov';
-      ov.id = 'mrc-kb-ov';
-      ov.innerHTML = `
-        <div class="mrc-kb${this.mode === 'num' ? ' mrc-kb-num' : ''}">
-          <div class="mrc-kb-bar">
-            <span class="mrc-kb-bar-lbl">${_esc(this.label)}</span>
-            <button class="mrc-kb-hide" data-k="@hide">Hide</button>
-          </div>
-          ${rows.map(r => `<div class="mrc-kb-row">${r.map(k =>
-            `<button class="mrc-kb-key${k === KB_DEL ? ' del' : ''}" data-k="${_esc(k)}"
-              >${_esc(k)}</button>`).join('')}</div>`).join('')}
-          <div class="mrc-kb-row">
-            <button class="mrc-kb-key mode" data-k="@mode">${this.mode === 'num' ? 'ABC' : '123'}</button>
-            <button class="mrc-kb-key mode" data-k="@clear">Clear</button>
-            <button class="mrc-kb-key go"   data-k="@enter">Enter</button>
-          </div>
-        </div>`;
-      screen.appendChild(ov);
-
-      // pointerdown + preventDefault: acts instantly and never steals focus,
-      // so a scan mid-typing still lands in the right place.
-      ov.querySelectorAll('[data-k]').forEach(b => {
-        b.addEventListener('pointerdown', (e) => { e.preventDefault(); this.press(b.dataset.k); });
+  function flash(type) {
+    const card = document.querySelector('.mrc-card');
+    if (card) {
+      const f = document.createElement('div');
+      f.className = 'mrc-flash ' + type;
+      card.style.position = 'relative';
+      card.appendChild(f);
+      requestAnimationFrame(() => {
+        f.style.opacity = '.3';
+        setTimeout(() => { f.style.opacity = '0'; setTimeout(() => f.remove(), 80); }, 80);
       });
-
-      // Reserve exactly the keyboard's height below the live field.
-      const h = ov.getBoundingClientRect().height || 190;
-      screen.style.setProperty('--kb-h', Math.round(h) + 'px');
-      screen.classList.add('kb-open');
-
-      this.focusInput();
-      setTimeout(measureHeight, 20);
-    },
-
-    focusInput() {
-      const el = document.getElementById(this.focusId || this.targetId);
-      if (el && !el.disabled) setTimeout(() => el.focus(), 0);
-    },
-
-    press(k) {
-      const i = this.input;
-      if (!i) return;
-      if (k === '@hide') { this.close(); this.focusInput(); return; }
-      if (k === '@mode') { this.mode = this.mode === 'num' ? 'alpha' : 'num'; this.render(); return; }
-      if (k === '@enter') {
-        const fn = this.onEnter, val = i.value;
-        this.close();
-        if (fn) fn(val);
-        return;
-      }
-      if (k === '@clear')     { i.value = ''; this.replaceNext = false; }
-      else if (k === KB_DEL)  { i.value = i.value.slice(0, -1); this.replaceNext = false; }
-      else if (this.replaceNext) { i.value = k; this.replaceNext = false; }
-      else                    { i.value += k; }
-      i.dispatchEvent(new Event('input', { bubbles: true }));
-      this.focusInput();
-    },
-  };
-
-  // Standard "Keyboard" button for screens where typing is the exception.
-  function kbButtonHtml() {
-    return `<button id="mrc-kb-btn" class="mrc-btn mrc-btn-secondary">Keyboard</button>`;
-  }
-  function wireKbButton(targetId, mode, onEnter, label, focusId) {
-    document.getElementById('mrc-kb-btn')?.addEventListener('click', () => {
-      Keyboard.toggle(targetId, mode, onEnter, label, focusId);
-      // A value already in the field came from a scan, so typing replaces it.
-      const el = document.getElementById(targetId);
-      Keyboard.replaceNext = !!(el && el.value);
-    });
-  }
-
-  function setFb(msg, type) {
-    const fb = document.getElementById('mrc-fb');
-    if (fb) {
-      fb.textContent = msg;
-      fb.className = 'mrc-fb ' + (type || 'dim');
     }
-    if (type === 'ok' || type === 'err') {
-      const screen = document.getElementById('mrc-screen');
-      if (screen) {
-        const flash = document.createElement('div');
-        flash.className = 'mrc-flash ' + type;
-        screen.style.position = 'relative';
-        screen.appendChild(flash);
-        requestAnimationFrame(() => {
-          flash.style.opacity = '0.32';
-          setTimeout(() => {
-            flash.style.opacity = '0';
-            setTimeout(() => flash.remove(), 80);
-          }, 80);
-        });
-      }
-      if (navigator.vibrate) navigator.vibrate(type === 'ok' ? [30] : [60, 30, 60]);
-    }
+    if (navigator.vibrate) navigator.vibrate(type === 'ok' ? [30] : [60, 30, 60]);
   }
+
+  function say(msg, type) { State.fb = msg; State.fbType = type || 'dim'; }
 
   function reject(msg, spoken) {
-    setFb(msg, 'err');
+    say(msg, 'err');
     Audio.chime('error');
     Voice.error(spoken || msg);
+    flash('err');
+    render();
   }
 
-  // Total open units still to receive on this receipt (base units).
-  function openUnits() {
-    return State.details.reduce((s, d) => s + Math.max(0, d.open_quantity || 0), 0);
-  }
-  function openLines() {
-    return State.details.filter(d => (d.open_quantity || 0) > 0).length;
-  }
-  // Progress is measured in DETAIL LINES: how many of the receipt's details are
-  // fully received, out of how many details exist. A part-received line is not
-  // counted as complete, and the denominator never moves.
-  function linesCompleted() {
-    return State.details.filter(d => (d.open_quantity || 0) <= 0).length;
-  }
-  function totalDetailLines() {
-    return State.details.length;
-  }
+  // ---------------------------------------------------------------------------
+  // 9. THE SINGLE-SCREEN FORM
+  // ---------------------------------------------------------------------------
+  // One card. Rows are revealed as the previous ones are satisfied, and rows
+  // already satisfied collapse to a compact one-line summary so the whole flow
+  // stays on screen. Inputs are ordinary text fields, so Canary7's native
+  // keyboard is what the operator gets.
 
-  // Fallback UoM when a bare item_code was scanned. Deliberately biased to the
-  // BASE unit: guessing a carton would silently multiply the received quantity
-  // by its factor, so the smallest/base unit is always the safe default.
-  function defaultUomFor(item) {
-    const uoms = item?.itemUnitOfMeasures || [];
-    if (!uoms.length) return null;
-    return uoms.find(u => u.unit_of_measure_id === item.base_unit_of_measure)
-        || uoms.find(u => (u.factor || 1) === 1)
-        || uoms.slice().sort((a, b) => (a.factor || 1) - (b.factor || 1))[0];
-  }
-
-  function uomName(uom) {
-    return uom?.unitOfMeasure?.name || uom?.unitOfMeasure?.description || 'Each';
-  }
-
-  // C7 returns enable_batch as 1/0 on some payloads and true/false on others.
-  function isBatch(item) {
-    return item?.enable_batch === 1 || item?.enable_batch === true;
-  }
-
-  // Step back one screen from the location stage.
-  function backFromLocation() {
-    if (isBatch(State.cur?.item)) renderBatch(); else renderQty();
-  }
-
-  // Pick the open detail line for an item. Lowest line_number with qty still open.
-  function openDetailForItem(itemId) {
-    const candidates = State.details
-      .filter(d => d.item_id === itemId && (d.open_quantity || 0) > 0)
-      .sort((a, b) => (a.line_number || 0) - (b.line_number || 0));
-    return candidates[0] || null;
-  }
-
-  // showEdit renders the pencil beside the code, for changing the location.
-  function progressHtml(label, code, sub, tone, showEdit) {
-    const done  = linesCompleted();
-    const total = totalDetailLines();
-    const pct   = total > 0 ? Math.round((done / total) * 100) : 0;
+  function doneRow(label, value, opts = {}) {
     return `
-      <div class="mrc-hdr${tone ? ' ' + tone : ''}">
-        <div class="mrc-hdr-top">
-          <span class="mrc-hdr-label">${_esc(label)}</span>
-          <div class="mrc-hdr-right">
-            <span class="mrc-hdr-prog">${done} / ${total} lines completed</span>
-            <button class="mrc-voice${State.voiceEnabled ? '' : ' muted'}" id="mrc-voice-btn"
-              title="Toggle voice" aria-label="Toggle voice">${State.voiceEnabled ? '🔊' : '🔇'}</button>
-          </div>
-        </div>
-        <div class="mrc-hdr-code-row">
-          <div class="mrc-hdr-code">${_esc(code)}</div>
-          ${showEdit ? `<button class="mrc-edit" id="mrc-edit-loc" title="Change location"
-            aria-label="Change location">&#9998;</button>` : ''}
-        </div>
-        ${sub ? `<div class="mrc-hdr-sub">${sub}</div>` : ''}
-        <div class="mrc-prog-track"><div class="mrc-prog-fill" style="width:${pct}%"></div></div>
+      <div class="mrc-done">
+        <span class="mrc-done-lbl">${_esc(label)}</span>
+        <span class="mrc-done-val${opts.emph ? ' emph' : ''}">${_esc(value)}</span>
+        ${opts.editId ? `<button class="mrc-pencil" id="${opts.editId}"
+          title="Change" aria-label="Change ${_esc(label)}">&#9998;</button>` : ''}
       </div>`;
   }
 
-  // Clear the location outright and drop the operator into a blank scan field.
-  function wireEditLocation() {
-    document.getElementById('mrc-edit-loc')?.addEventListener('click', () => {
-      const c = State.cur;
-      if (!c) return;
-      Keyboard.close();
-      c.location = null;
-      c.suggested = null;
-      c.viaKeep = false;
-      if (navigator.vibrate) navigator.vibrate([20]);
-      renderLocationScan();
-    });
+  function fieldRow(label, inputHtml, extra = '') {
+    return `<div class="mrc-fg"><label class="mrc-lbl">${label}</label>${inputHtml}${extra}</div>`;
   }
 
-  function wireVoiceBtn(refocusId) {
-    document.getElementById('mrc-voice-btn')?.addEventListener('click', () => {
-      State.voiceEnabled = !State.voiceEnabled;
-      try { sessionStorage.setItem('mrc_voice', State.voiceEnabled ? '1' : '0'); } catch (_) {}
-      const btn = document.getElementById('mrc-voice-btn');
-      if (btn) {
-        btn.textContent = State.voiceEnabled ? '🔊' : '🔇';
-        btn.classList.toggle('muted', !State.voiceEnabled);
-      }
-      if (!State.voiceEnabled) Voice.cancel();
-      if (refocusId) setTimeout(() => document.getElementById(refocusId)?.focus(), 60);
-    });
-  }
-
-  // Tap anywhere (other than a control) puts focus back on the scan input.
-  function wireTapRefocus(inputId) {
-    document.getElementById('mrc-screen')?.addEventListener('click', (e) => {
-      if (e.target.closest('button, select, input, label, .mrc-keep')) return;
-      setTimeout(() => document.getElementById(inputId)?.focus(), 40);
-    });
-  }
-
-  // ---------------------------------------------------------------------------
-  // 9. SCREEN A - RECEIPT NUMBER ENTRY
-  // ---------------------------------------------------------------------------
-
-  function renderReceiptEntry(errorMsg) {
+  function render() {
     const root = document.getElementById('mrc-root');
     if (!root) return;
-    State.screen = 'RECEIPT_ENTRY';
-    State.cur = null;
 
-    let last = '';
-    try { last = sessionStorage.getItem('mrc_lastreceipt') || ''; } catch (_) {}
+    const c       = State.cur;
+    const hasRcpt = !!State.header;
+    const hasItem = !!c;
+    const batch   = hasItem && isBatch(c.item);
+    const hasLoc  = hasItem && !!c.location;
 
-    root.innerHTML = `
-      <div class="mrc-screen" id="mrc-screen">
-        ${progressHtml('Malpa Receiving', 'Declare Receipt', 'Putaway - one step check in &amp; locate', 'green')}
-        <div class="mrc-body">
-          ${errorMsg ? `<div class="mrc-err-banner">${_esc(errorMsg)}</div>` : ''}
-          <div class="mrc-field-lbl">Receipt number</div>
-          <div class="mrc-zone">
-            <div class="mrc-zone-lbl">Scan or type receipt</div>
-            <input id="mrc-receipt-in" class="mrc-input big" type="text" inputmode="none"
-              autocomplete="off" autocorrect="off" autocapitalize="characters" spellcheck="false"
-              placeholder="RET-" value="${_esc(last)}"/>
-          </div>
-          <div class="mrc-fb dim" id="mrc-fb">Ready to scan</div>
-        </div>
-      </div>
-      <div class="mrc-actions">
-        ${kbButtonHtml()}
-        <button id="mrc-load-btn" class="mrc-btn mrc-btn-primary">Load Receipt</button>
-      </div>`;
+    // Which single row is live? Everything before it collapses to one line.
+    // Completion is tracked with explicit flags, not by testing for emptiness -
+    // a batch line can arrive with expected_batch_no already filled in, and the
+    // operator must still see and confirm that row.
+    let stage;
+    if (!hasRcpt)                     stage = 'receipt';
+    else if (!hasItem)                stage = 'item';
+    else if (!c.qtyDone)              stage = 'qty';
+    else if (batch && !c.batchDone)   stage = 'batch';
+    else if (!c.locResolved)          stage = 'wait';
+    else if (!c.location)             stage = 'location';
+    else                              stage = 'checkdigit';
+    const needsLoc = stage === 'location';
 
-    const inp = document.getElementById('mrc-receipt-in');
-    const go  = (v) => { const s = _normaliseScan(String(v || '').trim()); if (s) loadReceipt(s); };
-    inp?.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' || e.keyCode === 13) { e.preventDefault(); go(inp.value); }
-    });
-    document.getElementById('mrc-load-btn')?.addEventListener('click', () => go(inp?.value));
-    wireVoiceBtn('mrc-receipt-in');
-    wireKbButton('mrc-receipt-in', 'alpha', go, 'Receipt number');
-    setTimeout(measureHeight, 30);
-    // Receipt numbers get typed as often as scanned, so bring the keyboard up.
-    setTimeout(() => Keyboard.open('mrc-receipt-in', 'alpha', go, 'Receipt number'), 120);
-  }
+    const done  = linesCompleted(), total = totalDetailLines();
+    const pct   = total > 0 ? Math.round((done / total) * 100) : 0;
 
-  async function loadReceipt(receiptRaw) {
-    const receiptId = receiptRaw.toUpperCase();
-    const root = document.getElementById('mrc-root');
-    if (root) root.innerHTML = `<div class="mrc-loading"><div class="mrc-spinner"></div>Loading receipt...</div>`;
-    State.screen = 'TRANSITIONING';
+    let rows = '';
 
-    try {
-      await loadProfile();
-      if (!State.profile) throw new Error('No Putaway receiving profile available');
+    // -- receipt -------------------------------------------------------------
+    if (stage === 'receipt') {
+      rows += fieldRow('Receipt Number',
+        `<input id="mrc-receipt" class="mrc-fc big" type="text" autocomplete="off"
+           autocorrect="off" autocapitalize="characters" spellcheck="false"
+           placeholder="Scan or type receipt" value="${_esc(State.receiptId)}"/>`);
+    } else {
+      rows += doneRow('Receipt', State.header.receipt_num || State.receiptId,
+        { editId: 'mrc-edit-receipt' });
+    }
 
-      const header = await fetchReceiptHeader(receiptId).catch(e => {
-        if (e.notFound) return null;
-        throw e;
-      });
-
-      if (!header) {
-        renderReceiptEntry(`Receipt ${receiptId} not found, or it has nothing left to check in.`);
-        return;
+    // -- item ----------------------------------------------------------------
+    if (hasRcpt) {
+      if (stage === 'item') {
+        rows += fieldRow('Enter Item Code or Reference',
+          `<input id="mrc-item" class="mrc-fc big" type="text" autocomplete="off"
+             autocorrect="off" autocapitalize="characters" spellcheck="false"
+             placeholder="Scan item"/>`);
+      } else if (hasItem) {
+        rows += doneRow('Item', c.item.item_code, { editId: 'mrc-edit-item' });
+        rows += `<div class="mrc-static"><b>Item Description :</b>
+          <span class="v">${_esc(c.item.description || '')}</span></div>`;
       }
-
-      State.header    = header;
-      State.receiptId = receiptId;
-      State.companyId = header.company_id;
-      State.details   = (header.receiptDetails || []).map(d => ({ ...d }));
-      State.done       = 0;
-      State.linesDone  = new Set();
-      State.failedItems = [];
-      State.totalLines = State.details.filter(d => (d.open_quantity || 0) > 0).length;
-      try { sessionStorage.setItem('mrc_lastreceipt', receiptId); } catch (_) {}
-
-      if (!State.details.length) {
-        renderReceiptEntry(`Receipt ${receiptId} has no detail lines to receive.`);
-        return;
-      }
-
-      // Cache every item on the receipt in one parallel burst.
-      await buildItemCache(header);
-      // Locations may still be warming - do not block on it.
-      loadLocations().catch(() => {});
-
-      renderScanItem();
-    } catch (err) {
-      console.error('[MalpaRecv] loadReceipt:', err);
-      renderReceiptEntry('Could not load receipt: ' + err.message);
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // 10. SCREEN B - SCAN ITEM
-  // ---------------------------------------------------------------------------
-
-  function renderScanItem(msg, msgType) {
-    const root = document.getElementById('mrc-root');
-    if (!root) return;
-    State.screen = 'SCAN_ITEM';
-    State.cur = null;
-
-    const lines = openLines();
-    const units = openUnits();
-    const company = State.header?.company?.company_code || '';
-
-    root.innerHTML = `
-      <div class="mrc-screen" id="mrc-screen">
-        ${progressHtml('Receipt', State.header?.receipt_num || State.receiptId,
-          `${company ? _esc(company) + ' &middot; ' : ''}${lines} line${lines === 1 ? '' : 's'} open &middot; ${units} unit${units === 1 ? '' : 's'} to receive`)}
-        <div class="mrc-body">
-          <div class="mrc-zone">
-            <div class="mrc-zone-lbl">Scan item or barcode</div>
-            <div class="mrc-arrows">&gt;&gt;&gt;</div>
-            <input id="mrc-scan-in" class="mrc-hidden-in" type="text" inputmode="none"
-              autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"/>
-          </div>
-          <div class="mrc-fb ${msgType || 'dim'}" id="mrc-fb">${_esc(msg || 'Ready to scan')}</div>
-          ${State.failedItems.length ? `<div class="mrc-err-banner">Could not load ${
-            _esc(State.failedItems.join(', '))} - use the standard C7 window for
-            ${State.failedItems.length === 1 ? 'that line' : 'those lines'}.</div>` : ''}
-          ${renderKeepHtml()}
-        </div>
-      </div>
-      <div class="mrc-actions">
-        <button id="mrc-newreceipt-btn" class="mrc-btn mrc-btn-secondary">New Receipt</button>
-      </div>`;
-
-    const inp = document.getElementById('mrc-scan-in');
-    inp?.addEventListener('keydown', (e) => {
-      if (e.key !== 'Enter' && e.keyCode !== 13) return;
-      e.preventDefault();
-      const raw = inp.value.trim();
-      inp.value = '';
-      if (raw) onItemScan(_normaliseScan(raw));
-    });
-    // Straight back to the receipt prompt to start the next one.
-    document.getElementById('mrc-newreceipt-btn')?.addEventListener('click', () => {
-      State.resetReceipt();
-      renderReceiptEntry();
-    });
-    wireVoiceBtn('mrc-scan-in');
-    wireKeepToggle('mrc-scan-in');
-    wireTapRefocus('mrc-scan-in');
-    setTimeout(() => inp?.focus(), 90);
-    setTimeout(measureHeight, 30);
-  }
-
-  function onItemScan(barcode) {
-    const key = barcode.trim().toLowerCase();
-    const hit = State.refMap[key];
-
-    if (!hit) {
-      // Distinguish "wrong item" from "we failed to load this item's data".
-      const onReceipt = State.details.some(d =>
-        String(d.item?.item_code || '').trim().toLowerCase() === key);
-      if (onReceipt) reject('Item data failed to load - use C7 for this line', 'Item data error');
-      else reject('Not on this receipt', 'Item not on this receipt');
-      return;
     }
 
-    const item   = State.itemsById[hit.itemId];
-    const detail = openDetailForItem(hit.itemId);
+    // -- uom + quantity ------------------------------------------------------
+    if (hasItem) {
+      const factor   = c.uom.factor || 1;
+      const openBase = c.detail.open_quantity || 0;
 
-    if (!item) { reject('Item data missing - rescan', 'Item error'); return; }
-    if (!detail) {
-      reject('No open quantity left on this item', 'Line already complete');
-      return;
-    }
-
-    // Auto-select the UoM the scanned reference belongs to; operator can still change it.
-    let uom = hit.uomId
-      ? (item.itemUnitOfMeasures || []).find(u => u.id === hit.uomId)
-      : null;
-    if (!uom) uom = defaultUomFor(item);
-    if (!uom) { reject('Item has no unit of measure', 'Item error'); return; }
-
-    State.cur = {
-      detail, item, uom,
-      // One scan = one pack. Scanning again on the quantity screen adds another
-      // factor; typing overwrites. Same count-up behaviour as Malpa Pack.
-      qty: uom.factor || 1,
-      batchNo: detail.expected_batch_no || '',
-      expiry:  detail.expected_batch_expiry || '',
-      location: null,
-      suggested: null,
-      scannedRef: barcode,
-    };
-
-    setFb('Item verified', 'ok');
-    Audio.chime('item_ok');
-    renderQty();
-  }
-
-  // ---------------------------------------------------------------------------
-  // 11. SCREEN C - QUANTITY (+ UoM override)
-  // ---------------------------------------------------------------------------
-
-  function renderQty(errMsg) {
-    const root = document.getElementById('mrc-root');
-    if (!root) return;
-    State.screen = 'QTY';
-    const c = State.cur;
-    if (!c) { renderScanItem(); return; }
-
-    const factor   = c.uom.factor || 1;
-    const openBase = c.detail.open_quantity || 0;
-
-    const uomOpts = (c.item.itemUnitOfMeasures || []).map(u =>
-      `<option value="${u.id}"${u.id === c.uom.id ? ' selected' : ''}>` +
-      `${_esc(uomName(u))}${(u.factor || 1) > 1 ? ` (x${u.factor})` : ''}</option>`
-    ).join('');
-
-    root.innerHTML = `
-      <div class="mrc-screen" id="mrc-screen">
-        ${progressHtml('Quantity', State.header?.receipt_num || State.receiptId,
-          `Line ${c.detail.line_number ?? '-'}`)}
-        <div class="mrc-item">
-          <div class="mrc-item-sku">${_esc(c.item.item_code)}</div>
-          <div class="mrc-item-desc">${_esc(c.item.description || '')}</div>
-          <div class="mrc-open-row">
-            <div class="mrc-open-cell">
-              <span class="mrc-open-lbl">Open</span>
-              <span class="mrc-open-val hi">${openBase}</span>
-            </div>
-            ${factor > 1 ? `<div class="mrc-open-cell">
-              <span class="mrc-open-lbl">${_esc(uomName(c.uom))} x${factor}</span>
-              <span class="mrc-open-val" style="font-size:18px;color:#9faecb">${
-                openBase % factor === 0 ? openBase / factor : (openBase / factor).toFixed(2)}</span>
-            </div>` : ''}
-          </div>
-        </div>
-        <div class="mrc-body">
-          ${errMsg ? `<div class="mrc-err-banner">${_esc(errMsg)}</div>` : ''}
-          <div class="mrc-field-lbl">Unit of measure</div>
-          <select id="mrc-uom-sel" class="mrc-select">${uomOpts}</select>
-          <div class="mrc-field-lbl">Quantity${factor > 1 ? ' (base units)' : ''}</div>
-          <input id="mrc-qty-in" class="mrc-input big" type="text" inputmode="none"
-            autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
-            placeholder="0 of ${openBase}" value="${c.qty != null ? c.qty : ''}"/>
-          <input id="mrc-qty-scan" class="mrc-hidden-in" type="text" inputmode="none"
-            autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"/>
-          <div class="mrc-fb dim" id="mrc-fb">Scan again to add ${factor}, or type</div>
-        </div>
-      </div>
-      <div class="mrc-actions">
-        <button id="mrc-back-btn" class="mrc-btn mrc-btn-secondary">&lt;- Back</button>
-        ${kbButtonHtml()}
-        <button id="mrc-next-btn" class="mrc-btn mrc-btn-primary">Next -&gt;</button>
-      </div>`;
-
-    const qtyIn   = document.getElementById('mrc-qty-in');
-    const scanIn  = document.getElementById('mrc-qty-scan');
-    const uomSel  = document.getElementById('mrc-uom-sel');
-
-    // Live readout: pack count when the number is a whole multiple of the factor,
-    // and an immediate complaint when it is not.
-    const syncHint = () => {
-      const fb = document.getElementById('mrc-fb');
-      if (!fb) return;
-      const n = parseFloat(_normaliseScan((qtyIn?.value || '').trim()));
-      if (isNaN(n) || n <= 0) {
-        fb.textContent = factor > 1 ? `Scan again to add ${factor}, or type` : 'Scan again or type';
-        fb.className = 'mrc-fb dim';
-        return;
-      }
-      if (n > openBase) {
-        fb.textContent = `${n} exceeds the ${openBase} open - you will be asked to confirm`;
-        fb.className = 'mrc-fb err';
-        return;
-      }
-      if (factor > 1 && n % factor !== 0) {
-        const lo = Math.floor(n / factor) * factor, hi = lo + factor;
-        fb.textContent = `${n} is not a whole ${uomName(c.uom)} - try ${lo || factor} or ${hi}`;
-        fb.className = 'mrc-fb err';
-        return;
-      }
-      fb.textContent = factor > 1
-        ? `= ${n / factor} ${uomName(c.uom)}${n / factor === 1 ? '' : 's'}`
-        : `${n} of ${openBase}`;
-      fb.className = 'mrc-fb ok';
-    };
-
-    // Each additional scan of this item adds one pack (the UoM factor).
-    const bumpByScan = (barcode) => {
-      const hit = State.refMap[barcode.trim().toLowerCase()];
-      if (!hit || hit.itemId !== c.item.id) {
-        reject('Wrong item - scan the same item to count up', 'Wrong item');
-        return;
-      }
-      const cur = parseFloat(qtyIn.value) || 0;
-      qtyIn.value = String(cur + factor);
-      c.qty = cur + factor;
-      // A scan sets the value, so the next typed digit should replace it.
-      Keyboard.replaceNext = true;
-      Audio.chime('item_ok');
-      if (navigator.vibrate) navigator.vibrate([25]);
-      syncHint();
-    };
-
-    uomSel?.addEventListener('change', () => {
-      const nu = (c.item.itemUnitOfMeasures || []).find(u => String(u.id) === uomSel.value);
-      // Switching pack size restarts the count at one pack of the new UoM.
-      if (nu) { c.uom = nu; c.qty = nu.factor || 1; renderQty(); }
-    });
-
-    // The scanner owns focus; the on-screen keypad writes into the visible field.
-    scanIn?.addEventListener('keydown', (e) => {
-      if (e.key !== 'Enter' && e.keyCode !== 13) return;
-      e.preventDefault();
-      const raw = _normaliseScan(scanIn.value.trim());
-      scanIn.value = '';
-      if (raw) bumpByScan(raw);
-    });
-    qtyIn?.addEventListener('input', syncHint);
-    qtyIn?.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' || e.keyCode === 13) { e.preventDefault(); submitQty(); }
-    });
-    syncHint();
-
-    document.getElementById('mrc-next-btn')?.addEventListener('click', submitQty);
-    document.getElementById('mrc-back-btn')?.addEventListener('click', () => {
-      Keyboard.close(); renderScanItem();
-    });
-    wireVoiceBtn('mrc-qty-scan');
-    wireTapRefocus('mrc-qty-scan');
-    // Scanning drives the count, so the keypad is opt-in - it no longer steals
-    // the screen on every line.
-    wireKbButton('mrc-qty-in', 'num', () => submitQty(),
-      `Quantity${factor > 1 ? ' - base units' : ''}`, 'mrc-qty-scan');
-    setTimeout(() => scanIn?.focus(), 90);
-    setTimeout(measureHeight, 30);
-  }
-
-  function submitQty() {
-    const c = State.cur;
-    if (!c) return;
-    const raw = _normaliseScan((document.getElementById('mrc-qty-in')?.value || '').trim());
-    const qty = parseFloat(raw);
-
-    if (!raw || isNaN(qty) || qty <= 0) {
-      reject('Enter a quantity greater than zero', 'Invalid quantity');
-      return;
-    }
-    // A scan landing on this field would otherwise be read as a quantity.
-    // No real receipt line is 100,000 units, so treat long numbers as a misfire.
-    if (/^\d{6,}$/.test(raw)) {
-      document.getElementById('mrc-qty-in').value = '';
-      reject('That looks like a barcode, not a quantity', 'Enter a quantity');
-      return;
-    }
-    if (!Number.isInteger(qty) && !c.item.allow_partial_units) {
-      reject('Whole units only for this item', 'Whole units only');
-      return;
-    }
-
-    const factor   = c.uom.factor || 1;
-    const openBase = c.detail.open_quantity || 0;
-    const baseQty  = qty;   // C7 takes the quantity in BASE units - see note at top
-
-    // A factor-6 carton cannot hold 13 eaches. Refuse anything that is not a
-    // whole number of the selected unit of measure.
-    if (factor > 1 && qty % factor !== 0) {
-      const lo = Math.floor(qty / factor) * factor, hi = lo + factor;
-      reject(
-        `${qty} is not a whole ${uomName(c.uom)} (x${factor}) - use ${lo || factor} or ${hi}`,
-        `Not a whole ${uomName(c.uom)}`
-      );
-      return;
-    }
-
-    c.qty = qty;
-
-    if (baseQty > openBase) {
-      // Over-receive. Profile allows it, but C7 makes the operator type OVER - so do we.
-      if (!State.profile.allow_over_receiving) {
-        reject(`Over-receiving is off. Open is ${openBase} base units.`, 'Over receiving not allowed');
-        return;
-      }
-      showOverConfirm(qty, baseQty, openBase);
-      return;
-    }
-
-    afterQty();
-  }
-
-  function afterQty() {
-    const c = State.cur;
-    // Batch + expiry only when the item is actually batch tracked.
-    if (isBatch(c.item)) renderBatch();
-    else beginLocation();
-  }
-
-  // ---------------------------------------------------------------------------
-  // 12. OVER-RECEIVE CONFIRM  (type OVER)
-  // ---------------------------------------------------------------------------
-
-  function showOverConfirm(qty, baseQty, openBase) {
-    const screen = document.getElementById('mrc-screen');
-    if (!screen) return;
-    document.getElementById('mrc-over-ov')?.remove();
-    const prevScreen = State.screen;
-    State.screen = 'OVER_CONFIRM';
-
-    Audio.chime('warn');
-    Voice.error('Over receiving. Type OVER to confirm.');
-
-    const ov = document.createElement('div');
-    ov.className = 'mrc-ov';
-    ov.id = 'mrc-over-ov';
-    ov.innerHTML = `
-      <div class="mrc-ov-card">
-        <div class="mrc-ov-hdr">Over-receiving</div>
-        <div class="mrc-ov-body">
-          You are receiving <strong>${baseQty}</strong> base units against an open quantity of
-          <strong>${openBase}</strong>.<br><br>
-          Type <strong>OVER</strong> to confirm.
-          <input id="mrc-over-in" class="mrc-input big" type="text" inputmode="none"
-            autocomplete="off" autocorrect="off" autocapitalize="characters" spellcheck="false"
-            placeholder="OVER" style="margin-top:10px"/>
-          <div class="mrc-fb err" id="mrc-over-fb" style="margin-top:6px"></div>
-        </div>
-        <div class="mrc-ov-acts">
-          <button id="mrc-over-yes" class="mrc-btn mrc-btn-danger">Confirm Over-Receive</button>
-          <button id="mrc-over-no"  class="mrc-btn mrc-btn-secondary">Cancel</button>
-        </div>
-      </div>`;
-    screen.appendChild(ov);
-
-    const inp = document.getElementById('mrc-over-in');
-    const fb  = document.getElementById('mrc-over-fb');
-
-    const tryConfirm = () => {
-      const v = _normaliseScan((inp?.value || '').trim()).toUpperCase();
-      if (v === 'OVER') {
-        Keyboard.close();
-        ov.remove();
-        afterQty();
+      if (stage === 'qty') {
+        const opts = (c.item.itemUnitOfMeasures || []).map(u =>
+          `<option value="${u.id}"${u.id === c.uom.id ? ' selected' : ''}>` +
+          `${_esc(uomName(u))}(${u.factor || 1})</option>`).join('');
+        rows += fieldRow('Unit of Measure', `<select id="mrc-uom" class="mrc-fc">${opts}</select>`);
+        rows += fieldRow(`Check-In Quantity(open quantity : ${openBase})`,
+          `<input id="mrc-qty" class="mrc-fc qty" type="text" inputmode="numeric"
+             autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+             value="${c.qty != null ? c.qty : ''}"/>`,
+          factor > 1
+            ? `<div class="mrc-fb dim" id="mrc-qty-hint">Scan again to add ${factor}</div>` : '');
       } else {
-        if (fb) fb.textContent = 'Type OVER exactly to confirm';
-        Audio.chime('error');
-        if (navigator.vibrate) navigator.vibrate([60, 30, 60]);
-        if (inp) { inp.value = ''; inp.focus(); }
+        rows += doneRow('UoM', `${uomName(c.uom)}(${factor})`, { editId: 'mrc-edit-qty' });
+        rows += doneRow('Quantity', `${c.qty} of ${openBase}`, { emph: true, editId: 'mrc-edit-qty' });
       }
-    };
+    }
 
-    inp?.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' || e.keyCode === 13) { e.preventDefault(); tryConfirm(); }
-    });
-    document.getElementById('mrc-over-yes')?.addEventListener('click', tryConfirm);
-    document.getElementById('mrc-over-no')?.addEventListener('click', () => {
-      Keyboard.close();
-      ov.remove();
-      State.screen = prevScreen;
-      renderQty();
-    });
-    setTimeout(() => Keyboard.open('mrc-over-in', 'alpha', tryConfirm, 'Type OVER to confirm'), 130);
-  }
+    // -- batch / expiry (batch-tracked items only) ---------------------------
+    if (hasItem && batch && c.qtyDone) {
+      if (stage === 'batch') {
+        rows += fieldRow('Batch Number',
+          `<input id="mrc-batch" class="mrc-fc" type="text" autocomplete="off"
+             autocorrect="off" autocapitalize="characters" spellcheck="false"
+             placeholder="Scan or type batch" value="${_esc(c.batchNo || '')}"/>`);
+        rows += fieldRow('Expiry Date',
+          `<input id="mrc-expiry" class="mrc-fc" type="date" value="${_esc(_toDateInput(c.expiry))}"/>`);
+      } else if (c.batchNo) {
+        rows += doneRow('Batch', c.batchNo + (c.expiry ? '  exp ' + _toDateInput(c.expiry) : ''),
+          { editId: 'mrc-edit-batch' });
+      }
+    }
 
-  // ---------------------------------------------------------------------------
-  // 13. SCREEN D - BATCH + EXPIRY  (batch-tracked items only)
-  // ---------------------------------------------------------------------------
+    // -- location ------------------------------------------------------------
+    if (stage === 'wait') {
+      rows += `<div class="mrc-static" style="padding-top:6px">
+        <span class="mrc-spin"></span>Finding location...</div>`;
+    } else if (needsLoc) {
+      rows += `<div class="mrc-warn-red">NO EXISTING LOCATION</div>`;
+      rows += fieldRow('Location',
+        `<input id="mrc-loc" class="mrc-fc big nolocation" type="text" autocomplete="off"
+           autocorrect="off" autocapitalize="characters" spellcheck="false"
+           placeholder="Scan the bin you are using"/>`);
+    } else if (hasLoc) {
+      rows += `<div class="mrc-done">
+        <span class="mrc-done-lbl">Location :</span>
+        <span class="mrc-done-val">${_esc(c.location.location_code)}${c.viaKeep ? '  (kept)' : ''}</span>
+        <button class="mrc-pencil" id="mrc-edit-loc" title="Change location"
+          aria-label="Change location">&#9998;</button>
+      </div>`;
+      const digit   = String(c.location.check_digit ?? '').trim();
+      const noDigit = digit === '';
+      // Every line ends on a deliberate scan. Where the bin has no check digit,
+      // the location code itself is the confirmation - committing on a bare
+      // Enter would let a stray scanner terminator receive the line.
+      rows += fieldRow(noDigit ? 'Check Digit (none set - scan the location label)' : 'Check Digit',
+        `<input id="mrc-cd" class="mrc-fc big" type="text" inputmode="${noDigit ? 'text' : 'numeric'}"
+           autocomplete="off" autocorrect="off" autocapitalize="characters" spellcheck="false"
+           placeholder="${noDigit ? 'Scan location code' : 'Scan check digit'}"/>`);
+      // The locating rule will hand back bins C7 then refuses on check-in.
+      if (c.location.status !== 1) {
+        rows += `<div class="mrc-banner">Heads up: this bin is marked inactive.
+          Check in may be refused - use the pencil to pick another.</div>`;
+      } else if (c.location.allow_multiple_items === 0) {
+        rows += `<div class="mrc-banner">Heads up: this bin only accepts one item code.
+          Check in may be refused - use the pencil to pick another.</div>`;
+      }
+    }
 
-  function renderBatch(errMsg) {
-    const root = document.getElementById('mrc-root');
-    if (!root) return;
-    State.screen = 'BATCH';
-    const c = State.cur;
-    if (!c) { renderScanItem(); return; }
+    // -- keep location -------------------------------------------------------
+    if (hasRcpt) {
+      const on = State.keepLocation, last = State.lastLocation?.location_code;
+      rows += `<div class="mrc-keep${on ? ' on' : ''}" id="mrc-keep">
+        <span class="mrc-keep-box">${on ? '&#10003;' : ''}</span>
+        <span class="mrc-keep-txt">Keep Location</span>
+        <span class="mrc-keep-sub">${on ? (last ? _esc(last) : 'locks in the next bin')
+                                        : 'uses suggested bin'}</span>
+      </div>`;
+    }
+
+    const canCheckin = hasLoc && !State.busy;
 
     root.innerHTML = `
-      <div class="mrc-screen" id="mrc-screen">
-        ${progressHtml('Batch tracked item', State.header?.receipt_num || State.receiptId,
-          `${_esc(c.item.item_code)} &middot; ${c.qty} ${_esc(uomName(c.uom))}`, 'amber')}
-        <div class="mrc-body">
-          ${errMsg ? `<div class="mrc-err-banner">${_esc(errMsg)}</div>` : ''}
-          <div class="mrc-field-lbl">Batch number</div>
-          <input id="mrc-batch-in" class="mrc-input" type="text" inputmode="none"
-            autocomplete="off" autocorrect="off" autocapitalize="characters" spellcheck="false"
-            placeholder="Scan or type batch" value="${_esc(c.batchNo || '')}"/>
-          <div class="mrc-field-lbl">Expiry date</div>
-          <input id="mrc-expiry-in" class="mrc-input" type="date"
-            value="${_esc(_toDateInput(c.expiry))}"/>
-          <div class="mrc-fb dim" id="mrc-fb">Enter on expiry to continue</div>
+      <div class="mrc-card">
+        <div class="mrc-card-hdr">
+          <span class="mrc-card-title">Receiving</span>
+          <span class="mrc-card-meta">${hasRcpt
+            ? `${done} / ${total} lines completed &middot; ${openUnits()} units open`
+            : 'Putaway &middot; one step check in &amp; locate'}</span>
+          <button class="mrc-voice${State.voiceEnabled ? '' : ' muted'}" id="mrc-voice"
+            title="Toggle voice" aria-label="Toggle voice">${State.voiceEnabled ? '&#128266;' : '&#128263;'}</button>
         </div>
-      </div>
-      <div class="mrc-actions">
-        <button id="mrc-back-btn" class="mrc-btn mrc-btn-secondary">&lt;- Back</button>
-        ${kbButtonHtml()}
-        <button id="mrc-next-btn" class="mrc-btn mrc-btn-primary">Next -&gt;</button>
+        <div class="mrc-prog"><div class="mrc-prog-fill" style="width:${pct}%"></div></div>
+        <div class="mrc-card-body" id="mrc-body">
+          ${State.err ? `<div class="mrc-banner">${_esc(State.err)}</div>` : ''}
+          ${State.failedItems.length ? `<div class="mrc-banner">Could not load ${
+            _esc(State.failedItems.join(', '))} - use the standard C7 window for those lines.</div>` : ''}
+          ${State.busy ? `<div class="mrc-static"><span class="mrc-spin"></span>${_esc(State.busy)}</div>` : ''}
+          ${rows}
+          <div class="mrc-fb ${State.fbType}" id="mrc-fb">${_esc(State.fb)}</div>
+        </div>
+        <div class="mrc-actions">
+          ${hasItem
+            ? `<button id="mrc-cancel" class="mrc-btn mrc-btn-secondary">Cancel line</button>`
+            : `<button id="mrc-newrcpt" class="mrc-btn mrc-btn-secondary">New receipt</button>`}
+          <button id="mrc-go" class="mrc-btn mrc-btn-primary" ${canCheckin ? '' : 'disabled'}>Check In</button>
+        </div>
       </div>`;
 
-    const bIn = document.getElementById('mrc-batch-in');
-    const eIn = document.getElementById('mrc-expiry-in');
-
-    bIn?.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' || e.keyCode === 13) { e.preventDefault(); Keyboard.close(); eIn?.focus(); }
-    });
-    eIn?.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' || e.keyCode === 13) { e.preventDefault(); submitBatch(); }
-    });
-    document.getElementById('mrc-next-btn')?.addEventListener('click', submitBatch);
-    document.getElementById('mrc-back-btn')?.addEventListener('click', () => {
-      Keyboard.close(); renderQty();
-    });
-    wireVoiceBtn('mrc-batch-in');
-    wireKbButton('mrc-batch-in', 'alpha', () => { Keyboard.close(); eIn?.focus(); }, 'Batch number');
-    setTimeout(() => bIn?.focus(), 90);
-    setTimeout(measureHeight, 30);
+    wire(stage);
+    focusStage(stage);
+    setTimeout(measureHeight, 20);
   }
 
   function _toDateInput(v) {
@@ -1853,276 +1085,427 @@
     return '';
   }
 
-  function submitBatch() {
-    const c = State.cur;
-    if (!c) return;
-    const batchNo = _normaliseScan((document.getElementById('mrc-batch-in')?.value || '').trim());
-    const expiry  = (document.getElementById('mrc-expiry-in')?.value || '').trim();
-
-    if (!batchNo) { reject('Batch number is required', 'Batch required'); return; }
-
-    // If the receipt declared an expected batch, flag a mismatch but let it through.
-    if (c.detail.expected_batch_no &&
-        String(c.detail.expected_batch_no).trim().toLowerCase() !== batchNo.toLowerCase()) {
-      Audio.chime('warn');
-      setFb(`Expected batch ${c.detail.expected_batch_no}`, 'err');
-    }
-
-    c.batchNo = batchNo;
-    c.expiry  = expiry;
-    beginLocation();
+  function focusStage(stage) {
+    const id = { receipt: 'mrc-receipt', item: 'mrc-item', qty: 'mrc-qty',
+                 batch: 'mrc-batch', location: 'mrc-loc', checkdigit: 'mrc-cd' }[stage];
+    if (!id) return;
+    setTimeout(() => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.focus();
+      // Select the value so a scan replaces it rather than appending.
+      if (el.value) { try { el.select(); } catch (_) {} }
+      // Keeps the live row clear of the native keyboard once it slides up.
+      try { el.scrollIntoView({ block: 'nearest' }); } catch (_) {}
+    }, 60);
   }
 
-  // ---------------------------------------------------------------------------
-  // 14. SCREEN E - LOCATION
-  // ---------------------------------------------------------------------------
-
-  async function beginLocation() {
-    const c = State.cur;
-    if (!c) { renderScanItem(); return; }
-    State.screen = 'TRANSITIONING';
-
-    // Keep Location wins outright and skips the locating-rule round trip.
-    if (State.keepLocation && State.lastLocation) {
-      c.location  = State.lastLocation;
-      c.suggested = State.lastLocation;
-      c.viaKeep   = true;
-      renderCheckDigit();
-      return;
-    }
-
-    const root = document.getElementById('mrc-root');
-    if (root) root.innerHTML = `<div class="mrc-loading"><div class="mrc-spinner"></div>Finding location...</div>`;
-
-    const loc = await fetchSuggestedLocation(c.detail, c.item, c.uom, c.qty, c.batchNo);
-    const code = String(loc?.location_code || '').trim();
-
-    // 'NEW' (or nothing at all) means the item has no existing home.
-    // Do not suggest anything - make the operator scan a bin.
-    const isNoLocation =
-      !loc || !loc.id || NO_LOCATION_TOKENS.includes(code.toLowerCase());
-
-    if (isNoLocation) {
-      c.location = null;
-      c.suggested = null;
-      renderLocationScan();
-    } else {
-      c.location  = loc;
-      c.suggested = loc;
-      renderCheckDigit();
-    }
-  }
-
-  // E1 - no suggestion: blank field, red warning, operator scans the bin
-  function renderLocationScan(errMsg) {
-    const root = document.getElementById('mrc-root');
-    if (!root) return;
-    State.screen = 'LOCATION_SCAN';
-    const c = State.cur;
-    if (!c) { renderScanItem(); return; }
-
-    root.innerHTML = `
-      <div class="mrc-screen" id="mrc-screen">
-        ${progressHtml('Put away', c.item.item_code,
-          `${c.qty} ${_esc(uomName(c.uom))}${c.batchNo ? ' &middot; ' + _esc(c.batchNo) : ''}`, 'red')}
-        <div class="mrc-body">
-          ${errMsg ? `<div class="mrc-err-banner">${_esc(errMsg)}</div>` : ''}
-          <div class="mrc-warn-red">NO EXISTING LOCATION</div>
-          <div class="mrc-zone red">
-            <div class="mrc-zone-lbl">Scan the location you are using</div>
-            <input id="mrc-loc-in" class="mrc-input big nolocation" type="text" inputmode="none"
-              autocomplete="off" autocorrect="off" autocapitalize="characters" spellcheck="false"
-              placeholder="" value=""/>
-          </div>
-          <div class="mrc-fb dim" id="mrc-fb">Ready to scan</div>
-          ${renderKeepHtml()}
-        </div>
-      </div>
-      <div class="mrc-actions">
-        <button id="mrc-back-btn" class="mrc-btn mrc-btn-secondary">&lt;- Back</button>
-        ${kbButtonHtml()}
-      </div>`;
-
-    const inp = document.getElementById('mrc-loc-in');
-
-    const submitLoc = async (rawVal) => {
-      const raw = _normaliseScan(String(rawVal ?? inp.value).trim());
-      if (!raw) return;
-      inp.disabled = true;
-      const loc = await resolveLocation(raw);
-      inp.disabled = false;
-      const retry = (msg) => {
-        inp.value = '';
-        reject(msg, msg);
-        setTimeout(() => inp.focus(), 60);
-      };
-      if (!loc)               return retry('Location not found');
-      if (loc.status !== 1)   return retry('Location is inactive');
-      Keyboard.close();
-      c.location = loc;
-      setFb('Location accepted', 'ok');
-      Audio.chime('item_ok');
-      renderCheckDigit();
-    };
-
-    inp?.addEventListener('keydown', (e) => {
-      if (e.key !== 'Enter' && e.keyCode !== 13) return;
-      e.preventDefault();
-      submitLoc();
+  function onEnter(el, fn) {
+    el?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.keyCode === 13) { e.preventDefault(); fn(el.value); }
     });
-    document.getElementById('mrc-back-btn')?.addEventListener('click', () => {
-      Keyboard.close(); backFromLocation();
-    });
-    wireVoiceBtn('mrc-loc-in');
-    wireKeepToggle('mrc-loc-in');
-    wireTapRefocus('mrc-loc-in');
-    wireKbButton('mrc-loc-in', 'alpha', submitLoc, 'Location code');
-    setTimeout(() => inp?.focus(), 100);
-    setTimeout(measureHeight, 30);
-    Voice.announceNoLocation();
   }
 
-  // E2 - location known (suggested or kept): scan its check digit and we are done
-  function renderCheckDigit(errMsg) {
-    const root = document.getElementById('mrc-root');
-    if (!root) return;
-    State.screen = 'CHECK_DIGIT';
-    const c = State.cur;
-    if (!c || !c.location) { renderScanItem(); return; }
-
-    // Every line ends on a deliberate scan. Where the bin has no check digit
-    // configured, the location code itself becomes the confirmation - committing
-    // on a bare Enter would let a stray scanner terminator receive the line.
-    const digit    = String(c.location.check_digit ?? '').trim();
-    const locCode  = String(c.location.location_code ?? '').trim();
-    const noDigit  = digit === '';
-    const expected = noDigit ? locCode : digit;
-
-    // The locating rule will happily hand back a bin that C7 then refuses on
-    // check-in (inactive, or single-item and already occupied). Flag it here so
-    // the operator finds out at the terminal, not after walking to the aisle.
-    const suspect =
-      c.location.status !== 1                  ? 'this bin is marked inactive'
-      : c.location.allow_multiple_items === 0   ? 'this bin only accepts one item code'
-      : '';
-
-    root.innerHTML = `
-      <div class="mrc-screen" id="mrc-screen">
-        ${progressHtml('Put away', c.location.location_code,
-          `${_esc(c.item.item_code)} &middot; ${c.qty} ${_esc(uomName(c.uom))}` +
-          `${c.viaKeep ? ' &middot; KEPT' : ''}${c.batchNo ? ' &middot; ' + _esc(c.batchNo) : ''}`,
-          'green', true)}
-        <div class="mrc-item verified">
-          <div class="mrc-item-sku">${_esc(c.item.item_code)}</div>
-          <div class="mrc-item-desc">${_esc(c.item.description || '')}</div>
-          <div class="mrc-open-row">
-            <div class="mrc-open-cell">
-              <span class="mrc-open-lbl">Put away</span>
-              <span class="mrc-open-val" style="color:#79c447">${c.qty}</span>
-            </div>
-            <div class="mrc-open-cell">
-              <span class="mrc-open-lbl">${_esc(uomName(c.uom))}</span>
-              <span class="mrc-open-val" style="font-size:16px;color:#9faecb">x${c.uom.factor || 1}</span>
-            </div>
-          </div>
-        </div>
-        <div class="mrc-body">
-          ${errMsg ? `<div class="mrc-err-banner">${_esc(errMsg)}</div>` : ''}
-          ${!errMsg && suspect ? `<div class="mrc-err-banner">Heads up: ${_esc(suspect)}.
-            Check in may be refused - "Other bin" if it is.</div>` : ''}
-          <div class="mrc-zone${noDigit ? ' amber' : ''}">
-            <div class="mrc-zone-lbl">${noDigit
-              ? 'No check digit - scan the location label' : 'Scan check digit'}</div>
-            <div class="mrc-arrows">&gt;&gt;&gt;</div>
-            <input id="mrc-cd-in" class="mrc-hidden-in" type="text" inputmode="none"
-              autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"/>
-          </div>
-          <div class="mrc-fb dim" id="mrc-fb">Ready to scan</div>
-          ${renderKeepHtml()}
-        </div>
-      </div>
-      <div class="mrc-actions">
-        <button id="mrc-back-btn" class="mrc-btn mrc-btn-secondary">&lt;- Back</button>
-        ${kbButtonHtml()}
-      </div>`;
-
-    const inp = document.getElementById('mrc-cd-in');
-
-    const submitCd = (rawVal) => {
-      const raw = _normaliseScan(String(rawVal ?? inp.value).trim());
-      inp.value = '';
-      if (!raw) return;
-      // Accept the check digit, or the full location code - some C7 location
-      // templates set check_digit to the code itself.
-      const ok = raw.toLowerCase() === expected.toLowerCase() ||
-                 raw.toUpperCase() === locCode.toUpperCase();
-      if (ok) { Keyboard.close(); doCheckin(); }
-      else {
-        const m = noDigit ? 'Wrong location' : 'Wrong check digit';
-        reject(m, m);
-        setTimeout(() => inp.focus(), 60);
-      }
-    };
-
-    inp?.addEventListener('keydown', (e) => {
-      if (e.key !== 'Enter' && e.keyCode !== 13) return;
-      e.preventDefault();
-      submitCd();
+  function wire(stage) {
+    document.getElementById('mrc-voice')?.addEventListener('click', () => {
+      State.voiceEnabled = !State.voiceEnabled;
+      try { sessionStorage.setItem('mrc_voice', State.voiceEnabled ? '1' : '0'); } catch (_) {}
+      if (!State.voiceEnabled) Voice.cancel();
+      render();
     });
 
-    document.getElementById('mrc-back-btn')?.addEventListener('click', () => {
-      Keyboard.close(); backFromLocation();
-    });
-    wireEditLocation();
-    wireVoiceBtn('mrc-cd-in');
-    wireKeepToggle('mrc-cd-in');
-    wireTapRefocus('mrc-cd-in');
-    // Check digits are numeric, but the ABC toggle is one tap away.
-    wireKbButton('mrc-cd-in', 'num', submitCd, noDigit ? 'Location code' : 'Check digit');
-    setTimeout(() => inp?.focus(), 100);
-    setTimeout(measureHeight, 30);
-    setTimeout(() => Voice.announcePutaway(
-      c.qty, uomName(c.uom), c.location.location_code, State.lastLocation?.location_code
-    ), 140);
-  }
-
-  // ---------------------------------------------------------------------------
-  // 15. KEEP LOCATION
-  // ---------------------------------------------------------------------------
-
-  function renderKeepHtml() {
-    const on   = State.keepLocation;
-    const last = State.lastLocation?.location_code;
-    return `
-      <div class="mrc-keep${on ? ' on' : ''}" id="mrc-keep">
-        <span class="mrc-keep-box">${on ? '✓' : ''}</span>
-        <span class="mrc-keep-txt">Keep Location</span>
-        <span class="mrc-keep-sub">${on
-          ? (last ? _esc(last) : 'next bin will be locked in')
-          : 'uses suggested bin'}</span>
-      </div>`;
-  }
-
-  function wireKeepToggle(refocusId) {
     document.getElementById('mrc-keep')?.addEventListener('click', () => {
       State.keepLocation = !State.keepLocation;
       try { sessionStorage.setItem('mrc_keeploc', State.keepLocation ? '1' : '0'); } catch (_) {}
-      // If turned on while a location is already on screen, adopt it as the kept bin.
       if (State.keepLocation && State.cur?.location) State.lastLocation = State.cur.location;
-      const el = document.getElementById('mrc-keep');
-      if (el) el.outerHTML = renderKeepHtml();
-      wireKeepToggle(refocusId);
       if (navigator.vibrate) navigator.vibrate([20]);
-      if (refocusId) setTimeout(() => document.getElementById(refocusId)?.focus(), 60);
+      render();
     });
+
+    document.getElementById('mrc-newrcpt')?.addEventListener('click', () => {
+      State.resetReceipt(); render();
+    });
+    document.getElementById('mrc-cancel')?.addEventListener('click', () => {
+      State.resetLine(); render();
+    });
+    document.getElementById('mrc-go')?.addEventListener('click', () => submitCheckDigit(
+      document.getElementById('mrc-cd')?.value || ''));
+
+    // -- pencils: step back to a row already filled in ----------------------
+    document.getElementById('mrc-edit-receipt')?.addEventListener('click', () => {
+      State.resetReceipt(); render();
+    });
+    document.getElementById('mrc-edit-item')?.addEventListener('click', () => {
+      State.resetLine(); render();
+    });
+    document.getElementById('mrc-edit-qty')?.addEventListener('click', () => {
+      const c = State.cur;
+      if (!c) return;
+      c.qtyDone = false;
+      c.location = null; c.locResolved = false; c.viaKeep = false;
+      say('', 'dim'); render();
+    });
+    document.getElementById('mrc-edit-batch')?.addEventListener('click', () => {
+      const c = State.cur;
+      if (!c) return;
+      c.batchDone = false;
+      c.location = null; c.locResolved = false; c.viaKeep = false;
+      render();
+    });
+    // Clear the location entirely so a new bin can be scanned.
+    document.getElementById('mrc-edit-loc')?.addEventListener('click', () => {
+      const c = State.cur;
+      if (!c) return;
+      c.location = null; c.suggested = null; c.viaKeep = false; c.locResolved = true;
+      if (navigator.vibrate) navigator.vibrate([20]);
+      say('Scan the bin you are using', 'dim');
+      render();
+    });
+
+    onEnter(document.getElementById('mrc-receipt'), loadReceipt);
+    onEnter(document.getElementById('mrc-item'), submitItem);
+    onEnter(document.getElementById('mrc-qty'), submitQty);
+    onEnter(document.getElementById('mrc-loc'), submitLocation);
+    onEnter(document.getElementById('mrc-cd'), submitCheckDigit);
+
+    const bIn = document.getElementById('mrc-batch');
+    const eIn = document.getElementById('mrc-expiry');
+    onEnter(bIn, () => eIn?.focus());
+    onEnter(eIn, () => submitBatch());
+
+    const uom = document.getElementById('mrc-uom');
+    uom?.addEventListener('change', () => {
+      const c = State.cur;
+      const nu = (c.item.itemUnitOfMeasures || []).find(u => String(u.id) === uom.value);
+      // Switching pack size restarts the count at one pack of the new UoM.
+      if (nu) { c.uom = nu; c.qty = nu.factor || 1; say('', 'dim'); render(); }
+    });
+
+    // Live pack-count readout while typing the quantity.
+    const q = document.getElementById('mrc-qty');
+    q?.addEventListener('input', updateQtyHint);
+    if (stage === 'qty') updateQtyHint();
+  }
+
+  function updateQtyHint() {
+    const c = State.cur, el = document.getElementById('mrc-qty-hint');
+    if (!c || !el) return;
+    const factor = c.uom.factor || 1;
+    const open   = c.detail.open_quantity || 0;
+    const n = parseFloat(_normaliseScan((document.getElementById('mrc-qty')?.value || '').trim()));
+    if (isNaN(n) || n <= 0) { el.textContent = `Scan again to add ${factor}`; el.className = 'mrc-fb dim'; return; }
+    if (n > open) {
+      el.textContent = `${n} exceeds the ${open} open - you will be asked to confirm`;
+      el.className = 'mrc-fb err'; return;
+    }
+    if (n % factor !== 0) {
+      const lo = Math.floor(n / factor) * factor, hi = lo + factor;
+      el.textContent = `${n} is not a whole ${uomName(c.uom)} - try ${lo || factor} or ${hi}`;
+      el.className = 'mrc-fb err'; return;
+    }
+    el.textContent = `= ${n / factor} ${uomName(c.uom)}${n / factor === 1 ? '' : 's'}`;
+    el.className = 'mrc-fb ok';
   }
 
   // ---------------------------------------------------------------------------
-  // 16. CHECK IN (the write) + advance
+  // 10. STEP HANDLERS
   // ---------------------------------------------------------------------------
 
-  // Hard re-entrancy latch. A double trigger-pull on the check digit, or a
-  // scanner that repeats its terminator, must never produce two writes.
+  async function loadReceipt(raw) {
+    const id = _normaliseScan(String(raw || '').trim()).toUpperCase();
+    if (!id) return;
+    State.busy = 'Loading receipt...';
+    State.err = ''; State.fb = '';
+    State.receiptId = id;
+    render();
+    try {
+      await loadProfile();
+      if (!State.profile) throw new Error('No Putaway receiving profile available');
+
+      const header = await fetchReceiptHeader(id).catch(e => { if (e.notFound) return null; throw e; });
+      State.busy = null;
+      if (!header) {
+        State.header = null;
+        State.err = `Receipt ${id} not found, or nothing left to check in.`;
+        render(); Audio.chime('error'); Voice.error('Receipt not found');
+        return;
+      }
+      State.header  = header;
+      State.details = (header.receiptDetails || []).map(d => ({ ...d }));
+      State.done    = 0;
+      State.failedItems = [];
+      try { sessionStorage.setItem('mrc_lastreceipt', id); } catch (_) {}
+
+      if (!State.details.length) {
+        State.header = null;
+        State.err = `Receipt ${id} has no detail lines to receive.`;
+        render(); return;
+      }
+      State.busy = 'Caching items...';
+      render();
+      await buildItemCache(header);
+      loadLocations().catch(() => {});
+      State.busy = null;
+      say(`${openLines()} line${openLines() === 1 ? '' : 's'} to receive`, 'ok');
+      Audio.chime('item_ok');
+      render();
+    } catch (err) {
+      State.busy = null;
+      State.header = null;
+      State.err = 'Could not load receipt: ' + err.message;
+      render();
+    }
+  }
+
+  function submitItem(raw) {
+    const key = _normaliseScan(String(raw || '').trim()).toLowerCase();
+    if (!key) return;
+    const hit = State.refMap[key];
+    if (!hit) {
+      const onReceipt = State.details.some(d =>
+        String(d.item?.item_code || '').trim().toLowerCase() === key);
+      reject(onReceipt ? 'Item data failed to load - use C7 for this line'
+                       : 'Not on this receipt',
+             onReceipt ? 'Item data error' : 'Item not on this receipt');
+      return;
+    }
+    const item = State.itemsById[hit.itemId];
+    const detail = openDetailForItem(hit.itemId);
+    if (!item)   { reject('Item data missing - rescan', 'Item error'); return; }
+    if (!detail) { reject('No open quantity left on this item', 'Line already complete'); return; }
+
+    // Auto-select the UoM the scanned reference belongs to; still editable.
+    let uom = hit.uomId ? (item.itemUnitOfMeasures || []).find(u => u.id === hit.uomId) : null;
+    if (!uom) uom = defaultUomFor(item);
+    if (!uom) { reject('Item has no unit of measure', 'Item error'); return; }
+
+    State.cur = {
+      detail, item, uom,
+      // One scan = one pack. Scanning again on the quantity row adds another
+      // factor; typing replaces. Same count-up behaviour as Malpa Pack.
+      qty: uom.factor || 1,
+      batchNo: detail.expected_batch_no || '',
+      expiry:  detail.expected_batch_expiry || '',
+      qtyDone: false, batchDone: false,
+      location: null, suggested: null, locResolved: false, viaKeep: false,
+    };
+    say('Item verified', 'ok');
+    Audio.chime('item_ok');
+    flash('ok');
+    render();
+  }
+
+  function submitQty(raw) {
+    const c = State.cur;
+    if (!c) return;
+    const val    = _normaliseScan(String(raw || '').trim());
+    const factor = c.uom.factor || 1;
+    const open   = c.detail.open_quantity || 0;
+
+    // A scan landing in this field is a count-up, not a quantity. Match the whole
+    // value, or a barcode appended to what was already there ("6yenahyenah").
+    const refs = refsForItem(c.item);
+    const low  = val.toLowerCase();
+    let scanned = refs.includes(low);
+    let base    = null;
+    if (!scanned) {
+      for (const ref of refs) {
+        if (low.length > ref.length && low.endsWith(ref)) {
+          const prefix = low.slice(0, -ref.length);
+          if (prefix === '' || /^\d+$/.test(prefix)) { scanned = true; base = prefix; break; }
+        }
+      }
+    }
+    if (scanned) {
+      const from = base !== null ? (parseFloat(base) || 0) : (parseFloat(c.qty) || 0);
+      c.qty = from + factor;
+      Audio.chime('item_ok');
+      if (navigator.vibrate) navigator.vibrate([25]);
+      const el = document.getElementById('mrc-qty');
+      if (el) { el.value = String(c.qty); el.select(); }
+      updateQtyHint();
+      return;
+    }
+
+    const qty = parseFloat(val);
+    if (!val || isNaN(qty) || qty <= 0) { reject('Enter a quantity greater than zero', 'Invalid quantity'); return; }
+    if (!Number.isInteger(qty) && !c.item.allow_partial_units) {
+      reject('Whole units only for this item', 'Whole units only'); return;
+    }
+    // A factor-6 carton cannot hold 13 eaches.
+    if (factor > 1 && qty % factor !== 0) {
+      const lo = Math.floor(qty / factor) * factor, hi = lo + factor;
+      reject(`${qty} is not a whole ${uomName(c.uom)} (x${factor}) - use ${lo || factor} or ${hi}`,
+             `Not a whole ${uomName(c.uom)}`);
+      return;
+    }
+    c.qty = qty;
+
+    if (qty > open) {
+      if (!State.profile.allow_over_receiving) {
+        reject(`Over-receiving is off. Open is ${open}.`, 'Over receiving not allowed'); return;
+      }
+      showOverConfirm(qty, open);
+      return;
+    }
+    afterQty();
+  }
+
+  function afterQty() {
+    const c = State.cur;
+    c.qtyDone = true;
+    say('', 'dim');
+    if (isBatch(c.item) && !c.batchDone) { render(); return; }   // batch row next
+    beginLocation();
+  }
+
+  function submitBatch() {
+    const c = State.cur;
+    if (!c) return;
+    const b = _normaliseScan((document.getElementById('mrc-batch')?.value || '').trim());
+    const e = (document.getElementById('mrc-expiry')?.value || '').trim();
+    if (!b) { reject('Batch number is required', 'Batch required'); return; }
+    if (c.detail.expected_batch_no &&
+        String(c.detail.expected_batch_no).trim().toLowerCase() !== b.toLowerCase()) {
+      Audio.chime('warn');
+      say(`Expected batch ${c.detail.expected_batch_no}`, 'err');
+    } else {
+      say('', 'dim');
+    }
+    c.batchNo = b; c.expiry = e; c.batchDone = true;
+    beginLocation();
+  }
+
+  async function beginLocation() {
+    const c = State.cur;
+    if (!c) return;
+
+    // Keep Location wins outright and skips the locating-rule round trip.
+    if (State.keepLocation && State.lastLocation) {
+      c.location = State.lastLocation; c.suggested = State.lastLocation;
+      c.viaKeep = true; c.locResolved = true;
+      render();
+      Voice.putaway(c.qty, uomName(c.uom), c.location.location_code, null);
+      return;
+    }
+
+    c.locResolved = false;
+    render();
+    const loc  = await fetchSuggestedLocation(c.detail, c.item, c.uom, c.qty, c.batchNo);
+    const code = String(loc?.location_code || '').trim();
+    // 'NEW' (or nothing) means the item has no existing home - suggest nothing.
+    const none = !loc || !loc.id || NO_LOCATION_TOKENS.includes(code.toLowerCase());
+
+    c.locResolved = true;
+    if (none) {
+      c.location = null; c.suggested = null;
+      render();
+      Voice.noLocation();
+    } else {
+      c.location = loc; c.suggested = loc;
+      render();
+      Voice.putaway(c.qty, uomName(c.uom), loc.location_code, State.lastLocation?.location_code);
+    }
+  }
+
+  async function submitLocation(raw) {
+    const c = State.cur;
+    if (!c) return;
+    const code = _normaliseScan(String(raw || '').trim());
+    if (!code) return;
+    State.busy = 'Checking location...';
+    render();
+    const loc = await resolveLocation(code);
+    State.busy = null;
+    if (!loc)             { reject('Location not found', 'Location not found'); return; }
+    if (loc.status !== 1) { reject('Location is inactive', 'Location inactive'); return; }
+    c.location = loc;
+    say('Location accepted', 'ok');
+    Audio.chime('item_ok');
+    flash('ok');
+    render();
+    Voice.putaway(c.qty, uomName(c.uom), loc.location_code, State.lastLocation?.location_code);
+  }
+
+  function submitCheckDigit(raw) {
+    const c = State.cur;
+    if (!c || !c.location) return;
+    const digit   = String(c.location.check_digit ?? '').trim();
+    const locCode = String(c.location.location_code ?? '').trim();
+    const noDigit = digit === '';
+    const expect  = noDigit ? locCode : digit;
+    const val = _normaliseScan(String(raw || '').trim());
+    if (!val) return;
+    // Accept the check digit, or the location code - some C7 templates set
+    // check_digit to the code itself.
+    if (val.toLowerCase() === expect.toLowerCase() ||
+        val.toUpperCase() === locCode.toUpperCase()) {
+      doCheckin();
+    } else {
+      const el = document.getElementById('mrc-cd');
+      if (el) el.value = '';
+      reject(noDigit ? 'Wrong location' : 'Wrong check digit',
+             noDigit ? 'Wrong location' : 'Wrong check digit');
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // 11. OVER-RECEIVE (type OVER)
+  // ---------------------------------------------------------------------------
+
+  function showOverConfirm(qty, open) {
+    const card = document.querySelector('.mrc-card');
+    if (!card) return;
+    document.getElementById('mrc-over-ov')?.remove();
+    Audio.chime('warn');
+    Voice.error('Over receiving. Type OVER to confirm.');
+
+    const ov = document.createElement('div');
+    ov.className = 'mrc-ov';
+    ov.id = 'mrc-over-ov';
+    ov.innerHTML = `
+      <div class="mrc-ov-card">
+        <div class="mrc-ov-hdr">Over-receiving</div>
+        <div class="mrc-ov-body">
+          Receiving <strong>${qty}</strong> against an open quantity of <strong>${open}</strong>.<br><br>
+          Type <strong>OVER</strong> to confirm.
+          <input id="mrc-over" class="mrc-fc big" type="text" autocomplete="off"
+            autocorrect="off" autocapitalize="characters" spellcheck="false"
+            placeholder="OVER" style="margin-top:9px"/>
+          <div class="mrc-fb err" id="mrc-over-fb" style="min-height:15px"></div>
+        </div>
+        <div class="mrc-ov-acts">
+          <button id="mrc-over-yes" class="mrc-btn mrc-btn-danger">Confirm over-receive</button>
+          <button id="mrc-over-no"  class="mrc-btn mrc-btn-secondary">Cancel</button>
+        </div>
+      </div>`;
+    card.style.position = 'relative';
+    card.appendChild(ov);
+
+    const inp = document.getElementById('mrc-over');
+    const fb  = document.getElementById('mrc-over-fb');
+    const go = () => {
+      if (_normaliseScan((inp?.value || '').trim()).toUpperCase() === 'OVER') {
+        ov.remove(); afterQty();
+      } else {
+        if (fb) fb.textContent = 'Type OVER exactly to confirm';
+        Audio.chime('error');
+        if (navigator.vibrate) navigator.vibrate([60, 30, 60]);
+        if (inp) { inp.value = ''; inp.focus(); }
+      }
+    };
+    onEnter(inp, go);
+    document.getElementById('mrc-over-yes')?.addEventListener('click', go);
+    document.getElementById('mrc-over-no')?.addEventListener('click', () => { ov.remove(); render(); });
+    setTimeout(() => inp?.focus(), 90);
+  }
+
+  // ---------------------------------------------------------------------------
+  // 12. CHECK IN (the write)
+  // ---------------------------------------------------------------------------
+
+  // Hard re-entrancy latch: a double trigger-pull on the check digit, or a
+  // scanner repeating its terminator, must never produce two writes.
   let _writeInFlight = false;
 
   async function doCheckin() {
@@ -2130,51 +1513,40 @@
     if (!c || !c.location || _writeInFlight) return;
     _writeInFlight = true;
 
-    State.screen = 'TRANSITIONING';
-    Keyboard.close();
-    setFb('Checking in...', 'dim');
-    document.querySelector('.mrc-item')?.classList.add('verified');
+    State.busy = 'Checking in...';
+    State.fb = '';
+    render();
+    document.querySelectorAll('#mrc-root input, #mrc-root select, #mrc-root button')
+      .forEach(el => { el.disabled = true; });
 
-    // Freeze every control that could mutate State.cur mid-flight. "Other bin"
-    // in particular would null out c.location while the write is in the air.
-    const cdIn = document.getElementById('mrc-cd-in');
-    if (cdIn) cdIn.disabled = true;
-    document.querySelectorAll('.mrc-actions .mrc-btn').forEach(b => { b.disabled = true; });
-
-    // Snapshot everything the success path needs, so nothing can be pulled out
-    // from under us between the await and the render.
+    // Snapshot the success path's inputs so nothing can be pulled out from
+    // under us between the await and the render.
     const detailId   = c.detail.id;
     const locRec     = c.location;
     const qty        = c.qty;
     const uomLabel   = uomName(c.uom);
-    const baseQty    = qty;   // quantity is already in base units
+    const baseQty    = qty;                       // quantity is already base units
     const openBefore = c.detail.open_quantity || 0;
 
     try {
       let result, recoveredOpen = null;
-
       try {
         result = await postCheckin(c.detail, c.item, c.uom, qty, locRec.id);
       } catch (firstErr) {
         if (firstErr.message?.includes('Session expired')) throw firstErr;
-
-        // A C7 business rejection (numeric `code`, e.g. 1087 "Multiple Items not
-        // allowed in this location") is deterministic - it committed nothing and
-        // re-posting would only fail again. Surface it straight away.
+        // Deterministic refusal - nothing was written, so surface it now.
         if (firstErr.c7Code) throw firstErr;
 
-        // The first POST may well have COMMITTED before the error surfaced -
-        // proxy timeout, dropped socket, or a non-JSON 200. C7's checkin has no
-        // idempotency key, so blindly re-posting would double-receive the stock.
-        // Ask C7 what the line looks like now and only retry if it clearly did
-        // not land.
+        // The first POST may have COMMITTED before the error surfaced (proxy
+        // timeout, dropped socket, non-JSON 200). Checkin has no idempotency
+        // key, so blindly re-posting would double-receive. Ask C7 what the line
+        // looks like now and only retry if the stock clearly did not land.
         const fresh = await refreshDetail(c.detail, c.item).catch(() => null);
-
         if (fresh && typeof fresh.open_quantity === 'number' &&
             fresh.open_quantity <= openBefore - baseQty) {
           console.warn('[MalpaRecv] first checkin landed despite error - NOT retrying');
           recoveredOpen = Math.max(0, fresh.open_quantity);
-          result = { total: recoveredOpen, location: null };
+          result = { total: null };
         } else {
           if (fresh?.id) {
             c.detail = { ...c.detail, ...fresh };
@@ -2192,7 +1564,6 @@
       State.done++;
       State.lastLocation = locRec;
 
-      // Maintain open_quantity locally so the next scan costs no round trip.
       let idx = State.details.findIndex(d => d.id === detailId);
       if (idx < 0) idx = State.details.findIndex(d => d.id === c.detail.id);
       if (idx >= 0) {
@@ -2200,143 +1571,87 @@
         d.open_quantity = recoveredOpen !== null
           ? recoveredOpen
           : Math.max(0, (d.open_quantity || 0) - baseQty);
-        // updated_at is deliberately NOT touched - C7 owns that value and a
-        // locally-invented timestamp could fail an optimistic-lock check.
-        c.detail = d;
-        if (d.open_quantity <= 0) State.linesDone.add(d.id);
+        // updated_at is deliberately NOT touched - C7 owns that value.
       } else {
-        // Should not happen, but never guess: re-read the receipt rather than
-        // leave a line that can be received twice or block completion.
-        console.warn('[MalpaRecv] detail', detailId, 'not in local state - reloading');
+        console.warn('[MalpaRecv] detail', detailId, 'not local - reloading');
         await reloadDetails();
       }
 
-      // C7 returns `total` = open quantity remaining across the WHOLE receipt
+      // `total` is the open quantity remaining across the WHOLE receipt
       // (verified: a 101-unit receipt returned 41 after a 60-unit check-in).
-      // That is authoritative, so prefer it over local arithmetic.
-      const remaining = (result && typeof result.total === 'number')
-        ? result.total : openUnits();
+      const remaining = (result && typeof result.total === 'number') ? result.total : openUnits();
 
-      if (remaining <= 0) renderReceiptComplete();
-      else renderScanItem(`Checked in ${qty} ${uomLabel} to ${locRec.location_code}`, 'ok');
-
+      State.busy = null;
+      State.cur  = null;
+      if (remaining <= 0) {
+        Audio.chime('receipt_done');
+        Voice.speak('Receipt complete');
+        if (navigator.vibrate) navigator.vibrate([30, 50, 30, 50, 60]);
+        say(`Receipt complete - ${linesCompleted()} of ${totalDetailLines()} lines received`, 'ok');
+      } else {
+        say(`Checked in ${qty} ${uomLabel} to ${locRec.location_code}`, 'ok');
+      }
+      flash('ok');
+      render();
     } catch (err) {
       console.error('[MalpaRecv] checkin failed:', err);
       Audio.chime('error');
       Voice.error('Check in failed');
       if (navigator.vibrate) navigator.vibrate([60, 30, 60]);
-      // Nothing was committed, so the line is untouched and rescanning is safe.
-      State.screen = 'CHECK_DIGIT';
-      // 1087 = the bin already holds a different item and is flagged single-item.
-      // Retrying the same bin can never work, so point at "Other bin" instead.
-      const hint = err.c7Code === 1087
-        ? ' - this bin will not take a second item. Tap "Other bin".'
-        : ' - nothing was received. Scan again to retry.';
-      renderCheckDigit('Check in failed: ' + err.message + hint);
+      State.busy = null;
+      // 1087 = bin already holds a different item and is flagged single-item.
+      State.err = 'Check in failed: ' + err.message + (err.c7Code === 1087
+        ? ' - this bin will not take a second item. Use the pencil to pick another.'
+        : ' - nothing was received.');
+      render();
     } finally {
       _writeInFlight = false;
     }
   }
 
-  // Re-read the receipt's detail lines from C7 and rebuild local state.
   async function reloadDetails() {
     try {
       const header = await fetchReceiptHeader(State.receiptId);
       if (!header) { State.details = []; return; }
-      State.header  = header;
+      State.header = header;
       State.details = (header.receiptDetails || []).map(d => ({ ...d }));
-    } catch (e) {
-      console.warn('[MalpaRecv] reloadDetails failed:', e.message);
-    }
+    } catch (e) { console.warn('[MalpaRecv] reloadDetails:', e.message); }
   }
 
   // ---------------------------------------------------------------------------
-  // 17. RECEIPT COMPLETE
+  // 13. FOCUS RECOVERY  (TC51 sleep / notification steals focus)
   // ---------------------------------------------------------------------------
-
-  function renderReceiptComplete() {
-    const root = document.getElementById('mrc-root');
-    if (!root) return;
-    State.screen = 'RECEIPT_COMPLETE';
-    const num = State.header?.receipt_num || State.receiptId;
-
-    root.innerHTML = `
-      <div class="mrc-screen" id="mrc-screen">
-        ${progressHtml('Receipt complete', num, 'All lines checked in and located', 'green')}
-        <div class="mrc-center">
-          <div style="font-size:44px;line-height:1;color:#79c447;font-weight:700">&#10003;</div>
-          <div style="font-size:19px;font-weight:700;color:#3a8f3a">Receipt complete</div>
-          <div style="font-size:13px;color:#9faecb">${linesCompleted()} of ${
-            totalDetailLines()} line${totalDetailLines() === 1 ? '' : 's'} completed${
-            State.done > linesCompleted() ? ` in ${State.done} put-aways` : ''}</div>
-          <div style="font-size:12px;color:#9faecb">${_esc(State.header?.company?.company_code || '')}</div>
-        </div>
-      </div>
-      <div class="mrc-actions">
-        <button id="mrc-next-receipt" class="mrc-btn mrc-btn-primary">Next Receipt</button>
-      </div>`;
-
-    Audio.chime('receipt_done');
-    Voice.speak('Receipt complete');
-    if (navigator.vibrate) navigator.vibrate([30, 50, 30, 50, 60]);
-
-    document.getElementById('mrc-next-receipt')?.addEventListener('click', () => {
-      State.resetReceipt();
-      renderReceiptEntry();
-    });
-    setTimeout(measureHeight, 30);
-  }
-
-  // ---------------------------------------------------------------------------
-  // 18. FOCUS RECOVERY  (TC51 sleep / notification steals focus)
-  // ---------------------------------------------------------------------------
-
-  const _FOCUS_MAP = {
-    RECEIPT_ENTRY: 'mrc-receipt-in',
-    SCAN_ITEM:     'mrc-scan-in',
-    QTY:           'mrc-qty-scan',
-    BATCH:         'mrc-batch-in',
-    LOCATION_SCAN: 'mrc-loc-in',
-    CHECK_DIGIT:   'mrc-cd-in',
-    OVER_CONFIRM:  'mrc-over-in',
-  };
 
   function _refocus() {
-    // Never pull focus while we are minimised behind a C7 tab - the operator is
-    // typing in Canary7, not in us.
     if (!isForeground()) return;
-    const id = _FOCUS_MAP[State.screen];
-    if (!id) return;
-    const el = document.getElementById(id);
-    if (!el || !document.contains(el)) return;
-    if (document.activeElement === el) return;
-    el.focus();
+    // Only reclaim focus if it has drifted off our form entirely - never fight
+    // the operator while they are in one of our fields.
+    const root = document.getElementById('mrc-root');
+    if (!root || root.contains(document.activeElement)) return;
+    const el = root.querySelector('input:not([disabled]), select:not([disabled])');
+    if (el) el.focus();
   }
 
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') setTimeout(_refocus, 300);
   });
   window.addEventListener('focus', () => setTimeout(_refocus, 200));
-  setInterval(() => {
-    if (!isForeground()) return;
-    _refocus();
-  }, 2500);
+  setInterval(() => { if (isForeground()) _refocus(); }, 2500);
 
   // ---------------------------------------------------------------------------
-  // 19. CLOSE / KEYBOARD
+  // 14. CLOSE / KEYBOARD
   // ---------------------------------------------------------------------------
 
   function closeUI() {
     document.removeEventListener('keydown', onGlobalKey);
     window.removeEventListener('resize', measureHeight);
     Voice.cancel();
-    Keyboard.close();
 
     if (!R._sidebarWasMinimized) document.body.classList.remove('sidebar-minimized');
     if (!R._brandWasMinimized)   document.body.classList.remove('brand-minimized');
 
-    // Clear our inline display:none off EVERY C7 panel we hid. Missing any one
-    // of them leaves that tab permanently blank, even after we are gone.
+    // Clear our inline display:none off EVERY C7 panel we hid - missing one
+    // leaves that tab permanently blank.
     restoreC7Panels();
 
     const tabBar     = document.querySelector('ul.nav.nav-tabs[role="tablist"]');
@@ -2350,7 +1665,6 @@
       R._tabGuard = null;
     }
 
-    // Hand the foreground back to whichever C7 tab we took it from.
     const li = (R._prevActiveLi && document.contains(R._prevActiveLi))
       ? R._prevActiveLi
       : (tabBar && Array.from(tabBar.querySelectorAll('li.nav-item')).pop());
@@ -2359,26 +1673,23 @@
     const panels = tabContent
       ? Array.from(tabContent.querySelectorAll(':scope > tab, :scope > .tab-pane')) : [];
     const panel = (R._prevActivePanel && document.contains(R._prevActivePanel))
-      ? R._prevActivePanel
-      : panels[panels.length - 1];
-    if (panel) {
-      panel.classList.add('active');
-      panel.style.display = '';
-    }
+      ? R._prevActivePanel : panels[panels.length - 1];
+    if (panel) { panel.classList.add('active'); panel.style.display = ''; }
 
     State.resetReceipt();
-    State.screen = 'RECEIPT_ENTRY';
     R = {};
   }
 
   function onGlobalKey(e) {
-    // Esc must not close us while the operator is working in a C7 tab.
     if (!isForeground()) return;
-    if (e.key === 'Escape') { e.preventDefault(); closeUI(); }
+    // Esc must not fire while the operator is typing in a field.
+    if (e.key === 'Escape' && !document.getElementById('mrc-root')?.contains(document.activeElement)) {
+      e.preventDefault(); closeUI();
+    }
   }
 
   // ---------------------------------------------------------------------------
-  // 20. OPEN
+  // 15. OPEN
   // ---------------------------------------------------------------------------
 
   function openReceiving() {
@@ -2389,16 +1700,15 @@
       injectCSS();
       buildShell();
     } catch (err) {
-      console.error('[MalpaRecv] openReceiving error:', err);
+      console.error('[MalpaRecv] open error:', err);
       const d = document.createElement('div');
       d.style.cssText = 'position:fixed;top:80px;left:210px;right:20px;z-index:99999;' +
-        'background:#7f1d1d;color:#fff;padding:16px 20px;border-radius:6px;' +
-        'font-family:monospace;font-size:13px;white-space:pre-wrap;';
-      d.textContent = '[MalpaRecv Error] ' + err.message + '\n\n' + err.stack;
+        'background:#7f1d1d;color:#fff;padding:16px 20px;font-family:monospace;' +
+        'font-size:13px;white-space:pre-wrap;';
+      d.textContent = '[MalpaRecv] ' + err.message + '\n\n' + err.stack;
       const x = document.createElement('button');
-      x.textContent = 'x';
-      x.style.cssText = 'float:right;background:none;border:none;color:#fff;font-size:20px;' +
-        'cursor:pointer;margin:-4px -4px 0 0;';
+      x.textContent = '×';
+      x.style.cssText = 'float:right;background:none;border:none;color:#fff;font-size:20px;cursor:pointer';
       x.onclick = () => d.remove();
       d.prepend(x);
       document.body.appendChild(d);
@@ -2406,7 +1716,7 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 21. BOOT
+  // 16. BOOT
   // ---------------------------------------------------------------------------
 
   captureSessionId();
@@ -2419,19 +1729,13 @@
 
   let _attempts = 0;
   function tryInject() {
-    if (document.querySelector('div.sidebar nav li.nav-item')) {
-      injectCSS();
-      injectNav();
-      return;
-    }
+    if (document.querySelector('div.sidebar nav li.nav-item')) { injectCSS(); injectNav(); return; }
     if (++_attempts < 80) setTimeout(tryInject, 500);
   }
 
   new MutationObserver(() => {
     if (!document.getElementById('mrc-nav') &&
-        document.querySelector('div.sidebar nav li.nav-item')) {
-      injectNav();
-    }
+        document.querySelector('div.sidebar nav li.nav-item')) injectNav();
   }).observe(document.body, { childList: true, subtree: true });
 
   tryInject();
