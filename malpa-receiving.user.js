@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Receiving
 // @namespace    https://malpa.canary7.com
-// @version      2.2.2
+// @version      2.2.3
 // @description  Fast single-screen receiving for Canary7 WMS - TC51 optimised
 // @author       Malpa 3PL
 // @updateURL    https://raw.githubusercontent.com/zaynnev/malpa3pl/main/malpa-receiving.user.js
@@ -278,7 +278,7 @@
       #mrc-root.compact .mrc-fg, #mrc-root.compact .mrc-split { margin:.3rem 0 .2rem; }
       #mrc-root.compact .mrc-static { padding:1px 0; }
       #mrc-root.compact .mrc-keep { padding:3px 0 0; }
-      #mrc-root.compact .mrc-actions { padding:.3rem .6rem; }
+      #mrc-root.compact .mrc-actions { margin:.5rem 0 .2rem; padding-top:.4rem; }
       #mrc-root.compact .mrc-btn { min-height:36px; }
 
       /* ---- completed rows: one compact line each, so the whole flow fits ---- */
@@ -365,10 +365,13 @@
       .mrc-keep-txt { font-size:13px; color:#374767; }
       .mrc-keep-sub { font-size:12px; color:#9faecb; }
 
-      /* ---- buttons ---- */
+      /* ---- buttons ----
+         These sit INSIDE the form, below the last field, rather than pinned to
+         the bottom edge. Pinned to the footer they hugged the screen edge and
+         were far too easy to hit when aiming at empty space below a field. */
       .mrc-actions {
-        flex-shrink:0; display:flex; gap:6px; padding:.5rem .75rem;
-        background:#f9f9fa; border-top:1px solid #e1e6ef;
+        display:flex; gap:8px; margin:1rem 0 .25rem;
+        padding-top:.6rem; border-top:1px solid #e1e6ef;
       }
       .mrc-btn {
         flex:1; min-height:42px; display:inline-flex; align-items:center; justify-content:center;
@@ -1211,12 +1214,12 @@
           ${State.busy ? `<div class="mrc-static"><span class="mrc-spin"></span>${_esc(State.busy)}</div>` : ''}
           ${rows}
           <div class="mrc-fb ${State.fbType}" id="mrc-fb">${_esc(State.fb)}</div>
-        </div>
-        <div class="mrc-actions">
-          ${hasItem
-            ? `<button id="mrc-cancel" class="mrc-btn mrc-btn-secondary">Cancel line</button>`
-            : `<button id="mrc-newrcpt" class="mrc-btn mrc-btn-secondary">New receipt</button>`}
-          <button id="mrc-go" class="mrc-btn mrc-btn-primary" ${canCheckin ? '' : 'disabled'}>Check In</button>
+          <div class="mrc-actions">
+            ${hasItem
+              ? `<button id="mrc-cancel" class="mrc-btn mrc-btn-secondary">Cancel line</button>`
+              : `<button id="mrc-newrcpt" class="mrc-btn mrc-btn-secondary">New receipt</button>`}
+            <button id="mrc-go" class="mrc-btn mrc-btn-primary" ${canCheckin ? '' : 'disabled'}>Check In</button>
+          </div>
         </div>
       </div>`;
 
