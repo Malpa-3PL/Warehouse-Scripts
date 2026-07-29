@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Receiving
 // @namespace    https://malpa.canary7.com
-// @version      2.0.0
+// @version      2.1.0
 // @description  Fast receiving interface for Canary7 WMS - TC51 optimised
 // @author       Malpa 3PL
 // @updateURL    https://raw.githubusercontent.com/zaynnev/malpa3pl/main/malpa-receiving.user.js
@@ -443,9 +443,10 @@
       .mrc-actions .mrc-btn { flex:1; min-height:44px; font-size:13px; padding:0 8px; }
 
       /* ---- overlays ---- */
+      /* Top-aligned so the docked keyboard never covers the modal's input. */
       .mrc-ov {
         position:absolute; inset:0; background:rgba(0,0,0,.62); display:flex;
-        align-items:center; justify-content:center; z-index:200; padding:18px;
+        align-items:flex-start; justify-content:center; z-index:200; padding:14px;
       }
       .mrc-ov-card { background:#fff; width:100%; border-radius:8px; overflow:hidden; }
       .mrc-ov-hdr {
@@ -466,45 +467,52 @@
       .mrc-hdr-code-row { display:flex; align-items:center; gap:8px; }
       .mrc-hdr-code-row .mrc-hdr-code { flex:1; min-width:0; }
 
-      /* ---- custom on-screen keyboard (native keyboard is suppressed) ---- */
+      /* ---- on-screen keyboard: docked strip, NOT a full-screen takeover ----
+         No dark backdrop and no oversized display of its own - it sits at the
+         bottom of the screen area and the field it is editing stays visible and
+         readable above it. .kb-open pads the body so nothing gets covered. */
       .mrc-kb-ov {
-        position:absolute; inset:0; background:rgba(0,0,0,.45);
-        display:flex; align-items:flex-end; z-index:300;
+        position:absolute; left:0; right:0; bottom:0; z-index:300;
       }
       .mrc-kb {
-        width:100%; background:#fff; border-radius:10px 10px 0 0; padding:7px;
-        display:flex; flex-direction:column; gap:4px;
-        box-shadow:0 -2px 14px rgba(0,0,0,.28);
+        width:100%; background:#fff; border-top:1px solid #d8dee9;
+        border-radius:8px 8px 0 0; padding:5px 6px 6px;
+        display:flex; flex-direction:column; gap:3px;
+        box-shadow:0 -2px 10px rgba(0,0,0,.14);
       }
-      .mrc-kb-disp {
-        display:flex; flex-direction:column; align-items:center;
-        padding:3px 6px 5px; border-bottom:2px solid #e1e6ef;
+      .mrc-kb-bar {
+        display:flex; align-items:center; justify-content:space-between;
+        padding:0 2px 3px; gap:8px;
       }
-      .mrc-kb-disp-lbl {
+      .mrc-kb-bar-lbl {
         font-size:10px; font-weight:600; color:#9faecb;
         text-transform:uppercase; letter-spacing:.08em;
+        white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
       }
-      .mrc-kb-disp-val {
-        font-size:25px; font-weight:700; color:#384042; letter-spacing:.04em;
-        min-height:31px; line-height:1.2; text-align:center; word-break:break-all;
+      .mrc-kb-hide {
+        border:none; background:#eef2f7; color:#5b6b82; font-size:11px;
+        font-weight:600; font-family:Roboto,sans-serif; padding:3px 9px;
+        border-radius:4px; cursor:pointer; flex-shrink:0;
+        -webkit-tap-highlight-color:transparent; touch-action:manipulation;
       }
-      .mrc-kb-disp-val .cur { color:#20a8d8; font-weight:400; animation:mrc-blink 1s step-end infinite; }
-      @keyframes mrc-blink { 50% { opacity:0; } }
-      .mrc-kb-row { display:flex; gap:4px; }
+      .mrc-kb-row { display:flex; gap:3px; }
       .mrc-kb-key {
-        flex:1; min-width:0; height:41px; display:flex; align-items:center;
-        justify-content:center; font-size:17px; font-weight:600; color:#384042;
-        background:#f5f7fa; border:none; border-radius:5px; cursor:pointer;
+        flex:1; min-width:0; height:34px; display:flex; align-items:center;
+        justify-content:center; font-size:16px; font-weight:600; color:#384042;
+        background:#f5f7fa; border:none; border-radius:4px; cursor:pointer;
         font-family:Roboto,sans-serif; -webkit-tap-highlight-color:transparent;
         touch-action:manipulation; -webkit-user-select:none; user-select:none;
       }
       .mrc-kb-key:active { background:#20a8d8; color:#fff; }
       .mrc-kb-key.del  { background:#fff0f0; color:#d13b3b; }
-      .mrc-kb-key.mode { background:#eef2f7; color:#5b6b82; font-size:13px; }
-      .mrc-kb-key.go   { background:#20a8d8; color:#fff; flex:2.2; font-size:16px; }
+      .mrc-kb-key.mode { background:#eef2f7; color:#5b6b82; font-size:12px; }
+      .mrc-kb-key.go   { background:#20a8d8; color:#fff; flex:2.2; font-size:14px; }
       .mrc-kb-key.go:active { background:#1985ac; }
-      /* Numeric layout has far fewer keys, so make them noticeably bigger. */
-      .mrc-kb-num .mrc-kb-key { height:47px; font-size:21px; }
+      /* Numeric layout has 3 columns, so the keys can afford to be taller. */
+      .mrc-kb-num .mrc-kb-key { height:40px; font-size:20px; }
+      /* Keep the live field clear of the docked keyboard. */
+      .mrc-screen.kb-open .mrc-body { padding-bottom:var(--kb-h, 190px); }
+      @keyframes mrc-blink { 50% { opacity:0; } }
 
       .mrc-flash {
         position:absolute; inset:0; z-index:9999; opacity:0; pointer-events:none;
@@ -1067,25 +1075,36 @@
   const KB_DEL = '⌫';
 
   const Keyboard = {
-    targetId: null, mode: 'alpha', onEnter: null, label: '',
+    targetId: null, focusId: null, mode: 'alpha', onEnter: null, label: '',
+    // When true the next character key REPLACES the field instead of appending.
+    // Used where a scan has pre-filled a value that typing should overwrite.
+    replaceNext: false,
 
     get input() { return this.targetId ? document.getElementById(this.targetId) : null; },
     isOpen() { return !!document.getElementById('mrc-kb-ov'); },
-    close() { document.getElementById('mrc-kb-ov')?.remove(); },
 
-    open(targetId, mode, onEnter, label) {
+    close() {
+      document.getElementById('mrc-kb-ov')?.remove();
+      const s = document.getElementById('mrc-screen');
+      if (s) { s.classList.remove('kb-open'); s.style.removeProperty('--kb-h'); }
+    },
+
+    // focusId: element that keeps keyboard focus. Defaults to the target, but on
+    // screens with a dedicated scan input the scanner must keep it instead.
+    open(targetId, mode, onEnter, label, focusId) {
       this.targetId = targetId;
+      this.focusId  = focusId || targetId;
       this.mode     = mode || 'alpha';
       this.onEnter  = onEnter || null;
       this.label    = label || '';
       this.render();
     },
 
-    toggle(targetId, mode, onEnter, label) {
+    toggle(targetId, mode, onEnter, label, focusId) {
       if (this.isOpen() && this.targetId === targetId) {
         this.close(); this.focusInput();
       } else {
-        this.open(targetId, mode, onEnter, label);
+        this.open(targetId, mode, onEnter, label, focusId);
       }
     },
 
@@ -1100,9 +1119,9 @@
       ov.id = 'mrc-kb-ov';
       ov.innerHTML = `
         <div class="mrc-kb${this.mode === 'num' ? ' mrc-kb-num' : ''}">
-          <div class="mrc-kb-disp">
-            <span class="mrc-kb-disp-lbl">${_esc(this.label)}</span>
-            <span class="mrc-kb-disp-val" id="mrc-kb-val"></span>
+          <div class="mrc-kb-bar">
+            <span class="mrc-kb-bar-lbl">${_esc(this.label)}</span>
+            <button class="mrc-kb-hide" data-k="@hide">Hide</button>
           </div>
           ${rows.map(r => `<div class="mrc-kb-row">${r.map(k =>
             `<button class="mrc-kb-key${k === KB_DEL ? ' del' : ''}" data-k="${_esc(k)}"
@@ -1115,38 +1134,30 @@
         </div>`;
       screen.appendChild(ov);
 
-      // pointerdown + preventDefault: acts instantly and never steals focus
-      // from the input, so a scan mid-typing still lands in the right place.
-      ov.querySelectorAll('.mrc-kb-key').forEach(b => {
+      // pointerdown + preventDefault: acts instantly and never steals focus,
+      // so a scan mid-typing still lands in the right place.
+      ov.querySelectorAll('[data-k]').forEach(b => {
         b.addEventListener('pointerdown', (e) => { e.preventDefault(); this.press(b.dataset.k); });
       });
-      ov.addEventListener('pointerdown', (e) => {
-        if (e.target === ov) { e.preventDefault(); this.close(); this.focusInput(); }
-      });
 
-      // Mirror hardware-scanner input into the keyboard display.
-      const i = this.input;
-      if (i && i.dataset.kbSync !== '1') {
-        i.dataset.kbSync = '1';
-        i.addEventListener('input', () => this.sync());
-      }
-      this.sync();
+      // Reserve exactly the keyboard's height below the live field.
+      const h = ov.getBoundingClientRect().height || 190;
+      screen.style.setProperty('--kb-h', Math.round(h) + 'px');
+      screen.classList.add('kb-open');
+
       this.focusInput();
+      setTimeout(measureHeight, 20);
     },
 
     focusInput() {
-      const i = this.input;
-      if (i && !i.disabled) setTimeout(() => i.focus(), 0);
-    },
-
-    sync() {
-      const el = document.getElementById('mrc-kb-val');
-      if (el) el.innerHTML = _esc(this.input?.value ?? '') + '<span class="cur">|</span>';
+      const el = document.getElementById(this.focusId || this.targetId);
+      if (el && !el.disabled) setTimeout(() => el.focus(), 0);
     },
 
     press(k) {
       const i = this.input;
       if (!i) return;
+      if (k === '@hide') { this.close(); this.focusInput(); return; }
       if (k === '@mode') { this.mode = this.mode === 'num' ? 'alpha' : 'num'; this.render(); return; }
       if (k === '@enter') {
         const fn = this.onEnter, val = i.value;
@@ -1154,11 +1165,11 @@
         if (fn) fn(val);
         return;
       }
-      if (k === '@clear')     i.value = '';
-      else if (k === KB_DEL)  i.value = i.value.slice(0, -1);
-      else                    i.value += k;
+      if (k === '@clear')     { i.value = ''; this.replaceNext = false; }
+      else if (k === KB_DEL)  { i.value = i.value.slice(0, -1); this.replaceNext = false; }
+      else if (this.replaceNext) { i.value = k; this.replaceNext = false; }
+      else                    { i.value += k; }
       i.dispatchEvent(new Event('input', { bubbles: true }));
-      this.sync();
       this.focusInput();
     },
   };
@@ -1167,9 +1178,13 @@
   function kbButtonHtml() {
     return `<button id="mrc-kb-btn" class="mrc-btn mrc-btn-secondary">Keyboard</button>`;
   }
-  function wireKbButton(targetId, mode, onEnter, label) {
-    document.getElementById('mrc-kb-btn')?.addEventListener('click', () =>
-      Keyboard.toggle(targetId, mode, onEnter, label));
+  function wireKbButton(targetId, mode, onEnter, label, focusId) {
+    document.getElementById('mrc-kb-btn')?.addEventListener('click', () => {
+      Keyboard.toggle(targetId, mode, onEnter, label, focusId);
+      // A value already in the field came from a scan, so typing replaces it.
+      const el = document.getElementById(targetId);
+      Keyboard.replaceNext = !!(el && el.value);
+    });
   }
 
   function setFb(msg, type) {
@@ -1494,7 +1509,9 @@
 
     State.cur = {
       detail, item, uom,
-      qty: null,
+      // One scan = one pack. Scanning again on the quantity screen adds another
+      // factor; typing overwrites. Same count-up behaviour as Malpa Pack.
+      qty: uom.factor || 1,
       batchNo: detail.expected_batch_no || '',
       expiry:  detail.expected_batch_expiry || '',
       location: null,
@@ -1552,54 +1569,99 @@
           <div class="mrc-field-lbl">Quantity${factor > 1 ? ' (base units)' : ''}</div>
           <input id="mrc-qty-in" class="mrc-input big" type="text" inputmode="none"
             autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
-            placeholder="0 of ${openBase}" value=""/>
-          <div class="mrc-fb dim" id="mrc-fb">Enter to continue</div>
+            placeholder="0 of ${openBase}" value="${c.qty != null ? c.qty : ''}"/>
+          <input id="mrc-qty-scan" class="mrc-hidden-in" type="text" inputmode="none"
+            autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"/>
+          <div class="mrc-fb dim" id="mrc-fb">Scan again to add ${factor}, or type</div>
         </div>
       </div>
       <div class="mrc-actions">
         <button id="mrc-back-btn" class="mrc-btn mrc-btn-secondary">&lt;- Back</button>
+        ${kbButtonHtml()}
         <button id="mrc-next-btn" class="mrc-btn mrc-btn-primary">Next -&gt;</button>
       </div>`;
 
-    const qtyIn = document.getElementById('mrc-qty-in');
-    const uomSel = document.getElementById('mrc-uom-sel');
+    const qtyIn   = document.getElementById('mrc-qty-in');
+    const scanIn  = document.getElementById('mrc-qty-scan');
+    const uomSel  = document.getElementById('mrc-uom-sel');
 
-    // Live readout so the operator sees the carton count as they type, and knows
-    // immediately when the number does not divide by the factor.
+    // Live readout: pack count when the number is a whole multiple of the factor,
+    // and an immediate complaint when it is not.
     const syncHint = () => {
-      if (factor <= 1) return;
-      const n = parseFloat(_normaliseScan((qtyIn?.value || '').trim()));
       const fb = document.getElementById('mrc-fb');
       if (!fb) return;
-      if (isNaN(n) || n <= 0) { fb.textContent = 'Enter to continue'; fb.className = 'mrc-fb dim'; return; }
-      if (n % factor !== 0) {
+      const n = parseFloat(_normaliseScan((qtyIn?.value || '').trim()));
+      if (isNaN(n) || n <= 0) {
+        fb.textContent = factor > 1 ? `Scan again to add ${factor}, or type` : 'Scan again or type';
+        fb.className = 'mrc-fb dim';
+        return;
+      }
+      if (n > openBase) {
+        fb.textContent = `${n} exceeds the ${openBase} open - you will be asked to confirm`;
+        fb.className = 'mrc-fb err';
+        return;
+      }
+      if (factor > 1 && n % factor !== 0) {
         const lo = Math.floor(n / factor) * factor, hi = lo + factor;
         fb.textContent = `${n} is not a whole ${uomName(c.uom)} - try ${lo || factor} or ${hi}`;
         fb.className = 'mrc-fb err';
-      } else {
-        fb.textContent = `= ${n / factor} ${uomName(c.uom)}${n / factor === 1 ? '' : 's'}`;
-        fb.className = 'mrc-fb ok';
+        return;
       }
+      fb.textContent = factor > 1
+        ? `= ${n / factor} ${uomName(c.uom)}${n / factor === 1 ? '' : 's'}`
+        : `${n} of ${openBase}`;
+      fb.className = 'mrc-fb ok';
+    };
+
+    // Each additional scan of this item adds one pack (the UoM factor).
+    const bumpByScan = (barcode) => {
+      const hit = State.refMap[barcode.trim().toLowerCase()];
+      if (!hit || hit.itemId !== c.item.id) {
+        reject('Wrong item - scan the same item to count up', 'Wrong item');
+        return;
+      }
+      const cur = parseFloat(qtyIn.value) || 0;
+      qtyIn.value = String(cur + factor);
+      c.qty = cur + factor;
+      // A scan sets the value, so the next typed digit should replace it.
+      Keyboard.replaceNext = true;
+      Audio.chime('item_ok');
+      if (navigator.vibrate) navigator.vibrate([25]);
+      syncHint();
     };
 
     uomSel?.addEventListener('change', () => {
       const nu = (c.item.itemUnitOfMeasures || []).find(u => String(u.id) === uomSel.value);
-      if (nu) { c.uom = nu; renderQty(); }
+      // Switching pack size restarts the count at one pack of the new UoM.
+      if (nu) { c.uom = nu; c.qty = nu.factor || 1; renderQty(); }
+    });
+
+    // The scanner owns focus; the on-screen keypad writes into the visible field.
+    scanIn?.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' && e.keyCode !== 13) return;
+      e.preventDefault();
+      const raw = _normaliseScan(scanIn.value.trim());
+      scanIn.value = '';
+      if (raw) bumpByScan(raw);
     });
     qtyIn?.addEventListener('input', syncHint);
     qtyIn?.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' || e.keyCode === 13) { e.preventDefault(); submitQty(); }
     });
     syncHint();
+
     document.getElementById('mrc-next-btn')?.addEventListener('click', submitQty);
     document.getElementById('mrc-back-btn')?.addEventListener('click', () => {
       Keyboard.close(); renderScanItem();
     });
-    wireVoiceBtn('mrc-qty-in');
+    wireVoiceBtn('mrc-qty-scan');
+    wireTapRefocus('mrc-qty-scan');
+    // Scanning drives the count, so the keypad is opt-in - it no longer steals
+    // the screen on every line.
+    wireKbButton('mrc-qty-in', 'num', () => submitQty(),
+      `Quantity${factor > 1 ? ' - base units' : ''}`, 'mrc-qty-scan');
+    setTimeout(() => scanIn?.focus(), 90);
     setTimeout(measureHeight, 30);
-    // Quantity is always typed, so the keypad comes up automatically.
-    setTimeout(() => Keyboard.open('mrc-qty-in', 'num', () => submitQty(),
-      `Quantity${factor > 1 ? ' - base units' : ''} (open ${openBase})`), 110);
   }
 
   function submitQty() {
@@ -1891,7 +1953,6 @@
       inp.disabled = false;
       const retry = (msg) => {
         inp.value = '';
-        Keyboard.sync();
         reject(msg, msg);
         setTimeout(() => inp.focus(), 60);
       };
@@ -1990,7 +2051,6 @@
     const submitCd = (rawVal) => {
       const raw = _normaliseScan(String(rawVal ?? inp.value).trim());
       inp.value = '';
-      Keyboard.sync();
       if (!raw) return;
       // Accept the check digit, or the full location code - some C7 location
       // templates set check_digit to the code itself.
@@ -2234,7 +2294,7 @@
   const _FOCUS_MAP = {
     RECEIPT_ENTRY: 'mrc-receipt-in',
     SCAN_ITEM:     'mrc-scan-in',
-    QTY:           'mrc-qty-in',
+    QTY:           'mrc-qty-scan',
     BATCH:         'mrc-batch-in',
     LOCATION_SCAN: 'mrc-loc-in',
     CHECK_DIGIT:   'mrc-cd-in',
