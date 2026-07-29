@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Receiving
 // @namespace    https://malpa.canary7.com
-// @version      2.2.3
+// @version      2.2.4
 // @description  Fast single-screen receiving for Canary7 WMS - TC51 optimised
 // @author       Malpa 3PL
 // @updateURL    https://raw.githubusercontent.com/zaynnev/malpa3pl/main/malpa-receiving.user.js
@@ -266,7 +266,16 @@
 
       .mrc-card-body {
         flex:1; min-height:0; overflow-y:auto; -webkit-overflow-scrolling:touch;
-        padding:.55rem .75rem .7rem;
+        padding:.55rem .75rem .7rem; position:relative;
+      }
+
+      /* Hidden scan catcher. inputmode="none" means it holds focus WITHOUT
+         opening the native keyboard, so dismissing the keyboard never costs the
+         operator the ability to scan. */
+      .mrc-catch {
+        position:absolute; top:0; left:0; width:1px; height:1px; opacity:0;
+        padding:0; border:0; background:transparent; caret-color:transparent;
+        pointer-events:none;
       }
 
       /* With the native keyboard up the visible area is small - tighten rows so
@@ -278,8 +287,12 @@
       #mrc-root.compact .mrc-fg, #mrc-root.compact .mrc-split { margin:.3rem 0 .2rem; }
       #mrc-root.compact .mrc-static { padding:1px 0; }
       #mrc-root.compact .mrc-keep { padding:3px 0 0; }
-      #mrc-root.compact .mrc-actions { margin:.5rem 0 .2rem; padding-top:.4rem; }
       #mrc-root.compact .mrc-btn { min-height:36px; }
+      /* While the keyboard is up, nothing tappable may sit above it - the
+         operator needs neutral space to tap to dismiss the keyboard and see the
+         form. Enter still commits, so the buttons lose nothing by hiding. */
+      #mrc-root.compact .mrc-actions { display:none; }
+      #mrc-root.compact .mrc-card-body { padding:.3rem .6rem 2.75rem; }
 
       /* ---- completed rows: one compact line each, so the whole flow fits ---- */
       .mrc-done {
@@ -1220,6 +1233,9 @@
               : `<button id="mrc-newrcpt" class="mrc-btn mrc-btn-secondary">New receipt</button>`}
             <button id="mrc-go" class="mrc-btn mrc-btn-primary" ${canCheckin ? '' : 'disabled'}>Check In</button>
           </div>
+          <input id="mrc-catch" class="mrc-catch" type="text" inputmode="none"
+            autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+            tabindex="-1" aria-hidden="true"/>
         </div>
       </div>`;
 
@@ -1240,7 +1256,21 @@
     return '';
   }
 
+  // Set when the operator taps neutral space to put the keyboard away. While it
+  // holds, focus goes to the hidden catcher instead of the live field, so the
+  // keyboard stays down but scans still land. Cleared the moment they tap a real
+  // field again.
+  let _kbDismissed = false;
+
   function focusStage(stage) {
+    if (_kbDismissed) {
+      setTimeout(() => {
+        const cc = document.getElementById('mrc-catch');
+        if (!cc) return;
+        try { cc.focus({ preventScroll: true }); } catch (_) { cc.focus(); }
+      }, 40);
+      return;
+    }
     const id = { receipt: 'mrc-receipt', item: 'mrc-item', qty: 'mrc-qty',
                  batch: 'mrc-batch', location: 'mrc-loc', checkdigit: 'mrc-cd' }[stage];
     if (!id) return;
@@ -1262,6 +1292,42 @@
   }
 
   function wire(stage) {
+    const body    = document.getElementById('mrc-body');
+    const catcher = document.getElementById('mrc-catch');
+
+    // Tap neutral space to put the keyboard away. Focus moves to the hidden
+    // catcher rather than being dropped, so the scanner keeps working with the
+    // keyboard down and the whole form visible.
+    body?.addEventListener('pointerdown', (e) => {
+      if (e.target.closest('input, select, textarea, button, .mrc-keep-box, .mrc-pencil')) return;
+      _kbDismissed = true;
+      // preventScroll: the catcher sits at the top of the body, and without this
+      // focusing it would jump the form back to the first row.
+      try { catcher?.focus({ preventScroll: true }); } catch (_) { catcher?.focus(); }
+      setTimeout(measureHeight, 250);
+    });
+
+    // Tapping a real field means they want to type again.
+    body?.addEventListener('focusin', (e) => {
+      if (e.target !== catcher && e.target.matches('input, select, textarea')) _kbDismissed = false;
+    });
+
+    // A scan that arrives at the catcher is handled exactly as if it had been
+    // typed into whichever row is live.
+    onEnter(catcher, (v) => {
+      catcher.value = '';
+      const raw = String(v || '').trim();
+      if (!raw) return;
+      if (stage === 'batch') {
+        const b = document.getElementById('mrc-batch');
+        if (b) b.value = raw;
+        submitBatch();
+        return;
+      }
+      ({ receipt: loadReceipt, item: submitItem, qty: submitQty,
+         location: submitLocation, checkdigit: submitCheckDigit }[stage] || (() => {}))(raw);
+    });
+
     document.getElementById('mrc-voice')?.addEventListener('click', () => {
       State.voiceEnabled = !State.voiceEnabled;
       try { sessionStorage.setItem('mrc_voice', State.voiceEnabled ? '1' : '0'); } catch (_) {}
@@ -1790,8 +1856,13 @@
     const a = document.activeElement;
     if (a && a !== document.body && a !== document.documentElement) return;
     const root = document.getElementById('mrc-root');
-    const el = root && root.querySelector('input:not([disabled]), select:not([disabled])');
-    if (el) el.focus();
+    if (!root) return;
+    // If the operator put the keyboard away, recover onto the catcher so it
+    // stays down.
+    const el = _kbDismissed
+      ? document.getElementById('mrc-catch')
+      : root.querySelector('input:not([disabled]):not(.mrc-catch), select:not([disabled])');
+    if (el) { try { el.focus({ preventScroll: true }); } catch (_) { el.focus(); } }
   }
 
   document.addEventListener('visibilitychange', () => {
