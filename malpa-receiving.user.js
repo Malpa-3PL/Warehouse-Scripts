@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Receiving
 // @namespace    https://malpa.canary7.com
-// @version      2.2.1
+// @version      2.2.2
 // @description  Fast single-screen receiving for Canary7 WMS - TC51 optimised
 // @author       Malpa 3PL
 // @updateURL    https://raw.githubusercontent.com/zaynnev/malpa3pl/main/malpa-receiving.user.js
@@ -252,13 +252,13 @@
         flex:1; min-height:0; display:flex; flex-direction:column;
         background:#fff; border:1px solid #e1e6ef;
       }
+      /* No title bar - the space goes to the fields. Just the running totals. */
       .mrc-card-hdr {
         flex-shrink:0; display:flex; align-items:center; gap:8px;
-        padding:.5rem .75rem; background:#f9f9fa; border-bottom:1px solid #e1e6ef;
+        padding:.4rem .75rem; background:#f9f9fa; border-bottom:1px solid #e1e6ef;
       }
-      .mrc-card-title { font-size:14px; font-weight:500; color:#374767; flex-shrink:0; }
       .mrc-card-meta {
-        flex:1; text-align:right; font-size:11px; color:#9faecb; font-weight:500;
+        flex:1; font-size:12px; color:#374767; font-weight:500;
         white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
       }
       .mrc-prog { height:2px; background:#e1e6ef; flex-shrink:0; }
@@ -269,13 +269,13 @@
         padding:.55rem .75rem .7rem;
       }
 
-      /* With the native keyboard up the visible area is small - drop the header
-         and tighten every row so the live field and its context still fit. */
-      #mrc-root.compact .mrc-card-hdr,
+      /* With the native keyboard up the visible area is small - tighten rows so
+         the live field and its context still fit. The totals stay visible. */
       #mrc-root.compact .mrc-prog { display:none; }
+      #mrc-root.compact .mrc-card-hdr { padding:.25rem .6rem; }
       #mrc-root.compact .mrc-card-body { padding:.3rem .6rem .4rem; }
-      #mrc-root.compact .mrc-done { padding:2px 0; font-size:11px; }
-      #mrc-root.compact .mrc-fg { margin:.3rem 0 .2rem; }
+      #mrc-root.compact .mrc-done { padding:2px 0; font-size:13px; }
+      #mrc-root.compact .mrc-fg, #mrc-root.compact .mrc-split { margin:.3rem 0 .2rem; }
       #mrc-root.compact .mrc-static { padding:1px 0; }
       #mrc-root.compact .mrc-keep { padding:3px 0 0; }
       #mrc-root.compact .mrc-actions { padding:.3rem .6rem; }
@@ -283,10 +283,10 @@
 
       /* ---- completed rows: one compact line each, so the whole flow fits ---- */
       .mrc-done {
-        display:flex; align-items:center; gap:7px; padding:4px 0;
-        border-bottom:1px solid #f2f4f8; font-size:12px; line-height:1.3;
+        display:flex; align-items:center; gap:7px; padding:5px 0;
+        border-bottom:1px solid #f2f4f8; font-size:14px; line-height:1.3;
       }
-      .mrc-done-lbl { color:#9faecb; flex-shrink:0; }
+      .mrc-done-lbl { color:#9faecb; flex-shrink:0; font-size:12px; }
       .mrc-done-val {
         color:#374767; font-weight:500; flex:1; min-width:0;
         overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
@@ -294,16 +294,16 @@
       .mrc-done-val.emph { color:#b5551d; }
       .mrc-pencil {
         flex-shrink:0; border:none; background:transparent; color:#20a8d8;
-        font-size:14px; line-height:1; padding:2px 4px; cursor:pointer;
+        font-size:16px; line-height:1; padding:2px 5px; cursor:pointer;
         -webkit-tap-highlight-color:transparent; touch-action:manipulation;
       }
       .mrc-pencil:active { color:#1985ac; }
 
       /* ---- active form group (C7 .form-group / label / .form-control) ---- */
       .mrc-fg { margin:.5rem 0 .35rem; }
-      .mrc-lbl { display:block; margin-bottom:.3rem; font-size:12px; color:#5d7d9a; }
+      .mrc-lbl { display:block; margin-bottom:.3rem; font-size:13px; color:#5d7d9a; }
       .mrc-fc {
-        display:block; width:100%; padding:.5rem .75rem; font-size:.875rem;
+        display:block; width:100%; padding:.5rem .75rem; font-size:15px;
         line-height:1.25; color:#374767; background:#fff; background-image:none;
         border:1px solid #e1e6ef; border-radius:0; outline:none;
         transition:border-color .15s ease-in-out; font-family:Roboto,sans-serif;
@@ -312,19 +312,35 @@
       .mrc-fc:focus { border-color:#8ad4ee; }
       .mrc-fc::placeholder { color:#c0cadd; }
       .mrc-fc[readonly], .mrc-fc:disabled { background:#e1e6ef; opacity:1; }
-      .mrc-fc.big { font-size:19px; font-weight:500; min-height:44px; letter-spacing:.02em; }
-      .mrc-fc.qty { font-size:22px; font-weight:500; min-height:46px; color:#b5551d; }
+      .mrc-fc.big { font-size:21px; font-weight:500; min-height:46px; letter-spacing:.02em; }
+      .mrc-fc.qty { font-size:26px; font-weight:500; min-height:50px; color:#b5551d; }
+      /* Check digits are 1-3 characters - a full-width box wastes the row. */
+      .mrc-fc.cd {
+        width:130px; font-size:22px; font-weight:500; min-height:46px;
+        text-align:center; letter-spacing:.06em;
+      }
       .mrc-fc.nolocation { border:1px solid #ff5454; background:#fff8f8; }
       select.mrc-fc {
-        -webkit-appearance:none; appearance:none; cursor:pointer; min-height:38px;
-        background:#fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%239faecb' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E") no-repeat right 10px center;
+        -webkit-appearance:none; appearance:none; cursor:pointer; min-height:40px;
+        padding-right:26px;
+        background:#fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%239faecb' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E") no-repeat right 9px center;
       }
 
-      .mrc-static { font-size:12px; color:#374767; padding:3px 0; line-height:1.35; }
+      /* item + UoM share one row to save vertical space */
+      .mrc-split { display:flex; align-items:flex-end; gap:8px; margin:.5rem 0 .35rem; }
+      .mrc-split-l { flex:1; min-width:0; }
+      .mrc-split-r { flex:0 0 132px; }
+      .mrc-inline-val {
+        display:flex; align-items:center; gap:5px; min-height:40px;
+        font-size:17px; font-weight:500; color:#374767;
+        overflow:hidden; white-space:nowrap; text-overflow:ellipsis;
+      }
+
+      .mrc-static { font-size:13px; color:#374767; padding:3px 0; line-height:1.35; }
       .mrc-static b { font-weight:500; }
       .mrc-static .v { color:#b5551d; }
 
-      .mrc-fb { font-size:12px; font-weight:500; min-height:16px; padding-top:3px; }
+      .mrc-fb { font-size:13px; font-weight:500; min-height:17px; padding-top:3px; }
       .mrc-fb.ok { color:#4a9c2d; } .mrc-fb.err { color:#e03131; } .mrc-fb.dim { color:#9faecb; }
 
       .mrc-warn-red {
@@ -336,19 +352,18 @@
       }
       .mrc-banner.info { background:#f0f8fd; border-color:#b8e4f5; color:#1a7fa8; }
 
-      /* ---- keep location ---- */
-      .mrc-keep {
-        display:flex; align-items:center; gap:8px; padding:6px 0 2px; cursor:pointer;
+      /* ---- keep location: ONLY the box is a hit target, not the whole row ---- */
+      .mrc-keep { display:flex; align-items:center; gap:8px; padding:7px 0 2px; }
+      .mrc-keep-box {
+        width:24px; height:24px; border:1px solid #9faecb; flex-shrink:0;
+        display:flex; align-items:center; justify-content:center;
+        font-size:15px; line-height:1; color:#fff; cursor:pointer; background:#fff;
         -webkit-tap-highlight-color:transparent; touch-action:manipulation;
       }
-      .mrc-keep-box {
-        width:17px; height:17px; border:1px solid #9faecb; flex-shrink:0;
-        display:flex; align-items:center; justify-content:center;
-        font-size:12px; line-height:1; color:#fff;
-      }
+      .mrc-keep-box:active { border-color:#20a8d8; }
       .mrc-keep.on .mrc-keep-box { border-color:#20a8d8; background:#20a8d8; }
-      .mrc-keep-txt { font-size:12px; color:#374767; }
-      .mrc-keep-sub { font-size:11px; color:#9faecb; }
+      .mrc-keep-txt { font-size:13px; color:#374767; }
+      .mrc-keep-sub { font-size:12px; color:#9faecb; }
 
       /* ---- buttons ---- */
       .mrc-actions {
@@ -534,13 +549,57 @@
     R._vvWatch = null;
   }
 
-  function minimiseSelf() {
+  function c7Lists() {
+    const tabBar     = document.querySelector('ul.nav.nav-tabs[role="tablist"]');
+    const tabContent = document.querySelector('div.tab-content');
+    return {
+      tabContent,
+      lis: tabBar ? Array.from(tabBar.querySelectorAll('li.nav-item'))
+        .filter(x => x.id !== 'mrc-tab-li') : [],
+      panels: tabContent ? Array.from(tabContent.querySelectorAll(':scope > tab, :scope > .tab-pane'))
+        .filter(p => p.id !== 'mrc-tab-view') : [],
+    };
+  }
+
+  // Put the active class back on a C7 tab ourselves.
+  // Angular will NOT do it for us when there is only one C7 tab: from its point
+  // of view that tab is already selected, so clicking it changes nothing and it
+  // never re-renders. With two or more tabs the click is a real state change, so
+  // it repainted and the bug hid itself. We restore the class either way.
+  function activateC7Tab(preferLi) {
+    const { lis, panels } = c7Lists();
+    if (!lis.length) return;
+    let target = (preferLi && lis.includes(preferLi)) ? preferLi : null;
+    if (!target && R._prevActiveLi && lis.includes(R._prevActiveLi)) target = R._prevActiveLi;
+    if (!target) target = lis[lis.length - 1];
+
+    lis.forEach(x => _setTabActive(x, x === target));
+
+    // Tab bar order maps to tab-content order (ours is appended last and is
+    // filtered out of both lists).
+    const idx = lis.indexOf(target);
+    let panel = panels[idx];
+    if (!panel) {
+      panel = (R._prevActivePanel && panels.includes(R._prevActivePanel))
+        ? R._prevActivePanel : panels[panels.length - 1];
+    }
+    // Class only - restoreC7Panels already handed inline display back to C7.
+    panels.forEach(p => p.classList.toggle('active', p === panel));
+  }
+
+  function minimiseSelf(preferLi) {
     const panel = document.getElementById('mrc-tab-view');
     if (!panel) return;
     restoreC7Panels();
     panel.classList.remove('active');
     panel.style.display = 'none';
     _setTabActive(document.getElementById('mrc-tab-li'), false);
+
+    // Only drive the selection ourselves if nothing else is already active -
+    // when C7 opened a tab under its own steam it has already done this.
+    const { panels } = c7Lists();
+    if (!panels.some(p => p.classList.contains('active'))) activateC7Tab(preferLi);
+
     if (!R._sidebarWasMinimized) document.body.classList.remove('sidebar-minimized');
     if (!R._brandWasMinimized)   document.body.classList.remove('brand-minimized');
   }
@@ -573,7 +632,7 @@
       if (!document.getElementById('mrc-tab-view')) return;
       const li = e.target.closest && e.target.closest('li.nav-item');
       if (!li || li.id === 'mrc-tab-li') return;
-      minimiseSelf();
+      minimiseSelf(li);   // pass the tab they actually tapped
     };
     tabBar.addEventListener('click', R._tabGuard, true);
   }
@@ -1017,18 +1076,12 @@
         { editId: 'mrc-edit-receipt' });
     }
 
-    // -- item ----------------------------------------------------------------
-    if (hasRcpt) {
-      if (stage === 'item') {
-        rows += fieldRow('Enter Item Code or Reference',
-          `<input id="mrc-item" class="mrc-fc big" type="text" autocomplete="off"
-             autocorrect="off" autocapitalize="characters" spellcheck="false"
-             placeholder="Scan item"/>`);
-      } else if (hasItem) {
-        rows += doneRow('Item', c.item.item_code, { editId: 'mrc-edit-item' });
-        rows += `<div class="mrc-static"><b>Item Description :</b>
-          <span class="v">${_esc(c.item.description || '')}</span></div>`;
-      }
+    // -- item (+ UoM sharing the row) ---------------------------------------
+    if (hasRcpt && stage === 'item') {
+      rows += fieldRow('Enter Item Code or Reference',
+        `<input id="mrc-item" class="mrc-fc big" type="text" autocomplete="off"
+           autocorrect="off" autocapitalize="characters" spellcheck="false"
+           placeholder="Scan item"/>`);
     }
 
     // -- uom + quantity ------------------------------------------------------
@@ -1037,10 +1090,28 @@
       const openBase = c.detail.open_quantity || 0;
 
       if (stage === 'qty') {
+        // Item and Unit of Measure share one row - the item is already known, so
+        // it only needs reading, and that buys a whole row back.
         const opts = (c.item.itemUnitOfMeasures || []).map(u =>
           `<option value="${u.id}"${u.id === c.uom.id ? ' selected' : ''}>` +
           `${_esc(uomName(u))}(${u.factor || 1})</option>`).join('');
-        rows += fieldRow('Unit of Measure', `<select id="mrc-uom" class="mrc-fc">${opts}</select>`);
+        rows += `
+          <div class="mrc-split">
+            <div class="mrc-split-l">
+              <label class="mrc-lbl">Item</label>
+              <div class="mrc-inline-val">
+                <span style="overflow:hidden;text-overflow:ellipsis">${_esc(c.item.item_code)}</span>
+                <button class="mrc-pencil" id="mrc-edit-item" title="Change item"
+                  aria-label="Change item">&#9998;</button>
+              </div>
+            </div>
+            <div class="mrc-split-r">
+              <label class="mrc-lbl">Unit of Measure</label>
+              <select id="mrc-uom" class="mrc-fc">${opts}</select>
+            </div>
+          </div>`;
+        rows += `<div class="mrc-static"><b>Item Description :</b>
+          <span class="v">${_esc(c.item.description || '')}</span></div>`;
         rows += fieldRow(`Check-In Quantity(open quantity : ${openBase})`,
           `<input id="mrc-qty" class="mrc-fc qty" type="text" inputmode="numeric"
              autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
@@ -1048,7 +1119,8 @@
           factor > 1
             ? `<div class="mrc-fb dim" id="mrc-qty-hint">Scan again to add ${factor}</div>` : '');
       } else {
-        rows += doneRow('UoM', `${uomName(c.uom)}(${factor})`, { editId: 'mrc-edit-qty' });
+        rows += doneRow('Item', `${c.item.item_code}  ${uomName(c.uom)}(${factor})`,
+          { editId: 'mrc-edit-item' });
         rows += doneRow('Quantity', `${c.qty} of ${openBase}`, { emph: true, editId: 'mrc-edit-qty' });
       }
     }
@@ -1073,10 +1145,13 @@
       rows += `<div class="mrc-static" style="padding-top:6px">
         <span class="mrc-spin"></span>Finding location...</div>`;
     } else if (needsLoc) {
-      rows += `<div class="mrc-warn-red">NO EXISTING LOCATION</div>`;
+      // Only warn when the locating RULE found no home. If the operator opened
+      // this row themselves with the pencil, they already know - saying it then
+      // reads like an error.
+      if (!c.locManual) rows += `<div class="mrc-warn-red">NO EXISTING LOCATION</div>`;
       rows += fieldRow('Location',
-        `<input id="mrc-loc" class="mrc-fc big nolocation" type="text" autocomplete="off"
-           autocorrect="off" autocapitalize="characters" spellcheck="false"
+        `<input id="mrc-loc" class="mrc-fc big${c.locManual ? '' : ' nolocation'}" type="text"
+           autocomplete="off" autocorrect="off" autocapitalize="characters" spellcheck="false"
            placeholder="Scan the bin you are using"/>`);
     } else if (hasLoc) {
       rows += `<div class="mrc-done">
@@ -1091,9 +1166,10 @@
       // the location code itself is the confirmation - committing on a bare
       // Enter would let a stray scanner terminator receive the line.
       rows += fieldRow(noDigit ? 'Check Digit (none set - scan the location label)' : 'Check Digit',
-        `<input id="mrc-cd" class="mrc-fc big" type="text" inputmode="${noDigit ? 'text' : 'numeric'}"
+        `<input id="mrc-cd" class="mrc-fc ${noDigit ? 'big' : 'cd'}"
+           type="text" inputmode="${noDigit ? 'text' : 'numeric'}"
            autocomplete="off" autocorrect="off" autocapitalize="characters" spellcheck="false"
-           placeholder="${noDigit ? 'Scan location code' : 'Scan check digit'}"/>`);
+           placeholder="${noDigit ? 'Scan location code' : ''}"/>`);
       // The locating rule will hand back bins C7 then refuses on check-in.
       if (c.location.status !== 1) {
         rows += `<div class="mrc-banner">Heads up: this bin is marked inactive.
@@ -1107,8 +1183,9 @@
     // -- keep location -------------------------------------------------------
     if (hasRcpt) {
       const on = State.keepLocation, last = State.lastLocation?.location_code;
-      rows += `<div class="mrc-keep${on ? ' on' : ''}" id="mrc-keep">
-        <span class="mrc-keep-box">${on ? '&#10003;' : ''}</span>
+      rows += `<div class="mrc-keep${on ? ' on' : ''}">
+        <span class="mrc-keep-box" id="mrc-keep-box" role="checkbox"
+          aria-checked="${on}" aria-label="Keep Location">${on ? '&#10003;' : ''}</span>
         <span class="mrc-keep-txt">Keep Location</span>
         <span class="mrc-keep-sub">${on ? (last ? _esc(last) : 'locks in the next bin')
                                         : 'uses suggested bin'}</span>
@@ -1120,7 +1197,6 @@
     root.innerHTML = `
       <div class="mrc-card">
         <div class="mrc-card-hdr">
-          <span class="mrc-card-title">Receiving</span>
           <span class="mrc-card-meta">${hasRcpt
             ? `${done} / ${total} lines completed &middot; ${openUnits()} units open`
             : 'Putaway &middot; one step check in &amp; locate'}</span>
@@ -1190,7 +1266,9 @@
       render();
     });
 
-    document.getElementById('mrc-keep')?.addEventListener('click', () => {
+    // Deliberately bound to the box alone - the whole row was far too easy to
+    // hit by accident.
+    document.getElementById('mrc-keep-box')?.addEventListener('click', () => {
       State.keepLocation = !State.keepLocation;
       try { sessionStorage.setItem('mrc_keeploc', State.keepLocation ? '1' : '0'); } catch (_) {}
       if (State.keepLocation && State.cur?.location) State.lastLocation = State.cur.location;
@@ -1232,9 +1310,10 @@
     document.getElementById('mrc-edit-loc')?.addEventListener('click', () => {
       const c = State.cur;
       if (!c) return;
-      c.location = null; c.suggested = null; c.viaKeep = false; c.locResolved = true;
+      c.location = null; c.suggested = null; c.viaKeep = false;
+      c.locResolved = true; c.locManual = true;   // their choice, not a missing home
       if (navigator.vibrate) navigator.vibrate([20]);
-      say('Scan the bin you are using', 'dim');
+      say('', 'dim');
       render();
     });
 
@@ -1466,6 +1545,7 @@
     }
 
     c.locResolved = false;
+    c.locManual   = false;   // this is the rule's answer, not the operator's
     render();
     const loc  = await fetchSuggestedLocation(c.detail, c.item, c.uom, c.qty, c.batchNo);
     const code = String(loc?.location_code || '').trim();
@@ -1495,10 +1575,11 @@
     State.busy = null;
     if (!loc)             { reject('Location not found', 'Location not found'); return; }
     if (loc.status !== 1) { reject('Location is inactive', 'Location inactive'); return; }
+    // No "accepted" message - an unacceptable bin never gets this far, so
+    // confirming the obvious is just noise.
     c.location = loc;
-    say('Location accepted', 'ok');
+    say('', 'dim');
     Audio.chime('item_ok');
-    flash('ok');
     render();
     Voice.putaway(c.qty, uomName(c.uom), loc.location_code, State.lastLocation?.location_code);
   }
