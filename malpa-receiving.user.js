@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Receiving
 // @namespace    https://malpa.canary7.com
-// @version      1.0.0
+// @version      2.0.0
 // @description  Fast receiving interface for Canary7 WMS - TC51 optimised
 // @author       Malpa 3PL
 // @updateURL    https://raw.githubusercontent.com/zaynnev/malpa3pl/main/malpa-receiving.user.js
@@ -332,9 +332,11 @@
       #mrc-nav .mrc-nav-label { font-size:17px; font-weight:500; }
 
       /* ---- generic screen frame (never scrolls) ---- */
+      /* position:relative keeps the keyboard and modal overlays inside the screen
+         area, so the action bar underneath stays visible and tappable. */
       .mrc-screen {
         flex:1; min-height:0; display:flex; flex-direction:column; overflow:hidden;
-        background:#f5f7fa;
+        background:#f5f7fa; position:relative;
       }
       .mrc-hdr { background:#20a8d8; padding:8px 14px 7px; flex-shrink:0; }
       .mrc-hdr.green  { background:#3a8f3a; }
@@ -453,6 +455,57 @@
       .mrc-ov-body strong { color:#ff5454; font-weight:700; }
       .mrc-ov-acts { display:flex; flex-direction:column; gap:8px; padding:0 15px 15px; }
 
+      /* ---- edit-location pencil ---- */
+      .mrc-edit {
+        display:inline-flex; align-items:center; justify-content:center;
+        width:30px; height:26px; border:none; border-radius:4px; flex-shrink:0;
+        background:rgba(255,255,255,.20); color:#fff; font-size:14px; cursor:pointer;
+        -webkit-tap-highlight-color:transparent; touch-action:manipulation;
+      }
+      .mrc-edit:active { background:rgba(255,255,255,.42); }
+      .mrc-hdr-code-row { display:flex; align-items:center; gap:8px; }
+      .mrc-hdr-code-row .mrc-hdr-code { flex:1; min-width:0; }
+
+      /* ---- custom on-screen keyboard (native keyboard is suppressed) ---- */
+      .mrc-kb-ov {
+        position:absolute; inset:0; background:rgba(0,0,0,.45);
+        display:flex; align-items:flex-end; z-index:300;
+      }
+      .mrc-kb {
+        width:100%; background:#fff; border-radius:10px 10px 0 0; padding:7px;
+        display:flex; flex-direction:column; gap:4px;
+        box-shadow:0 -2px 14px rgba(0,0,0,.28);
+      }
+      .mrc-kb-disp {
+        display:flex; flex-direction:column; align-items:center;
+        padding:3px 6px 5px; border-bottom:2px solid #e1e6ef;
+      }
+      .mrc-kb-disp-lbl {
+        font-size:10px; font-weight:600; color:#9faecb;
+        text-transform:uppercase; letter-spacing:.08em;
+      }
+      .mrc-kb-disp-val {
+        font-size:25px; font-weight:700; color:#384042; letter-spacing:.04em;
+        min-height:31px; line-height:1.2; text-align:center; word-break:break-all;
+      }
+      .mrc-kb-disp-val .cur { color:#20a8d8; font-weight:400; animation:mrc-blink 1s step-end infinite; }
+      @keyframes mrc-blink { 50% { opacity:0; } }
+      .mrc-kb-row { display:flex; gap:4px; }
+      .mrc-kb-key {
+        flex:1; min-width:0; height:41px; display:flex; align-items:center;
+        justify-content:center; font-size:17px; font-weight:600; color:#384042;
+        background:#f5f7fa; border:none; border-radius:5px; cursor:pointer;
+        font-family:Roboto,sans-serif; -webkit-tap-highlight-color:transparent;
+        touch-action:manipulation; -webkit-user-select:none; user-select:none;
+      }
+      .mrc-kb-key:active { background:#20a8d8; color:#fff; }
+      .mrc-kb-key.del  { background:#fff0f0; color:#d13b3b; }
+      .mrc-kb-key.mode { background:#eef2f7; color:#5b6b82; font-size:13px; }
+      .mrc-kb-key.go   { background:#20a8d8; color:#fff; flex:2.2; font-size:16px; }
+      .mrc-kb-key.go:active { background:#1985ac; }
+      /* Numeric layout has far fewer keys, so make them noticeably bigger. */
+      .mrc-kb-num .mrc-kb-key { height:47px; font-size:21px; }
+
       .mrc-flash {
         position:absolute; inset:0; z-index:9999; opacity:0; pointer-events:none;
         transition:opacity .06s ease-in;
@@ -536,9 +589,15 @@
   // 5. SHELL
   // ---------------------------------------------------------------------------
 
+  // True only when our tab is built AND in front of C7's tabs.
+  function isForeground() {
+    const p = document.getElementById('mrc-tab-view');
+    return !!p && p.classList.contains('active');
+  }
+
   function measureHeight() {
     const panel = document.getElementById('mrc-tab-view');
-    if (!panel) return;
+    if (!panel || !panel.classList.contains('active')) return;
     const rect = panel.getBoundingClientRect();
     const available = Math.floor(window.innerHeight - rect.top);
     if (available > 100) {
@@ -546,6 +605,91 @@
       panel.style.maxHeight = available + 'px';
       panel.style.minHeight = available + 'px';
     }
+  }
+
+  // --- C7 panel bookkeeping -------------------------------------------------
+  // We hide C7's own tab panels while our tab is in front. That has to be done
+  // with an inline style (class removal alone is not reliable across C7's tab
+  // markup), but an inline style BEATS the .active class - so if it is left
+  // behind, clicking any other C7 tab shows a blank panel: Angular adds .active
+  // and our display:none quietly wins. Every panel we touch is recorded here and
+  // put back exactly as found, both when stepping aside and when closing.
+  let _hiddenPanels = [];
+
+  function hideC7Panels(tabContent) {
+    tabContent.querySelectorAll(':scope > tab, :scope > .tab-pane').forEach(p => {
+      if (p.id === 'mrc-tab-view') return;
+      _hiddenPanels.push({ el: p, display: p.style.display });
+      p.classList.remove('active');
+      p.style.display = 'none';
+    });
+  }
+
+  // Hand display control back to C7's stylesheet.
+  function restoreC7Panels() {
+    for (const rec of _hiddenPanels) {
+      if (document.contains(rec.el)) rec.el.style.display = rec.display;
+    }
+    _hiddenPanels = [];
+  }
+
+  function _setTabActive(li, on) {
+    if (!li) return;
+    li.classList.toggle('active', on);
+    const a = li.querySelector('a.nav-link');
+    if (a) {
+      a.classList.toggle('active', on);
+      a.setAttribute('aria-selected', on ? 'true' : 'false');
+    }
+  }
+
+  // Step aside so a C7 tab can take the foreground. Our tab and state stay put,
+  // so tapping "Malpa Receiving" again resumes mid-receipt.
+  function minimiseSelf() {
+    const panel = document.getElementById('mrc-tab-view');
+    if (!panel) return;
+    Keyboard.close();
+    restoreC7Panels();
+    panel.classList.remove('active');
+    panel.style.display = 'none';
+    _setTabActive(document.getElementById('mrc-tab-li'), false);
+    if (!R._sidebarWasMinimized) document.body.classList.remove('sidebar-minimized');
+    if (!R._brandWasMinimized)   document.body.classList.remove('brand-minimized');
+  }
+
+  function activateSelf() {
+    const tabBar     = document.querySelector('ul.nav.nav-tabs[role="tablist"]');
+    const tabContent = document.querySelector('div.tab-content');
+    const li         = document.getElementById('mrc-tab-li');
+    const panel      = document.getElementById('mrc-tab-view');
+    if (!tabBar || !tabContent || !panel) return;
+
+    // Remember where to hand control back to on close.
+    const curLi    = tabBar.querySelector('li.nav-item.active');
+    const curPanel = tabContent.querySelector(':scope > .tab-pane.active, :scope > tab.active');
+    if (curLi    && curLi    !== li)    R._prevActiveLi    = curLi;
+    if (curPanel && curPanel !== panel) R._prevActivePanel = curPanel;
+
+    tabBar.querySelectorAll('li.nav-item').forEach(x => { if (x !== li) _setTabActive(x, false); });
+    hideC7Panels(tabContent);
+
+    panel.style.display = '';
+    panel.classList.add('active');
+    _setTabActive(li, true);
+    document.body.classList.add('sidebar-minimized', 'brand-minimized');
+    setTimeout(measureHeight, 50);
+  }
+
+  // Capture-phase, so we clear our inline styles BEFORE Angular switches tab.
+  function attachTabSwitchGuard(tabBar) {
+    if (R._tabGuard) return;
+    R._tabGuard = (e) => {
+      if (!document.getElementById('mrc-tab-view')) return;
+      const li = e.target.closest && e.target.closest('li.nav-item');
+      if (!li || li.id === 'mrc-tab-li') return;
+      minimiseSelf();
+    };
+    tabBar.addEventListener('click', R._tabGuard, true);
   }
 
   function buildShell() {
@@ -556,20 +700,6 @@
       console.warn('[MalpaRecv] C7 tab bar / tab content not found.');
       return;
     }
-
-    const prevLi    = tabBar.querySelector('li.nav-item.active');
-    const prevPanel = tabContent.querySelector(':scope > .tab-pane.active, :scope > tab.active');
-    if (prevLi)    R._prevActiveLi    = prevLi;
-    if (prevPanel) R._prevActivePanel = prevPanel;
-
-    tabBar.querySelectorAll('li.nav-item').forEach(li => {
-      li.classList.remove('active');
-      const a = li.querySelector('a.nav-link');
-      if (a) { a.classList.remove('active'); a.setAttribute('aria-selected', 'false'); }
-    });
-    tabContent.querySelectorAll(':scope > tab, :scope > .tab-pane').forEach(p => {
-      p.classList.remove('active'); p.style.display = 'none';
-    });
 
     const tabLi = document.createElement('li');
     tabLi.id = 'mrc-tab-li';
@@ -587,10 +717,15 @@
     tabLi.querySelector('#mrc-tab-close').addEventListener('click', (e) => {
       e.stopPropagation(); closeUI();
     });
+    // Clicking our own tab label brings us back to the front, mid-receipt.
+    tabLi.querySelector('a.nav-link').addEventListener('click', (e) => {
+      if (e.target.closest('#mrc-tab-close')) return;
+      activateSelf();
+    });
 
     const panel = document.createElement('div');
     panel.id = 'mrc-tab-view';
-    panel.className = 'tab-pane active';
+    panel.className = 'tab-pane';
     panel.innerHTML = `<div id="mrc-root"></div>`;
     tabContent.appendChild(panel);
 
@@ -598,9 +733,10 @@
 
     R._sidebarWasMinimized = document.body.classList.contains('sidebar-minimized');
     R._brandWasMinimized   = document.body.classList.contains('brand-minimized');
-    document.body.classList.add('sidebar-minimized', 'brand-minimized');
 
-    setTimeout(measureHeight, 50);
+    attachTabSwitchGuard(tabBar);
+    activateSelf();   // records the outgoing tab, hides C7's panels, shows ours
+
     window.addEventListener('resize', measureHeight);
 
     Audio.init();
@@ -905,6 +1041,137 @@
     return String(val).split('').map(c => _SHIFT_NUMS[c] || c).join('');
   }
 
+  // ---------------------------------------------------------------------------
+  // 8b. ON-SCREEN KEYBOARD
+  // ---------------------------------------------------------------------------
+  // Every input carries inputmode="none" so Android's keyboard never appears -
+  // it is cramped, covers the screen unpredictably and fights the scanner. This
+  // keyboard is a proxy for the real input: keys write into it and fire an
+  // `input` event, so the hardware scanner keeps working the whole time the
+  // keyboard is up (keys use pointerdown + preventDefault so focus never moves).
+
+  const KB_LAYOUTS = {
+    num: [
+      ['1', '2', '3'],
+      ['4', '5', '6'],
+      ['7', '8', '9'],
+      ['-', '0', '⌫'],
+    ],
+    alpha: [
+      ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'],
+      ['Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P'],
+      ['A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', '-'],
+      ['Z', 'X', 'C', 'V', 'B', 'N', 'M', '⌫'],
+    ],
+  };
+  const KB_DEL = '⌫';
+
+  const Keyboard = {
+    targetId: null, mode: 'alpha', onEnter: null, label: '',
+
+    get input() { return this.targetId ? document.getElementById(this.targetId) : null; },
+    isOpen() { return !!document.getElementById('mrc-kb-ov'); },
+    close() { document.getElementById('mrc-kb-ov')?.remove(); },
+
+    open(targetId, mode, onEnter, label) {
+      this.targetId = targetId;
+      this.mode     = mode || 'alpha';
+      this.onEnter  = onEnter || null;
+      this.label    = label || '';
+      this.render();
+    },
+
+    toggle(targetId, mode, onEnter, label) {
+      if (this.isOpen() && this.targetId === targetId) {
+        this.close(); this.focusInput();
+      } else {
+        this.open(targetId, mode, onEnter, label);
+      }
+    },
+
+    render() {
+      const screen = document.getElementById('mrc-screen');
+      if (!screen) return;
+      this.close();
+
+      const rows = KB_LAYOUTS[this.mode] || KB_LAYOUTS.alpha;
+      const ov = document.createElement('div');
+      ov.className = 'mrc-kb-ov';
+      ov.id = 'mrc-kb-ov';
+      ov.innerHTML = `
+        <div class="mrc-kb${this.mode === 'num' ? ' mrc-kb-num' : ''}">
+          <div class="mrc-kb-disp">
+            <span class="mrc-kb-disp-lbl">${_esc(this.label)}</span>
+            <span class="mrc-kb-disp-val" id="mrc-kb-val"></span>
+          </div>
+          ${rows.map(r => `<div class="mrc-kb-row">${r.map(k =>
+            `<button class="mrc-kb-key${k === KB_DEL ? ' del' : ''}" data-k="${_esc(k)}"
+              >${_esc(k)}</button>`).join('')}</div>`).join('')}
+          <div class="mrc-kb-row">
+            <button class="mrc-kb-key mode" data-k="@mode">${this.mode === 'num' ? 'ABC' : '123'}</button>
+            <button class="mrc-kb-key mode" data-k="@clear">Clear</button>
+            <button class="mrc-kb-key go"   data-k="@enter">Enter</button>
+          </div>
+        </div>`;
+      screen.appendChild(ov);
+
+      // pointerdown + preventDefault: acts instantly and never steals focus
+      // from the input, so a scan mid-typing still lands in the right place.
+      ov.querySelectorAll('.mrc-kb-key').forEach(b => {
+        b.addEventListener('pointerdown', (e) => { e.preventDefault(); this.press(b.dataset.k); });
+      });
+      ov.addEventListener('pointerdown', (e) => {
+        if (e.target === ov) { e.preventDefault(); this.close(); this.focusInput(); }
+      });
+
+      // Mirror hardware-scanner input into the keyboard display.
+      const i = this.input;
+      if (i && i.dataset.kbSync !== '1') {
+        i.dataset.kbSync = '1';
+        i.addEventListener('input', () => this.sync());
+      }
+      this.sync();
+      this.focusInput();
+    },
+
+    focusInput() {
+      const i = this.input;
+      if (i && !i.disabled) setTimeout(() => i.focus(), 0);
+    },
+
+    sync() {
+      const el = document.getElementById('mrc-kb-val');
+      if (el) el.innerHTML = _esc(this.input?.value ?? '') + '<span class="cur">|</span>';
+    },
+
+    press(k) {
+      const i = this.input;
+      if (!i) return;
+      if (k === '@mode') { this.mode = this.mode === 'num' ? 'alpha' : 'num'; this.render(); return; }
+      if (k === '@enter') {
+        const fn = this.onEnter, val = i.value;
+        this.close();
+        if (fn) fn(val);
+        return;
+      }
+      if (k === '@clear')     i.value = '';
+      else if (k === KB_DEL)  i.value = i.value.slice(0, -1);
+      else                    i.value += k;
+      i.dispatchEvent(new Event('input', { bubbles: true }));
+      this.sync();
+      this.focusInput();
+    },
+  };
+
+  // Standard "Keyboard" button for screens where typing is the exception.
+  function kbButtonHtml() {
+    return `<button id="mrc-kb-btn" class="mrc-btn mrc-btn-secondary">Keyboard</button>`;
+  }
+  function wireKbButton(targetId, mode, onEnter, label) {
+    document.getElementById('mrc-kb-btn')?.addEventListener('click', () =>
+      Keyboard.toggle(targetId, mode, onEnter, label));
+  }
+
   function setFb(msg, type) {
     const fb = document.getElementById('mrc-fb');
     if (fb) {
@@ -943,6 +1210,15 @@
   function openLines() {
     return State.details.filter(d => (d.open_quantity || 0) > 0).length;
   }
+  // Progress is measured in DETAIL LINES: how many of the receipt's details are
+  // fully received, out of how many details exist. A part-received line is not
+  // counted as complete, and the denominator never moves.
+  function linesCompleted() {
+    return State.details.filter(d => (d.open_quantity || 0) <= 0).length;
+  }
+  function totalDetailLines() {
+    return State.details.length;
+  }
 
   // Fallback UoM when a bare item_code was scanned. Deliberately biased to the
   // BASE unit: guessing a carton would silently multiply the received quantity
@@ -977,25 +1253,43 @@
     return candidates[0] || null;
   }
 
-  function progressHtml(label, code, sub, tone) {
-    // Denominator is the open-line count captured at receipt load. A partial
-    // receive leaves its line open, so done+openLines() would keep creeping up.
-    const total = Math.max(State.totalLines, State.done + openLines());
-    const pct   = total > 0 ? Math.round((State.done / total) * 100) : 0;
+  // showEdit renders the pencil beside the code, for changing the location.
+  function progressHtml(label, code, sub, tone, showEdit) {
+    const done  = linesCompleted();
+    const total = totalDetailLines();
+    const pct   = total > 0 ? Math.round((done / total) * 100) : 0;
     return `
       <div class="mrc-hdr${tone ? ' ' + tone : ''}">
         <div class="mrc-hdr-top">
           <span class="mrc-hdr-label">${_esc(label)}</span>
           <div class="mrc-hdr-right">
-            <span class="mrc-hdr-prog">${State.done} / ${total} lines</span>
+            <span class="mrc-hdr-prog">${done} / ${total} lines completed</span>
             <button class="mrc-voice${State.voiceEnabled ? '' : ' muted'}" id="mrc-voice-btn"
               title="Toggle voice" aria-label="Toggle voice">${State.voiceEnabled ? '🔊' : '🔇'}</button>
           </div>
         </div>
-        <div class="mrc-hdr-code">${_esc(code)}</div>
+        <div class="mrc-hdr-code-row">
+          <div class="mrc-hdr-code">${_esc(code)}</div>
+          ${showEdit ? `<button class="mrc-edit" id="mrc-edit-loc" title="Change location"
+            aria-label="Change location">&#9998;</button>` : ''}
+        </div>
         ${sub ? `<div class="mrc-hdr-sub">${sub}</div>` : ''}
         <div class="mrc-prog-track"><div class="mrc-prog-fill" style="width:${pct}%"></div></div>
       </div>`;
+  }
+
+  // Clear the location outright and drop the operator into a blank scan field.
+  function wireEditLocation() {
+    document.getElementById('mrc-edit-loc')?.addEventListener('click', () => {
+      const c = State.cur;
+      if (!c) return;
+      Keyboard.close();
+      c.location = null;
+      c.suggested = null;
+      c.viaKeep = false;
+      if (navigator.vibrate) navigator.vibrate([20]);
+      renderLocationScan();
+    });
   }
 
   function wireVoiceBtn(refocusId) {
@@ -1041,7 +1335,7 @@
           <div class="mrc-field-lbl">Receipt number</div>
           <div class="mrc-zone">
             <div class="mrc-zone-lbl">Scan or type receipt</div>
-            <input id="mrc-receipt-in" class="mrc-input big" type="text" inputmode="text"
+            <input id="mrc-receipt-in" class="mrc-input big" type="text" inputmode="none"
               autocomplete="off" autocorrect="off" autocapitalize="characters" spellcheck="false"
               placeholder="RET-" value="${_esc(last)}"/>
           </div>
@@ -1049,24 +1343,21 @@
         </div>
       </div>
       <div class="mrc-actions">
+        ${kbButtonHtml()}
         <button id="mrc-load-btn" class="mrc-btn mrc-btn-primary">Load Receipt</button>
       </div>`;
 
     const inp = document.getElementById('mrc-receipt-in');
+    const go  = (v) => { const s = _normaliseScan(String(v || '').trim()); if (s) loadReceipt(s); };
     inp?.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' || e.keyCode === 13) {
-        e.preventDefault();
-        const v = _normaliseScan(inp.value.trim());
-        if (v) loadReceipt(v);
-      }
+      if (e.key === 'Enter' || e.keyCode === 13) { e.preventDefault(); go(inp.value); }
     });
-    document.getElementById('mrc-load-btn')?.addEventListener('click', () => {
-      const v = _normaliseScan((inp?.value || '').trim());
-      if (v) loadReceipt(v);
-    });
+    document.getElementById('mrc-load-btn')?.addEventListener('click', () => go(inp?.value));
     wireVoiceBtn('mrc-receipt-in');
-    setTimeout(() => { inp?.focus(); inp?.select(); }, 90);
+    wireKbButton('mrc-receipt-in', 'alpha', go, 'Receipt number');
     setTimeout(measureHeight, 30);
+    // Receipt numbers get typed as often as scanned, so bring the keyboard up.
+    setTimeout(() => Keyboard.open('mrc-receipt-in', 'alpha', go, 'Receipt number'), 120);
   }
 
   async function loadReceipt(receiptRaw) {
@@ -1149,7 +1440,7 @@
         </div>
       </div>
       <div class="mrc-actions">
-        <button id="mrc-finish-btn" class="mrc-btn mrc-btn-secondary">Finish Receipt</button>
+        <button id="mrc-newreceipt-btn" class="mrc-btn mrc-btn-secondary">New Receipt</button>
       </div>`;
 
     const inp = document.getElementById('mrc-scan-in');
@@ -1160,7 +1451,11 @@
       inp.value = '';
       if (raw) onItemScan(_normaliseScan(raw));
     });
-    document.getElementById('mrc-finish-btn')?.addEventListener('click', () => renderReceiptEntry());
+    // Straight back to the receipt prompt to start the next one.
+    document.getElementById('mrc-newreceipt-btn')?.addEventListener('click', () => {
+      State.resetReceipt();
+      renderReceiptEntry();
+    });
     wireVoiceBtn('mrc-scan-in');
     wireKeepToggle('mrc-scan-in');
     wireTapRefocus('mrc-scan-in');
@@ -1255,9 +1550,9 @@
           <div class="mrc-field-lbl">Unit of measure</div>
           <select id="mrc-uom-sel" class="mrc-select">${uomOpts}</select>
           <div class="mrc-field-lbl">Quantity${factor > 1 ? ' (base units)' : ''}</div>
-          <input id="mrc-qty-in" class="mrc-input big" type="text" inputmode="numeric"
+          <input id="mrc-qty-in" class="mrc-input big" type="text" inputmode="none"
             autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
-            placeholder="${openBase}" value="${openBase}"/>
+            placeholder="0 of ${openBase}" value=""/>
           <div class="mrc-fb dim" id="mrc-fb">Enter to continue</div>
         </div>
       </div>
@@ -1297,10 +1592,14 @@
     });
     syncHint();
     document.getElementById('mrc-next-btn')?.addEventListener('click', submitQty);
-    document.getElementById('mrc-back-btn')?.addEventListener('click', () => renderScanItem());
+    document.getElementById('mrc-back-btn')?.addEventListener('click', () => {
+      Keyboard.close(); renderScanItem();
+    });
     wireVoiceBtn('mrc-qty-in');
-    setTimeout(() => { qtyIn?.focus(); qtyIn?.select(); }, 90);
     setTimeout(measureHeight, 30);
+    // Quantity is always typed, so the keypad comes up automatically.
+    setTimeout(() => Keyboard.open('mrc-qty-in', 'num', () => submitQty(),
+      `Quantity${factor > 1 ? ' - base units' : ''} (open ${openBase})`), 110);
   }
 
   function submitQty() {
@@ -1386,7 +1685,7 @@
           You are receiving <strong>${baseQty}</strong> base units against an open quantity of
           <strong>${openBase}</strong>.<br><br>
           Type <strong>OVER</strong> to confirm.
-          <input id="mrc-over-in" class="mrc-input big" type="text" inputmode="text"
+          <input id="mrc-over-in" class="mrc-input big" type="text" inputmode="none"
             autocomplete="off" autocorrect="off" autocapitalize="characters" spellcheck="false"
             placeholder="OVER" style="margin-top:10px"/>
           <div class="mrc-fb err" id="mrc-over-fb" style="margin-top:6px"></div>
@@ -1404,6 +1703,7 @@
     const tryConfirm = () => {
       const v = _normaliseScan((inp?.value || '').trim()).toUpperCase();
       if (v === 'OVER') {
+        Keyboard.close();
         ov.remove();
         afterQty();
       } else {
@@ -1419,11 +1719,12 @@
     });
     document.getElementById('mrc-over-yes')?.addEventListener('click', tryConfirm);
     document.getElementById('mrc-over-no')?.addEventListener('click', () => {
+      Keyboard.close();
       ov.remove();
       State.screen = prevScreen;
-      setTimeout(() => document.getElementById('mrc-qty-in')?.focus(), 60);
+      renderQty();
     });
-    setTimeout(() => inp?.focus(), 120);
+    setTimeout(() => Keyboard.open('mrc-over-in', 'alpha', tryConfirm, 'Type OVER to confirm'), 130);
   }
 
   // ---------------------------------------------------------------------------
@@ -1444,7 +1745,7 @@
         <div class="mrc-body">
           ${errMsg ? `<div class="mrc-err-banner">${_esc(errMsg)}</div>` : ''}
           <div class="mrc-field-lbl">Batch number</div>
-          <input id="mrc-batch-in" class="mrc-input" type="text" inputmode="text"
+          <input id="mrc-batch-in" class="mrc-input" type="text" inputmode="none"
             autocomplete="off" autocorrect="off" autocapitalize="characters" spellcheck="false"
             placeholder="Scan or type batch" value="${_esc(c.batchNo || '')}"/>
           <div class="mrc-field-lbl">Expiry date</div>
@@ -1455,6 +1756,7 @@
       </div>
       <div class="mrc-actions">
         <button id="mrc-back-btn" class="mrc-btn mrc-btn-secondary">&lt;- Back</button>
+        ${kbButtonHtml()}
         <button id="mrc-next-btn" class="mrc-btn mrc-btn-primary">Next -&gt;</button>
       </div>`;
 
@@ -1462,15 +1764,18 @@
     const eIn = document.getElementById('mrc-expiry-in');
 
     bIn?.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' || e.keyCode === 13) { e.preventDefault(); eIn?.focus(); }
+      if (e.key === 'Enter' || e.keyCode === 13) { e.preventDefault(); Keyboard.close(); eIn?.focus(); }
     });
     eIn?.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' || e.keyCode === 13) { e.preventDefault(); submitBatch(); }
     });
     document.getElementById('mrc-next-btn')?.addEventListener('click', submitBatch);
-    document.getElementById('mrc-back-btn')?.addEventListener('click', () => renderQty());
+    document.getElementById('mrc-back-btn')?.addEventListener('click', () => {
+      Keyboard.close(); renderQty();
+    });
     wireVoiceBtn('mrc-batch-in');
-    setTimeout(() => { bIn?.focus(); bIn?.select(); }, 90);
+    wireKbButton('mrc-batch-in', 'alpha', () => { Keyboard.close(); eIn?.focus(); }, 'Batch number');
+    setTimeout(() => bIn?.focus(), 90);
     setTimeout(measureHeight, 30);
   }
 
@@ -1563,7 +1868,7 @@
           <div class="mrc-warn-red">NO EXISTING LOCATION</div>
           <div class="mrc-zone red">
             <div class="mrc-zone-lbl">Scan the location you are using</div>
-            <input id="mrc-loc-in" class="mrc-input big nolocation" type="text" inputmode="text"
+            <input id="mrc-loc-in" class="mrc-input big nolocation" type="text" inputmode="none"
               autocomplete="off" autocorrect="off" autocapitalize="characters" spellcheck="false"
               placeholder="" value=""/>
           </div>
@@ -1573,38 +1878,44 @@
       </div>
       <div class="mrc-actions">
         <button id="mrc-back-btn" class="mrc-btn mrc-btn-secondary">&lt;- Back</button>
+        ${kbButtonHtml()}
       </div>`;
 
     const inp = document.getElementById('mrc-loc-in');
-    inp?.addEventListener('keydown', async (e) => {
-      if (e.key !== 'Enter' && e.keyCode !== 13) return;
-      e.preventDefault();
-      const raw = _normaliseScan(inp.value.trim());
+
+    const submitLoc = async (rawVal) => {
+      const raw = _normaliseScan(String(rawVal ?? inp.value).trim());
       if (!raw) return;
       inp.disabled = true;
       const loc = await resolveLocation(raw);
       inp.disabled = false;
-      if (!loc) {
+      const retry = (msg) => {
         inp.value = '';
-        reject('Location not found', 'Location not found');
+        Keyboard.sync();
+        reject(msg, msg);
         setTimeout(() => inp.focus(), 60);
-        return;
-      }
-      if (loc.status !== 1) {
-        inp.value = '';
-        reject('Location is inactive', 'Location inactive');
-        setTimeout(() => inp.focus(), 60);
-        return;
-      }
+      };
+      if (!loc)               return retry('Location not found');
+      if (loc.status !== 1)   return retry('Location is inactive');
+      Keyboard.close();
       c.location = loc;
       setFb('Location accepted', 'ok');
       Audio.chime('item_ok');
       renderCheckDigit();
+    };
+
+    inp?.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' && e.keyCode !== 13) return;
+      e.preventDefault();
+      submitLoc();
     });
-    document.getElementById('mrc-back-btn')?.addEventListener('click', backFromLocation);
+    document.getElementById('mrc-back-btn')?.addEventListener('click', () => {
+      Keyboard.close(); backFromLocation();
+    });
     wireVoiceBtn('mrc-loc-in');
     wireKeepToggle('mrc-loc-in');
     wireTapRefocus('mrc-loc-in');
+    wireKbButton('mrc-loc-in', 'alpha', submitLoc, 'Location code');
     setTimeout(() => inp?.focus(), 100);
     setTimeout(measureHeight, 30);
     Voice.announceNoLocation();
@@ -1638,7 +1949,8 @@
       <div class="mrc-screen" id="mrc-screen">
         ${progressHtml('Put away', c.location.location_code,
           `${_esc(c.item.item_code)} &middot; ${c.qty} ${_esc(uomName(c.uom))}` +
-          `${c.viaKeep ? ' &middot; KEPT' : ''}${c.batchNo ? ' &middot; ' + _esc(c.batchNo) : ''}`, 'green')}
+          `${c.viaKeep ? ' &middot; KEPT' : ''}${c.batchNo ? ' &middot; ' + _esc(c.batchNo) : ''}`,
+          'green', true)}
         <div class="mrc-item verified">
           <div class="mrc-item-sku">${_esc(c.item.item_code)}</div>
           <div class="mrc-item-desc">${_esc(c.item.description || '')}</div>
@@ -1669,34 +1981,44 @@
         </div>
       </div>
       <div class="mrc-actions">
-        <button id="mrc-back-btn"  class="mrc-btn mrc-btn-secondary">&lt;- Back</button>
-        <button id="mrc-other-btn" class="mrc-btn mrc-btn-secondary">Other bin</button>
+        <button id="mrc-back-btn" class="mrc-btn mrc-btn-secondary">&lt;- Back</button>
+        ${kbButtonHtml()}
       </div>`;
 
     const inp = document.getElementById('mrc-cd-in');
-    inp?.addEventListener('keydown', (e) => {
-      if (e.key !== 'Enter' && e.keyCode !== 13) return;
-      e.preventDefault();
-      const raw = _normaliseScan(inp.value.trim());
+
+    const submitCd = (rawVal) => {
+      const raw = _normaliseScan(String(rawVal ?? inp.value).trim());
       inp.value = '';
+      Keyboard.sync();
       if (!raw) return;
       // Accept the check digit, or the full location code - some C7 location
       // templates set check_digit to the code itself.
       const ok = raw.toLowerCase() === expected.toLowerCase() ||
                  raw.toUpperCase() === locCode.toUpperCase();
-      if (ok) doCheckin();
-      else reject(noDigit ? 'Wrong location' : 'Wrong check digit',
-                  noDigit ? 'Wrong location' : 'Wrong check digit');
+      if (ok) { Keyboard.close(); doCheckin(); }
+      else {
+        const m = noDigit ? 'Wrong location' : 'Wrong check digit';
+        reject(m, m);
+        setTimeout(() => inp.focus(), 60);
+      }
+    };
+
+    inp?.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' && e.keyCode !== 13) return;
+      e.preventDefault();
+      submitCd();
     });
 
-    document.getElementById('mrc-back-btn')?.addEventListener('click', backFromLocation);
-    document.getElementById('mrc-other-btn')?.addEventListener('click', () => {
-      c.location = null; c.suggested = null; c.viaKeep = false;
-      renderLocationScan();
+    document.getElementById('mrc-back-btn')?.addEventListener('click', () => {
+      Keyboard.close(); backFromLocation();
     });
+    wireEditLocation();
     wireVoiceBtn('mrc-cd-in');
     wireKeepToggle('mrc-cd-in');
     wireTapRefocus('mrc-cd-in');
+    // Check digits are numeric, but the ABC toggle is one tap away.
+    wireKbButton('mrc-cd-in', 'num', submitCd, noDigit ? 'Location code' : 'Check digit');
     setTimeout(() => inp?.focus(), 100);
     setTimeout(measureHeight, 30);
     setTimeout(() => Voice.announcePutaway(
@@ -1749,6 +2071,7 @@
     _writeInFlight = true;
 
     State.screen = 'TRANSITIONING';
+    Keyboard.close();
     setFb('Checking in...', 'dim');
     document.querySelector('.mrc-item')?.classList.add('verified');
 
@@ -1883,9 +2206,9 @@
         <div class="mrc-center">
           <div style="font-size:44px;line-height:1;color:#79c447;font-weight:700">&#10003;</div>
           <div style="font-size:19px;font-weight:700;color:#3a8f3a">Receipt complete</div>
-          <div style="font-size:13px;color:#9faecb">${State.linesDone.size} line${
-            State.linesDone.size === 1 ? '' : 's'} received${
-            State.done > State.linesDone.size ? ` in ${State.done} put-aways` : ''}</div>
+          <div style="font-size:13px;color:#9faecb">${linesCompleted()} of ${
+            totalDetailLines()} line${totalDetailLines() === 1 ? '' : 's'} completed${
+            State.done > linesCompleted() ? ` in ${State.done} put-aways` : ''}</div>
           <div style="font-size:12px;color:#9faecb">${_esc(State.header?.company?.company_code || '')}</div>
         </div>
       </div>
@@ -1919,6 +2242,9 @@
   };
 
   function _refocus() {
+    // Never pull focus while we are minimised behind a C7 tab - the operator is
+    // typing in Canary7, not in us.
+    if (!isForeground()) return;
     const id = _FOCUS_MAP[State.screen];
     if (!id) return;
     const el = document.getElementById(id);
@@ -1932,7 +2258,7 @@
   });
   window.addEventListener('focus', () => setTimeout(_refocus, 200));
   setInterval(() => {
-    if (!document.getElementById('mrc-tab-view')) return;
+    if (!isForeground()) return;
     _refocus();
   }, 2500);
 
@@ -1944,38 +2270,40 @@
     document.removeEventListener('keydown', onGlobalKey);
     window.removeEventListener('resize', measureHeight);
     Voice.cancel();
+    Keyboard.close();
 
     if (!R._sidebarWasMinimized) document.body.classList.remove('sidebar-minimized');
     if (!R._brandWasMinimized)   document.body.classList.remove('brand-minimized');
 
+    // Clear our inline display:none off EVERY C7 panel we hid. Missing any one
+    // of them leaves that tab permanently blank, even after we are gone.
+    restoreC7Panels();
+
+    const tabBar     = document.querySelector('ul.nav.nav-tabs[role="tablist"]');
+    const tabContent = document.querySelector('div.tab-content');
+
     document.getElementById('mrc-tab-li')?.remove();
     document.getElementById('mrc-tab-view')?.remove();
 
-    if (R._prevActiveLi && document.contains(R._prevActiveLi)) {
-      R._prevActiveLi.classList.add('active');
-      const a = R._prevActiveLi.querySelector('a.nav-link');
-      if (a) { a.classList.add('active'); a.setAttribute('aria-selected', 'true'); }
-    } else {
-      const tabBar = document.querySelector('ul.nav.nav-tabs[role="tablist"]');
-      const lastLi = tabBar && Array.from(tabBar.querySelectorAll('li.nav-item')).pop();
-      if (lastLi) {
-        lastLi.classList.add('active');
-        const a = lastLi.querySelector('a.nav-link');
-        if (a) { a.classList.add('active'); a.setAttribute('aria-selected', 'true'); }
-      }
+    if (tabBar && R._tabGuard) {
+      tabBar.removeEventListener('click', R._tabGuard, true);
+      R._tabGuard = null;
     }
-    if (R._prevActivePanel && document.contains(R._prevActivePanel)) {
-      R._prevActivePanel.classList.add('active');
-      R._prevActivePanel.style.display = '';
-    } else {
-      const tabContent = document.querySelector('div.tab-content');
-      const panels = tabContent
-        ? Array.from(tabContent.querySelectorAll(':scope > tab, :scope > .tab-pane')) : [];
-      if (panels.length) {
-        const last = panels[panels.length - 1];
-        last.classList.add('active');
-        last.style.display = '';
-      }
+
+    // Hand the foreground back to whichever C7 tab we took it from.
+    const li = (R._prevActiveLi && document.contains(R._prevActiveLi))
+      ? R._prevActiveLi
+      : (tabBar && Array.from(tabBar.querySelectorAll('li.nav-item')).pop());
+    _setTabActive(li, true);
+
+    const panels = tabContent
+      ? Array.from(tabContent.querySelectorAll(':scope > tab, :scope > .tab-pane')) : [];
+    const panel = (R._prevActivePanel && document.contains(R._prevActivePanel))
+      ? R._prevActivePanel
+      : panels[panels.length - 1];
+    if (panel) {
+      panel.classList.add('active');
+      panel.style.display = '';
     }
 
     State.resetReceipt();
@@ -1984,7 +2312,8 @@
   }
 
   function onGlobalKey(e) {
-    if (!document.getElementById('mrc-tab-view')) return;
+    // Esc must not close us while the operator is working in a C7 tab.
+    if (!isForeground()) return;
     if (e.key === 'Escape') { e.preventDefault(); closeUI(); }
   }
 
@@ -1993,7 +2322,9 @@
   // ---------------------------------------------------------------------------
 
   function openReceiving() {
-    if (document.getElementById('mrc-tab-view')) return;
+    // Already built - we may just be minimised behind a C7 tab, so come forward
+    // rather than no-op. State is untouched, so a part-done receipt resumes.
+    if (document.getElementById('mrc-tab-view')) { activateSelf(); return; }
     try {
       injectCSS();
       buildShell();
