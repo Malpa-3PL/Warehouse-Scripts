@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Receiving
 // @namespace    https://malpa.canary7.com
-// @version      2.2.5
+// @version      2.2.6
 // @description  Fast single-screen receiving for Canary7 WMS - TC51 optimised
 // @author       Malpa 3PL
 // @updateURL    https://raw.githubusercontent.com/zaynnev/malpa3pl/main/malpa-receiving.user.js
@@ -1214,7 +1214,18 @@
       </div>`;
     }
 
-    const canCheckin = hasLoc && !State.busy;
+    // The primary button always performs the CURRENT step, so no stage can dead
+    // end. This matters most on the batch row: its date field opens Android's
+    // native picker, which swallows Enter, so a button is the only way out.
+    const primary = {
+      receipt:    { label: 'Load Receipt', on: true },
+      item:        { label: 'Find Item',   on: true },
+      qty:         { label: 'Next',        on: true },
+      batch:       { label: 'Next',        on: true },
+      location:    { label: 'Next',        on: true },
+      checkdigit:  { label: 'Check In',    on: true },
+      wait:        { label: 'Next',        on: false },
+    }[stage] || { label: 'Next', on: false };
 
     root.innerHTML = `
       <div class="mrc-card">
@@ -1238,7 +1249,8 @@
             ${hasItem
               ? `<button id="mrc-cancel" class="mrc-btn mrc-btn-secondary">Cancel line</button>`
               : `<button id="mrc-newrcpt" class="mrc-btn mrc-btn-secondary">New receipt</button>`}
-            <button id="mrc-go" class="mrc-btn mrc-btn-primary" ${canCheckin ? '' : 'disabled'}>Check In</button>
+            <button id="mrc-go" class="mrc-btn mrc-btn-primary"
+              ${primary.on && !State.busy ? '' : 'disabled'}>${primary.label}</button>
           </div>
           <input id="mrc-catch" class="mrc-catch" type="text" inputmode="none"
             autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
@@ -1358,8 +1370,16 @@
     document.getElementById('mrc-cancel')?.addEventListener('click', () => {
       State.resetLine(); render();
     });
-    document.getElementById('mrc-go')?.addEventListener('click', () => submitCheckDigit(
-      document.getElementById('mrc-cd')?.value || ''));
+    // One button, whatever the current step happens to be.
+    document.getElementById('mrc-go')?.addEventListener('click', () => {
+      const v = (id) => document.getElementById(id)?.value || '';
+      if (stage === 'receipt')         loadReceipt(v('mrc-receipt'));
+      else if (stage === 'item')       submitItem(v('mrc-item'));
+      else if (stage === 'qty')        submitQty(v('mrc-qty'));
+      else if (stage === 'batch')      submitBatch();
+      else if (stage === 'location')   submitLocation(v('mrc-loc'));
+      else if (stage === 'checkdigit') submitCheckDigit(v('mrc-cd'));
+    });
 
     // -- pencils: step back to a row already filled in ----------------------
     document.getElementById('mrc-edit-receipt')?.addEventListener('click', () => {
@@ -1401,8 +1421,17 @@
 
     const bIn = document.getElementById('mrc-batch');
     const eIn = document.getElementById('mrc-expiry');
-    onEnter(bIn, () => eIn?.focus());
+    // Enter on the batch field completes the step using whatever expiry is
+    // already set. It deliberately does NOT jump into the date field - doing so
+    // popped Android's date picker every time, which is what made it feel like
+    // the app kept demanding a date.
+    onEnter(bIn, () => submitBatch());
     onEnter(eIn, () => submitBatch());
+    // Hold onto a picked date immediately. Without this it lived only in the DOM
+    // and was lost on the next re-render, so the step could never be satisfied.
+    eIn?.addEventListener('change', () => {
+      if (State.cur) State.cur.expiry = eIn.value;
+    });
 
     const uom = document.getElementById('mrc-uom');
     uom?.addEventListener('change', () => {
@@ -1594,8 +1623,12 @@
     const c = State.cur;
     if (!c) return;
     const b = _normaliseScan((document.getElementById('mrc-batch')?.value || '').trim());
-    const e = (document.getElementById('mrc-expiry')?.value || '').trim();
+    // Fall back to state: on Android the picker can commit a value without the
+    // element still being in the DOM we read from.
+    const e = (document.getElementById('mrc-expiry')?.value || c.expiry || '').trim();
     if (!b) { reject('Batch number is required', 'Batch required'); return; }
+    // Expiry is not blocked on - C7 accepts a null expiry, and refusing to move
+    // on because a picker was dismissed is exactly the trap being fixed here.
     if (c.detail.expected_batch_no &&
         String(c.detail.expected_batch_no).trim().toLowerCase() !== b.toLowerCase()) {
       Audio.chime('warn');
