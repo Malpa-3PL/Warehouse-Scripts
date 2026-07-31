@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Transfer
 // @namespace    https://malpa.canary7.com
-// @version      2.1.0
+// @version      2.4.0
 // @description  Location-to-location stock transfer for Canary7 WMS - TC51 optimised
 // @author       Malpa 3PL
 // @homepageURL  https://github.com/zaynnev/malpa3pl
@@ -14,6 +14,20 @@
 // ==/UserScript==
 
 /* =============================================================================
+ * v2.4.0 - '%' is a Canary7 LIKE wildcard, not a mangled '5'.
+ *   The TC51 stuck-Shift repair was rewriting % to 5, killing partial search.
+ *   % is now excluded from that map AND actually supported: a pattern with %
+ *   runs a LIKE search (confirmed live: "%B02-S0%" -> A10-B02-S01, A10-B02-S02),
+ *   one match resolves straight through, several open a pick-list.
+ *
+ * v2.3.0 - tab co-existence. v2.2.0 hid other C7 panels with an INLINE
+ *   display:none; Angular switches tabs by toggling the .active CLASS only, and
+ *   inline style beats a class - so once hidden, a C7 tab could never be
+ *   returned to. Nothing told our panel to stand down either, so a newly opened
+ *   tab rendered on top of ours. We now only touch other panels while we are the
+ *   active tab, restore every one of them the moment we are not, and a
+ *   MutationObserver on the tab bar lets whoever C7 activates win.
+ *
  * v2.1.0 - location lookup moved onto the legacy monolith; on-screen console
  *          replaced by a plain success/error banner for the picker.
  *   - v2.0.0 called /inbound/api/wms/v1/location and got a 404. "inbound" is a
@@ -83,7 +97,7 @@
   // 0. CONSTANTS
   // ---------------------------------------------------------------------------
   const TAG          = '[MalpaTransfer]';
-  const VERSION      = '2.1.0';   // keep in step with @version in the header
+  const VERSION      = '2.4.0';   // keep in step with @version in the header
   const API_ROOT     = 'https://stgauth.canary7.com';
   const API_BASE     = API_ROOT + '/index.php?r=';
   const WAREHOUSE_ID = 10;                      // 10 = Darra (Malpa's only live WH)
@@ -266,11 +280,14 @@
     }[c]));
   }
 
-  // TC51 scanners can emit shifted number keys when Android's Shift state sticks
-  // during a focus() call ($ instead of 4, % instead of 5, ...). Location codes are
-  // full of digits, so an unmangled scan matters. Same fix as malpa-pick.
+  /* TC51 scanners can emit shifted number keys when Android's Shift state sticks
+   * during a focus() call ($ for 4, ^ for 6, ...). Location codes are full of
+   * digits, so repairing that matters. Same fix as malpa-pick, with ONE exception:
+   * '%' is deliberately NOT repaired to '5', because Canary7 treats % as a LIKE
+   * wildcard and operators use it for partial searches (confirmed: "%B02-S0%"
+   * returns A10-B02-S01 and A10-B02-S02). Turning it into a 5 broke that. */
   const _SHIFT_NUMS = {
-    '!': '1', '@': '2', '#': '3', '$': '4', '%': '5',
+    '!': '1', '@': '2', '#': '3', '$': '4',
     '^': '6', '&': '7', '*': '8', '(': '9', ')': '0',
   };
   function _normaliseScan(val) {
@@ -285,23 +302,49 @@
    * proxy-side route name, not a real URL), which is what broke v2.0.0.
    * The filter is a PREFIX match - "A10-B02" returns S01, S02, S11... - so an
    * exact-code check is mandatory or a partial scan silently picks the wrong bin. */
+  async function searchLocations(pattern) {
+    const path = 'configuration/location' +
+      '&location_code=' + encodeURIComponent(pattern) +
+      '&fields=' + encodeURIComponent(
+        'id,location_code,warehouse_id,status,location_class_id,allow_multiple_items,enable_license_plate') +
+      '&per-page=200';
+    const list = await apiGet(path);
+    return Array.isArray(list) ? list : [];
+  }
+
+  function _cancelled() {
+    const e = new Error('Cancelled');
+    e.cancelled = true;
+    return e;
+  }
+
   async function resolveLocation(code) {
     const clean = String(code || '').trim().toUpperCase();
     if (!clean) throw new Error('No location entered');
-    const path = 'configuration/location' +
-      '&location_code=' + encodeURIComponent(clean) +
-      '&fields=' + encodeURIComponent(
-        'id,location_code,warehouse_id,status,location_class_id,allow_multiple_items,enable_license_plate') +
-      '&per-page=50';
-    const list = await apiGet(path);
-    const arr = Array.isArray(list) ? list : [];
-    const hit = arr.find((l) => String(l.location_code).toUpperCase() === clean);
-    if (!hit) throw new Error('Location "' + clean + '" not found');
-    if (String(hit.warehouse_id) !== String(WAREHOUSE_ID)) {
-      throw new Error('Location "' + clean + '" is in warehouse ' + hit.warehouse_id +
-                      ', not ' + WAREHOUSE_ID);
+    const arr = await searchLocations(clean);
+    let hit;
+
+    if (clean.includes('%')) {
+      // Wildcard search - Canary7 treats % as a LIKE wildcard, so let the
+      // operator pick from the matches rather than demanding an exact code.
+      const usable = arr.filter((l) => String(l.warehouse_id) === String(WAREHOUSE_ID));
+      if (!usable.length) throw new Error('Nothing matches "' + clean + '"');
+      hit = usable.length === 1 ? usable[0] : await chooseLocation(usable, clean);
+      if (!hit) throw _cancelled();
+    } else {
+      // Plain code. The filter is a PREFIX match, so demand an exact hit or a
+      // half-read scan ("A10-B02") would silently resolve to the first bin.
+      hit = arr.find((l) => String(l.location_code).toUpperCase() === clean);
+      if (!hit) throw new Error('Location "' + clean + '" not found');
     }
-    if (hit.status !== 1) Log.warn(clean + ' is INACTIVE (status ' + hit.status + ')');
+
+    if (String(hit.warehouse_id) !== String(WAREHOUSE_ID)) {
+      throw new Error('Location "' + hit.location_code + '" is in warehouse ' +
+                      hit.warehouse_id + ', not ' + WAREHOUSE_ID);
+    }
+    if (hit.status !== 1) {
+      Log.warn(hit.location_code + ' is INACTIVE (status ' + hit.status + ')');
+    }
     return hit;
   }
 
@@ -358,6 +401,40 @@
     rows.sort((a, b) =>
       a.itemCode.localeCompare(b.itemCode) || String(a.batchNo).localeCompare(String(b.batchNo)));
     return rows;
+  }
+
+  /* Bottom sheet listing wildcard matches. Resolves with the chosen location, or
+   * null if the operator cancels. Big touch targets - this is used with gloves on. */
+  function chooseLocation(matches, pattern) {
+    return new Promise((resolve) => {
+      const host = document.getElementById('mtr-tab-view');
+      if (!host) { resolve(matches[0] || null); return; }
+      document.getElementById('mtr-pick')?.remove();
+
+      const ov = document.createElement('div');
+      ov.id = 'mtr-pick';
+      ov.className = 'mtr-pick-overlay';
+      ov.innerHTML = `
+        <div class="mtr-pick-sheet">
+          <div class="mtr-pick-head">${matches.length} locations match "${_esc(pattern)}"</div>
+          <div class="mtr-pick-list" id="mtr-pick-list"></div>
+          <button class="mtr-btn mtr-btn-secondary" id="mtr-pick-cancel">Cancel</button>
+        </div>`;
+      host.appendChild(ov);
+
+      const list = ov.querySelector('#mtr-pick-list');
+      matches.forEach((m) => {
+        const b = document.createElement('button');
+        b.className = 'mtr-pick-item' + (m.status !== 1 ? ' mtr-pick-off' : '');
+        b.textContent = m.location_code + (m.status !== 1 ? '  (inactive)' : '');
+        b.addEventListener('click', () => { ov.remove(); resolve(m); });
+        list.appendChild(b);
+      });
+      ov.querySelector('#mtr-pick-cancel').addEventListener('click', () => {
+        ov.remove();
+        resolve(null);
+      });
+    });
   }
 
   // Allocated / suspended stock cannot be transferred - C7 rejects the move.
@@ -430,15 +507,46 @@
       #mtr-nav-li { order: -1; }
       #mtr-nav {
         display: flex !important; align-items: center; gap: 10px; padding: 10px 12px;
-        color: #5cd6a9 !important; font-weight: 500; cursor: pointer;
+        color: #009C3B !important; font-weight: 500; cursor: pointer;
         transition: background .1s; text-decoration: none !important; position: relative;
       }
-      #mtr-nav:hover { background: rgba(92,214,169,.08); }
+      #mtr-nav:hover { background: rgba(0,156,59,.10); }
       #mtr-nav .mtr-nav-icon {
         width: 20px; height: 20px; flex-shrink: 0; display: flex;
         align-items: center; justify-content: center;
       }
-      #mtr-nav .mtr-nav-label { font-size: 17px; font-weight: 500; }
+      /* Brazil colour wave: verde-amarela flag palette swept across the letters.
+         The gradient is twice the label width and slides continuously, so the
+         colour travels through the text rather than the text moving. */
+      #mtr-nav .mtr-nav-label {
+        font-size: 17px; font-weight: 500;
+        background-image: linear-gradient(100deg,
+          #009C3B 0%,   /* verde   */
+          #FFDF00 18%,  /* amarelo */
+          #FFFFFF 30%,  /* branco  */
+          #002776 42%,  /* azul    */
+          #FFDF00 58%,
+          #009C3B 76%,
+          #FFDF00 88%,
+          #009C3B 100%);
+        background-size: 200% auto;
+        background-position: 0% center;
+        -webkit-background-clip: text; background-clip: text;
+        -webkit-text-fill-color: transparent; color: transparent;
+        animation: mtr-brazil-wave 3.6s linear infinite;
+      }
+      @keyframes mtr-brazil-wave { to { background-position: -200% center; } }
+      /* If the device can't clip a background to text the label would render
+         invisible - fall back to solid verde. */
+      @supports not ((-webkit-background-clip: text) or (background-clip: text)) {
+        #mtr-nav .mtr-nav-label {
+          background: none; color: #009C3B;
+          -webkit-text-fill-color: currentColor; animation: none;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #mtr-nav .mtr-nav-label { animation: none; background-position: 25% center; }
+      }
 
       /* -- Buttons -- */
       #mtr-root .mtr-btn {
@@ -542,6 +650,28 @@
       .mtr-status-err  { background: #fdecea; border-color: #c5221f; color: #b3261e; }
       .mtr-status-warn { background: #fff8e6; border-color: #d99400; color: #8a5a00; }
 
+      /* -- Wildcard match picker -- */
+      .mtr-pick-overlay {
+        position: absolute; inset: 0; background: rgba(0,0,0,.55);
+        display: flex; align-items: flex-end; z-index: 400;
+      }
+      .mtr-pick-sheet {
+        width: 100%; max-height: 85%; background: #fff; padding: 12px;
+        display: flex; flex-direction: column; gap: 8px;
+      }
+      .mtr-pick-head { font: 600 14px Roboto, sans-serif; color: #384042; }
+      .mtr-pick-list {
+        flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch;
+        display: flex; flex-direction: column; gap: 6px;
+      }
+      .mtr-pick-item {
+        min-height: 50px; padding: 12px; background: #f0f8fd; border: 1px solid #c3ced8;
+        font: 700 17px monospace; color: #20455c; text-align: left; cursor: pointer;
+        -webkit-tap-highlight-color: transparent; touch-action: manipulation;
+      }
+      .mtr-pick-item:active { background: #d8ecfa; }
+      .mtr-pick-item.mtr-pick-off { opacity: .55; }
+
       #mtr-veil {
         position: absolute; inset: 0; background: rgba(255,255,255,.7); display: none;
         align-items: center; justify-content: center; gap: 10px;
@@ -626,25 +756,17 @@
       <div id="mtr-veil"><span class="mtr-spinner"></span><span>Working...</span></div>`;
 
     if (tabBar && tabContent) {
+      R._tabBar = tabBar;
+      R._tabContent = tabContent;
       // Remember what was active so we can restore it exactly on close.
       R._prevActiveLi = tabBar.querySelector('li.nav-item.active');
       R._prevActivePanel = tabContent.querySelector(':scope > .tab-pane.active, :scope > tab.active');
 
-      tabBar.querySelectorAll('li.nav-item').forEach((li) => {
-        li.classList.remove('active');
-        const a = li.querySelector('a.nav-link');
-        if (a) { a.classList.remove('active'); a.setAttribute('aria-selected', 'false'); }
-      });
-      tabContent.querySelectorAll(':scope > tab, :scope > .tab-pane').forEach((p) => {
-        p.classList.remove('active');
-        p.style.display = 'none';
-      });
-
       const tabLi = document.createElement('li');
       tabLi.id = 'mtr-tab-li';
-      tabLi.className = 'nav-item active';
+      tabLi.className = 'nav-item';
       tabLi.innerHTML = `
-        <a class="nav-link active" aria-selected="true" href="javascript:void(0)"
+        <a class="nav-link" aria-selected="false" href="javascript:void(0)"
            style="display:inline-flex;align-items:center;gap:6px;padding-right:8px;">
           Malpa Transfer
           <span id="mtr-tab-close" title="Close (Esc)" style="display:inline-flex;align-items:center;
@@ -654,12 +776,21 @@
       tabBar.appendChild(tabLi);
       tabLi.querySelector('#mtr-tab-close').addEventListener('click', (e) => {
         e.stopPropagation();
+        e.preventDefault();
         closeUI();
       });
+      // Clicking our own tab brings it back to the front.
+      tabLi.addEventListener('click', (e) => {
+        if (e.target.closest('#mtr-tab-close')) return;
+        e.preventDefault();
+        showOurs();
+      });
 
-      panel.className = 'tab-pane active';
+      panel.className = 'tab-pane';
       tabContent.appendChild(panel);
       R._mode = 'tab';
+      showOurs();
+      watchTabs();
     } else {
       // No tab bar on this screen - fall back to a full-screen panel so the
       // script is still usable rather than silently doing nothing.
@@ -690,6 +821,100 @@
       window.addEventListener('resize', measureHeight);
     }
     return true;
+  }
+
+  /* ---------------------------------------------------------------------------
+   * 9b. TAB CO-EXISTENCE
+   *
+   * v2.2.0 hid the other panels with an INLINE style.display='none'. Angular
+   * switches tabs by toggling the .active CLASS only, and an inline style beats
+   * a class - so once hidden, a C7 tab could never come back. And nothing told
+   * our panel to stand down when C7 activated another tab, so a newly opened tab
+   * rendered while ours was still on screen.
+   *
+   * Rule now: we only ever touch another panel's inline display while WE are the
+   * active tab, and we put every one of them back the moment we are not. A
+   * MutationObserver watches the tab bar so that whoever C7 activates wins.
+   * ------------------------------------------------------------------------ */
+  let _syncing = false;
+
+  function otherPanels() {
+    if (!R._tabContent) return [];
+    return Array.from(R._tabContent.querySelectorAll(':scope > tab, :scope > .tab-pane'))
+      .filter((p) => p.id !== 'mtr-tab-view');
+  }
+  function otherLis() {
+    if (!R._tabBar) return [];
+    return Array.from(R._tabBar.querySelectorAll('li.nav-item'))
+      .filter((li) => li.id !== 'mtr-tab-li');
+  }
+  function setLiActive(li, on) {
+    if (!li) return;
+    li.classList.toggle('active', on);
+    const a = li.querySelector('a.nav-link');
+    if (a) { a.classList.toggle('active', on); a.setAttribute('aria-selected', on ? 'true' : 'false'); }
+  }
+
+  function hideOthers() {
+    otherPanels().forEach((p) => {
+      if (p.dataset.mtrPrevDisplay === undefined) p.dataset.mtrPrevDisplay = p.style.display || '';
+      p.style.display = 'none';
+    });
+  }
+  // Give every panel its original inline display back - this is what makes the
+  // other tabs clickable again.
+  function restoreOthers() {
+    otherPanels().forEach((p) => {
+      if (p.dataset.mtrPrevDisplay !== undefined) {
+        p.style.display = p.dataset.mtrPrevDisplay;
+        delete p.dataset.mtrPrevDisplay;
+      }
+    });
+  }
+
+  function showOurs() {
+    const li = document.getElementById('mtr-tab-li');
+    const panel = document.getElementById('mtr-tab-view');
+    if (!li || !panel || R._mode !== 'tab') return;
+    _syncing = true;
+    otherLis().forEach((o) => setLiActive(o, false));
+    hideOthers();
+    setLiActive(li, true);
+    panel.classList.add('active');
+    panel.style.display = '';
+    _syncing = false;
+    setTimeout(measureHeight, 30);
+  }
+
+  function hideOurs() {
+    const li = document.getElementById('mtr-tab-li');
+    const panel = document.getElementById('mtr-tab-view');
+    if (!li || !panel || R._mode !== 'tab') return;
+    _syncing = true;
+    setLiActive(li, false);
+    panel.classList.remove('active');
+    panel.style.display = 'none';
+    restoreOthers();
+    _syncing = false;
+  }
+
+  // Whoever C7 activates wins; we only hold the screen while our tab is active.
+  function syncTabs() {
+    if (_syncing || R._mode !== 'tab') return;
+    const li = document.getElementById('mtr-tab-li');
+    if (!li) return;
+    const otherActive = otherLis().some((o) => o.classList.contains('active'));
+    if (otherActive) hideOurs();
+    else if (li.classList.contains('active')) showOurs();
+  }
+
+  function watchTabs() {
+    if (R._tabObs || !R._tabBar) return;
+    R._tabObs = new MutationObserver(() => syncTabs());
+    R._tabObs.observe(R._tabBar, { attributes: true, subtree: true, attributeFilter: ['class'] });
+    if (R._tabContent) {
+      R._tabObs.observe(R._tabContent, { childList: true });
+    }
   }
 
   function setBusy(on) {
@@ -930,6 +1155,7 @@
     try {
       const loc = await resolveLocation(clean);
       State.from = loc;
+      R.from.value = loc.location_code;      // replace any % pattern with the real code
       R.fromMsg.className = 'mtr-loc-msg ok';
       R.fromMsg.textContent = 'FROM ' + loc.location_code + ' (id ' + loc.id + ')';
 
@@ -955,13 +1181,18 @@
       }
     } catch (e) {
       State.from = null;
-      const msg = String((e && e.message) || e);
-      R.fromMsg.className = 'mtr-loc-msg bad';
-      R.fromMsg.textContent = msg;
-      Log.err('FROM ' + clean + ': ' + msg);
-      Status.show('err', 'From location: ' + msg, ['Scanned: ' + clean]);
-      Audio.chime('error');
-      buzz('error');
+      if (e && e.cancelled) {                      // operator backed out of the picker
+        R.fromMsg.className = 'mtr-loc-msg';
+        R.fromMsg.textContent = '';
+      } else {
+        const msg = String((e && e.message) || e);
+        R.fromMsg.className = 'mtr-loc-msg bad';
+        R.fromMsg.textContent = msg;
+        Log.err('FROM ' + clean + ': ' + msg);
+        Status.show('err', 'From location: ' + msg, ['Entered: ' + clean]);
+        Audio.chime('error');
+        buzz('error');
+      }
     } finally {
       setBusy(false);
       refreshGo();
@@ -981,6 +1212,7 @@
         throw new Error('TO is the same as FROM');
       }
       State.to = loc;
+      R.to.value = loc.location_code;        // replace any % pattern with the real code
       R.toMsg.className = 'mtr-loc-msg ok';
       R.toMsg.textContent = 'TO ' + loc.location_code + ' (id ' + loc.id + ')';
       Log.ok('TO ' + loc.location_code + ' ready');
@@ -990,13 +1222,18 @@
       }
     } catch (e) {
       State.to = null;
-      const msg = String((e && e.message) || e);
-      R.toMsg.className = 'mtr-loc-msg bad';
-      R.toMsg.textContent = msg;
-      Log.err('TO ' + clean + ': ' + msg);
-      Status.show('err', 'To location: ' + msg, ['Scanned: ' + clean]);
-      Audio.chime('error');
-      buzz('error');
+      if (e && e.cancelled) {
+        R.toMsg.className = 'mtr-loc-msg';
+        R.toMsg.textContent = '';
+      } else {
+        const msg = String((e && e.message) || e);
+        R.toMsg.className = 'mtr-loc-msg bad';
+        R.toMsg.textContent = msg;
+        Log.err('TO ' + clean + ': ' + msg);
+        Status.show('err', 'To location: ' + msg, ['Entered: ' + clean]);
+        Audio.chime('error');
+        buzz('error');
+      }
     } finally {
       setBusy(false);
       refreshGo();
@@ -1106,7 +1343,10 @@
   // 12. FOCUS RECOVERY  (TC51 sleeps / notifications steal focus)
   // ---------------------------------------------------------------------------
   function _refocusScanInput() {
-    if (!document.getElementById('mtr-tab-view')) return;
+    const panel = document.getElementById('mtr-tab-view');
+    if (!panel) return;
+    // Don't grab the scanner while we're hidden behind another C7 tab.
+    if (panel.style.display === 'none') return;
     if (State.busy) return;
     const id = R._armed === 'mtr-to' ? 'mtr-to' : 'mtr-from';
     const el = document.getElementById(id);
@@ -1127,7 +1367,11 @@
   // 13. OPEN / CLOSE / KEYBOARD
   // ---------------------------------------------------------------------------
   function openTransfer() {
-    if (document.getElementById('mtr-tab-view')) return;
+    // Already open but sitting behind another tab - just bring it forward.
+    if (document.getElementById('mtr-tab-view')) {
+      if (R._mode === 'tab') showOurs();
+      return;
+    }
     try {
       injectCSS();
       buildShell();
@@ -1157,43 +1401,41 @@
     document.removeEventListener('keydown', onGlobalKey);
     window.removeEventListener('resize', measureHeight);
 
+    if (R._tabObs) { R._tabObs.disconnect(); R._tabObs = null; }
+    _syncing = true;
+
     if (!R._sidebarWasMinimized) document.body.classList.remove('sidebar-minimized');
     if (!R._brandWasMinimized) document.body.classList.remove('brand-minimized');
 
-    document.getElementById('mtr-tab-li')?.remove();
-    document.getElementById('mtr-tab-view')?.remove();
-
-    // Restore whichever tab + panel was active before we opened.
     if (R._mode === 'tab') {
-      if (R._prevActiveLi && document.contains(R._prevActiveLi)) {
-        R._prevActiveLi.classList.add('active');
-        const a = R._prevActiveLi.querySelector('a.nav-link');
-        if (a) { a.classList.add('active'); a.setAttribute('aria-selected', 'true'); }
-      } else {
-        const tabBar = document.querySelector('ul.nav.nav-tabs[role="tablist"]');
-        const lastLi = tabBar && Array.from(tabBar.querySelectorAll('li.nav-item')).pop();
-        if (lastLi) {
-          lastLi.classList.add('active');
-          const a = lastLi.querySelector('a.nav-link');
-          if (a) { a.classList.add('active'); a.setAttribute('aria-selected', 'true'); }
-        }
-      }
-      if (R._prevActivePanel && document.contains(R._prevActivePanel)) {
-        R._prevActivePanel.classList.add('active');
-        R._prevActivePanel.style.display = '';
-      } else {
-        const tabContent = document.querySelector('div.tab-content');
-        const panels = tabContent
-          ? Array.from(tabContent.querySelectorAll(':scope > tab, :scope > .tab-pane'))
+      // Undo every inline display we set before removing ourselves, or C7's own
+      // tabs stay stuck hidden after we're gone.
+      restoreOthers();
+      const wasActive = document.getElementById('mtr-tab-li')?.classList.contains('active');
+
+      document.getElementById('mtr-tab-li')?.remove();
+      document.getElementById('mtr-tab-view')?.remove();
+
+      // Only hand focus to another tab if we were the one on screen. If the user
+      // was already looking at a different tab, leave their selection alone.
+      if (wasActive) {
+        const lis = R._tabBar ? Array.from(R._tabBar.querySelectorAll('li.nav-item')) : [];
+        const panels = R._tabContent
+          ? Array.from(R._tabContent.querySelectorAll(':scope > tab, :scope > .tab-pane'))
           : [];
-        if (panels.length) {
-          const last = panels[panels.length - 1];
-          last.classList.add('active');
-          last.style.display = '';
-        }
+        const li = (R._prevActiveLi && document.contains(R._prevActiveLi))
+          ? R._prevActiveLi : lis[lis.length - 1];
+        const panel = (R._prevActivePanel && document.contains(R._prevActivePanel))
+          ? R._prevActivePanel : panels[panels.length - 1];
+        setLiActive(li, true);
+        if (panel) { panel.classList.add('active'); panel.style.display = ''; }
       }
+    } else {
+      document.getElementById('mtr-tab-li')?.remove();
+      document.getElementById('mtr-tab-view')?.remove();
     }
 
+    _syncing = false;
     State.reset();
     R = {};
   }
@@ -1210,7 +1452,8 @@
     VERSION, State, Status, open: openTransfer, close: closeUI,
     apiGet, apiPost, getToken,
     groupRows, validateRow, movableQty, buildTransferBody,
-    resolveLocation, readLocationStock, injectNav,
+    resolveLocation, searchLocations, chooseLocation, readLocationStock, injectNav,
+    showOurs, hideOurs, syncTabs, restoreOthers,
     apiBase: () => API_BASE, warehouseId: () => String(WAREHOUSE_ID),
     hasToken: () => !!getToken(), normaliseScan: _normaliseScan,
     CONFIG: { transferAdjustmentTypeId: TRANSFER_ADJUSTMENT_TYPE_ID, comment: COMMENT },
