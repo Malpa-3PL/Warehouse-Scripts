@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Transfer
 // @namespace    https://malpa.canary7.com
-// @version      2.4.0
+// @version      2.5.0
 // @description  Location-to-location stock transfer for Canary7 WMS - TC51 optimised
 // @author       Malpa 3PL
 // @homepageURL  https://github.com/zaynnev/malpa3pl
@@ -97,7 +97,7 @@
   // 0. CONSTANTS
   // ---------------------------------------------------------------------------
   const TAG          = '[MalpaTransfer]';
-  const VERSION      = '2.4.0';   // keep in step with @version in the header
+  const VERSION      = '2.5.0';   // keep in step with @version in the header
   const API_ROOT     = 'https://stgauth.canary7.com';
   const API_BASE     = API_ROOT + '/index.php?r=';
   const WAREHOUSE_ID = 10;                      // 10 = Darra (Malpa's only live WH)
@@ -583,6 +583,10 @@
         flex: 0 0 auto; background: #f0f2f5; border: 1px solid #e1e6ef;
         padding: 0 13px; font: 500 13px Roboto, sans-serif; color: #20455c;
         min-height: 44px; cursor: pointer; -webkit-tap-highlight-color: transparent;
+        touch-action: manipulation;
+      }
+      .mtr-scanrow button.mtr-clr {
+        padding: 0; width: 42px; font-size: 22px; line-height: 1; color: #7d92a3;
       }
       .mtr-loc-msg { padding: 0 10px 8px; font-size: 12px; font-weight: 500; }
       .mtr-loc-msg.ok { color: #12833f; }
@@ -626,11 +630,12 @@
       .mtr-tag.mtr-lp { background: #f0e6ff; color: #5b2ea8; }
       .mtr-tag.mtr-stat { background: #ffe4e0; color: #a3311f; }
       .mtr-right { flex: 0 0 auto; width: 88px; text-align: right; }
-      .mtr-right input {
-        width: 100%; font: 700 18px/1 monospace; text-align: right; padding: 10px 6px;
-        border: 2px solid #e1e6ef; border-radius: 0; background: #fff; outline: none;
+      .mtr-qty {
+        width: 100%; min-height: 46px; font: 700 20px/1 monospace; text-align: right;
+        padding: 10px 8px; border: 2px solid #20a8d8; background: #f0f8fd; color: #20455c;
+        cursor: pointer; -webkit-tap-highlight-color: transparent; touch-action: manipulation;
       }
-      .mtr-right input:focus { border-color: #20a8d8; }
+      .mtr-qty:active { background: #d8ecfa; }
       .mtr-onhand { font-size: 11px; color: #9faecb; margin-top: 3px; }
       .mtr-err { font-size: 11px; color: #ff5454; font-weight: 600; margin-top: 3px; }
       .mtr-empty { padding: 18px 10px; text-align: center; color: #9faecb; font-size: 13px; }
@@ -671,6 +676,33 @@
       }
       .mtr-pick-item:active { background: #d8ecfa; }
       .mtr-pick-item.mtr-pick-off { opacity: .55; }
+
+      /* -- Quantity keypad -- */
+      .mtr-pad-sheet {
+        width: 100%; background: #fff; padding: 12px; display: flex;
+        flex-direction: column; gap: 8px; max-height: 96%;
+      }
+      .mtr-pad-head { border-bottom: 1px solid #e1e6ef; padding-bottom: 6px; }
+      .mtr-pad-sku { font: 700 15px monospace; color: #384042; overflow-wrap: anywhere; }
+      .mtr-pad-desc { font-size: 12px; color: #9faecb; margin-top: 2px; overflow-wrap: anywhere; }
+      .mtr-pad-value {
+        font: 700 46px/1 monospace; text-align: center; color: #20455c; padding: 6px 0 2px;
+      }
+      .mtr-pad-value.mtr-pad-bad { color: #c5221f; }
+      .mtr-pad-hint {
+        text-align: center; font: 500 12px Roboto, sans-serif; color: #9faecb; min-height: 16px;
+      }
+      .mtr-pad-hint.mtr-pad-hint-bad { color: #c5221f; font-weight: 600; }
+      .mtr-pad-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+      .mtr-pad-key {
+        min-height: 52px; font: 600 22px Roboto, sans-serif; color: #384042;
+        background: #f0f2f5; border: 1px solid #e1e6ef; cursor: pointer;
+        -webkit-tap-highlight-color: transparent; touch-action: manipulation;
+      }
+      .mtr-pad-key:active { background: #dde3ea; }
+      .mtr-pad-key.mtr-pad-alt { font-size: 15px; color: #20455c; }
+      .mtr-pad-actions { display: flex; gap: 8px; }
+      .mtr-pad-actions .mtr-btn { flex: 1; }
 
       #mtr-veil {
         position: absolute; inset: 0; background: rgba(255,255,255,.7); display: none;
@@ -935,9 +967,10 @@
         <div class="mtr-card">
           <span class="mtr-card-label">From location</span>
           <div class="mtr-scanrow">
-            <input id="mtr-from" type="text" inputmode="none" autocomplete="off"
-                   autocorrect="off" autocapitalize="off" spellcheck="false"
-                   placeholder="scan or type" />
+            <input id="mtr-from" type="text" autocomplete="off"
+                   autocorrect="off" autocapitalize="characters" spellcheck="false"
+                   placeholder="scan, or type (% = wildcard)" />
+            <button id="mtr-from-clr" class="mtr-clr" title="Clear">&times;</button>
             <button id="mtr-from-go">Load</button>
           </div>
           <div class="mtr-loc-msg" id="mtr-from-msg"></div>
@@ -956,9 +989,10 @@
         <div class="mtr-card">
           <span class="mtr-card-label">To location</span>
           <div class="mtr-scanrow">
-            <input id="mtr-to" type="text" inputmode="none" autocomplete="off"
-                   autocorrect="off" autocapitalize="off" spellcheck="false"
-                   placeholder="scan or type" />
+            <input id="mtr-to" type="text" autocomplete="off"
+                   autocorrect="off" autocapitalize="characters" spellcheck="false"
+                   placeholder="scan, or type (% = wildcard)" />
+            <button id="mtr-to-clr" class="mtr-clr" title="Clear">&times;</button>
             <button id="mtr-to-go">Check</button>
           </div>
           <div class="mtr-loc-msg" id="mtr-to-msg"></div>
@@ -985,6 +1019,21 @@
     const commitFrom = () => loadFrom(R.from.value);
     const commitTo = () => checkTo(R.to.value);
 
+    /* Once a location is resolved the field holds a committed code. The next
+     * scan (or keystroke) must REPLACE it, not append to it - otherwise moving a
+     * second pallet appends the new code onto the old one. */
+    const replaceOnNextType = (input) => {
+      input.addEventListener('keydown', (e) => {
+        if (input.dataset.committed !== '1') return;
+        if (e.key && e.key.length === 1) {           // a printable character
+          input.value = '';
+          delete input.dataset.committed;
+        }
+      });
+    };
+    replaceOnNextType(R.from);
+    replaceOnNextType(R.to);
+
     R.from.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' || e.keyCode === 13) { e.preventDefault(); commitFrom(); }
     });
@@ -993,6 +1042,28 @@
     });
     document.getElementById('mtr-from-go').addEventListener('click', commitFrom);
     document.getElementById('mtr-to-go').addEventListener('click', commitTo);
+
+    document.getElementById('mtr-from-clr').addEventListener('click', () => {
+      R.from.value = '';
+      delete R.from.dataset.committed;
+      R.fromMsg.className = 'mtr-loc-msg';
+      R.fromMsg.textContent = '';
+      State.from = null;
+      State.rows = [];
+      Status.clear();
+      renderRows();
+      R.from.focus();
+    });
+    document.getElementById('mtr-to-clr').addEventListener('click', () => {
+      R.to.value = '';
+      delete R.to.dataset.committed;
+      R.toMsg.className = 'mtr-loc-msg';
+      R.toMsg.textContent = '';
+      State.to = null;
+      Status.clear();
+      refreshGo();
+      R.to.focus();
+    });
 
     // Arm whichever field the operator last touched, so a scan lands in it.
     [R.from, R.to].forEach((inp) => {
@@ -1110,20 +1181,16 @@
         mid.appendChild(e);
       }
 
+      /* Tapping the qty opens an in-panel keypad instead of the Android numeric
+       * keyboard, which covered the very row you were editing - you ended up
+       * typing blind. The keypad shows the number big while you change it. */
       const right = document.createElement('div');
       right.className = 'mtr-right';
-      const qty = document.createElement('input');
-      qty.type = 'number';
-      qty.inputMode = 'numeric';
-      qty.min = '0';
-      qty.step = String(g.factor > 1 ? g.factor : 1);
-      qty.value = String(g.qty);
-      qty.addEventListener('input', () => {
-        g.qty = qty.value === '' ? 0 : Number(qty.value);
-        if (!g.checked && g.qty > 0) g.checked = true;
-        refreshGo();
-      });
-      qty.addEventListener('blur', renderRows);
+      const qty = document.createElement('button');
+      qty.type = 'button';
+      qty.className = 'mtr-qty';
+      qty.textContent = String(g.qty);
+      qty.addEventListener('click', () => openQtyPad(g));
       const oh = document.createElement('div');
       oh.className = 'mtr-onhand';
       oh.textContent = hasAlloc ? 'max ' + movableQty(g) : 'of ' + g.onHand;
@@ -1142,6 +1209,95 @@
   // ---------------------------------------------------------------------------
   // 11. ACTIONS
   // ---------------------------------------------------------------------------
+  /* In-panel numeric keypad. The value being typed is shown large at the top of
+   * the sheet, with the cap and any UOM rule live beneath it, so the operator can
+   * always see what they are entering. */
+  function openQtyPad(g) {
+    const host = document.getElementById('mtr-tab-view');
+    if (!host) return;
+    document.getElementById('mtr-pad')?.remove();
+
+    const movable = movableQty(g);
+    let entered = '';                 // '' means "still showing the current qty"
+    let fresh = true;                 // first digit replaces rather than appends
+
+    const ov = document.createElement('div');
+    ov.id = 'mtr-pad';
+    ov.className = 'mtr-pick-overlay';
+    ov.innerHTML = `
+      <div class="mtr-pad-sheet">
+        <div class="mtr-pad-head">
+          <div class="mtr-pad-sku">${_esc(g.itemCode)}${g.batchNo ? ' · ' + _esc(g.batchNo) : ''}</div>
+          <div class="mtr-pad-desc">${_esc(g.description || '')}</div>
+        </div>
+        <div class="mtr-pad-value" id="mtr-pad-value">0</div>
+        <div class="mtr-pad-hint" id="mtr-pad-hint"></div>
+        <div class="mtr-pad-grid" id="mtr-pad-grid">
+          <button class="mtr-pad-key" data-k="1">1</button>
+          <button class="mtr-pad-key" data-k="2">2</button>
+          <button class="mtr-pad-key" data-k="3">3</button>
+          <button class="mtr-pad-key" data-k="4">4</button>
+          <button class="mtr-pad-key" data-k="5">5</button>
+          <button class="mtr-pad-key" data-k="6">6</button>
+          <button class="mtr-pad-key" data-k="7">7</button>
+          <button class="mtr-pad-key" data-k="8">8</button>
+          <button class="mtr-pad-key" data-k="9">9</button>
+          <button class="mtr-pad-key mtr-pad-alt" data-k="max">MAX</button>
+          <button class="mtr-pad-key" data-k="0">0</button>
+          <button class="mtr-pad-key mtr-pad-alt" data-k="del">&#9003;</button>
+        </div>
+        <div class="mtr-pad-actions">
+          <button class="mtr-btn mtr-btn-secondary" id="mtr-pad-cancel">Cancel</button>
+          <button class="mtr-btn mtr-btn-primary" id="mtr-pad-ok">Done</button>
+        </div>
+      </div>`;
+    host.appendChild(ov);
+
+    const valueEl = ov.querySelector('#mtr-pad-value');
+    const hintEl = ov.querySelector('#mtr-pad-hint');
+    const okBtn = ov.querySelector('#mtr-pad-ok');
+    const current = () => (entered === '' ? g.qty : Number(entered || 0));
+
+    function paint() {
+      const v = current();
+      valueEl.textContent = String(v);
+      const probe = Object.assign({}, g, { qty: v });
+      const err = validateRow(probe);
+      valueEl.classList.toggle('mtr-pad-bad', !!err);
+      hintEl.className = 'mtr-pad-hint' + (err ? ' mtr-pad-hint-bad' : '');
+      hintEl.textContent = err ||
+        ('max ' + movable + (g.factor > 1 ? ' · multiples of ' + g.factor + ' (' + g.uomName + ')' : ''));
+      okBtn.disabled = !!err;
+    }
+
+    ov.querySelectorAll('.mtr-pad-key').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const k = btn.dataset.k;
+        if (k === 'del') {
+          entered = (entered === '' ? String(g.qty) : entered).slice(0, -1);
+          fresh = false;
+        } else if (k === 'max') {
+          entered = String(movable);
+          fresh = false;
+        } else {
+          if (fresh) { entered = k; fresh = false; }
+          else if (entered.length < 6) entered = (entered === '0' ? '' : entered) + k;
+        }
+        paint();
+      });
+    });
+
+    ov.querySelector('#mtr-pad-cancel').addEventListener('click', () => ov.remove());
+    okBtn.addEventListener('click', () => {
+      const v = current();
+      ov.remove();
+      g.qty = v;
+      g.checked = v > 0;
+      renderRows();
+    });
+    paint();
+  }
+
   async function loadFrom(code, opts) {
     const quiet = opts && opts.quiet;
     const clean = _normaliseScan(String(code || '').trim()).toUpperCase();
@@ -1156,6 +1312,7 @@
       const loc = await resolveLocation(clean);
       State.from = loc;
       R.from.value = loc.location_code;      // replace any % pattern with the real code
+      R.from.dataset.committed = '1';        // next scan replaces rather than appends
       R.fromMsg.className = 'mtr-loc-msg ok';
       R.fromMsg.textContent = 'FROM ' + loc.location_code + ' (id ' + loc.id + ')';
 
@@ -1213,6 +1370,7 @@
       }
       State.to = loc;
       R.to.value = loc.location_code;        // replace any % pattern with the real code
+      R.to.dataset.committed = '1';
       R.toMsg.className = 'mtr-loc-msg ok';
       R.toMsg.textContent = 'TO ' + loc.location_code + ' (id ' + loc.id + ')';
       Log.ok('TO ' + loc.location_code + ' ready');
@@ -1348,12 +1506,14 @@
     // Don't grab the scanner while we're hidden behind another C7 tab.
     if (panel.style.display === 'none') return;
     if (State.busy) return;
+    // ...nor while a sheet is open (qty keypad, wildcard picker).
+    if (document.getElementById('mtr-pad') || document.getElementById('mtr-pick')) return;
     const id = R._armed === 'mtr-to' ? 'mtr-to' : 'mtr-from';
     const el = document.getElementById(id);
     if (!el || !document.contains(el)) return;
     const ae = document.activeElement;
-    // Don't steal focus from a qty box the operator is typing in.
-    if (ae && ae !== document.body && ae.tagName === 'INPUT' && ae.type === 'number') return;
+    // Leave the operator alone if they're typing in the other location field.
+    if (ae && ae !== document.body && ae.tagName === 'INPUT' && ae !== el) return;
     if (ae === el) return;
     el.focus();
   }
@@ -1452,7 +1612,7 @@
     VERSION, State, Status, open: openTransfer, close: closeUI,
     apiGet, apiPost, getToken,
     groupRows, validateRow, movableQty, buildTransferBody,
-    resolveLocation, searchLocations, chooseLocation, readLocationStock, injectNav,
+    resolveLocation, searchLocations, chooseLocation, readLocationStock, injectNav, openQtyPad,
     showOurs, hideOurs, syncTabs, restoreOthers,
     apiBase: () => API_BASE, warehouseId: () => String(WAREHOUSE_ID),
     hasToken: () => !!getToken(), normaliseScan: _normaliseScan,
