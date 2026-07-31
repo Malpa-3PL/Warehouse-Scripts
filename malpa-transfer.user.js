@@ -4,6 +4,10 @@
 // @version      1.0.0
 // @description  Fast location-to-location stock transfer for Canary7 on the Zebra TC51. Scan FROM, tick the SKUs, scan TO, transfer. Replaces the native Inventory Adjustment > Transfer tab.
 // @author       Malpa 3PL
+// @homepageURL  https://github.com/zaynnev/malpa3pl
+// @supportURL   https://github.com/zaynnev/malpa3pl/issues
+// @updateURL    https://raw.githubusercontent.com/zaynnev/malpa3pl/main/malpa-transfer.user.js
+// @downloadURL  https://raw.githubusercontent.com/zaynnev/malpa3pl/main/malpa-transfer.user.js
 // @match        https://malpa.canary7.com/*
 // @match        https://stgauth.canary7.com/*
 // @grant        GM_xmlhttpRequest
