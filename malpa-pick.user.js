@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Pick
 // @namespace    https://malpa.canary7.com
-// @version      4.9.0
+// @version      4.10.0
 // @description  Picking interface for Canary7 WMS - TC51 optimised
 // @author       Malpa 3PL
 // @updateURL    https://raw.githubusercontent.com/zaynnev/malpa3pl/main/malpa-pick.user.js
@@ -2297,6 +2297,89 @@
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // TAB CO-EXISTENCE
+  //
+  // Angular switches tabs by toggling the .active CLASS only. An inline
+  // style.display beats a class, so any sibling pane we hide that way can never
+  // be shown again - the picker's other C7 tabs stay dead even after Pick is
+  // closed, until the page is reloaded.
+  //
+  // Rule: only touch another pane's inline display while WE are the active tab,
+  // and put every one of them back the moment we are not. A MutationObserver on
+  // the tab bar lets whoever C7 activates win.
+  // ---------------------------------------------------------------------------
+  let _tabSyncing = false;
+
+  function otherPanels() {
+    if (!R._tabContent) return [];
+    return Array.from(R._tabContent.querySelectorAll(':scope > tab, :scope > .tab-pane'))
+      .filter(p => p.id !== 'mpk-tab-view');
+  }
+  function otherLis() {
+    if (!R._tabBar) return [];
+    return Array.from(R._tabBar.querySelectorAll('li.nav-item')).filter(li => li.id !== 'mpk-tab-li');
+  }
+  function setLiActive(li, on) {
+    if (!li) return;
+    li.classList.toggle('active', on);
+    const a = li.querySelector('a.nav-link');
+    if (a) { a.classList.toggle('active', on); a.setAttribute('aria-selected', on ? 'true' : 'false'); }
+  }
+  function hideOtherPanels() {
+    otherPanels().forEach(p => {
+      if (p.dataset.mpkPrevDisplay === undefined) p.dataset.mpkPrevDisplay = p.style.display || '';
+      p.style.display = 'none';
+    });
+  }
+  // Give every pane its original inline display back - this is what makes the
+  // other tabs clickable again.
+  function restoreOtherPanels() {
+    otherPanels().forEach(p => {
+      if (p.dataset.mpkPrevDisplay !== undefined) {
+        p.style.display = p.dataset.mpkPrevDisplay;
+        delete p.dataset.mpkPrevDisplay;
+      }
+    });
+  }
+  function showOurs() {
+    const li = document.getElementById('mpk-tab-li');
+    const panel = document.getElementById('mpk-tab-view');
+    if (!li || !panel) return;
+    _tabSyncing = true;
+    otherLis().forEach(o => setLiActive(o, false));
+    hideOtherPanels();
+    setLiActive(li, true);
+    panel.classList.add('active');
+    panel.style.display = '';
+    _tabSyncing = false;
+    setTimeout(measureHeight, 30);
+  }
+  function hideOurs() {
+    const li = document.getElementById('mpk-tab-li');
+    const panel = document.getElementById('mpk-tab-view');
+    if (!li || !panel) return;
+    _tabSyncing = true;
+    setLiActive(li, false);
+    panel.classList.remove('active');
+    panel.style.display = 'none';
+    restoreOtherPanels();
+    _tabSyncing = false;
+  }
+  function syncTabs() {
+    if (_tabSyncing) return;
+    const li = document.getElementById('mpk-tab-li');
+    if (!li) return;
+    if (otherLis().some(o => o.classList.contains('active'))) hideOurs();
+    else if (li.classList.contains('active')) showOurs();
+  }
+  function watchTabs() {
+    if (R._tabObs || !R._tabBar) return;
+    R._tabObs = new MutationObserver(() => syncTabs());
+    R._tabObs.observe(R._tabBar, { attributes: true, subtree: true, attributeFilter: ['class'] });
+    if (R._tabContent) R._tabObs.observe(R._tabContent, { childList: true });
+  }
+
   function buildShell() {
     if (document.getElementById('mpk-tab-view')) return; // double-open guard
 
@@ -2307,29 +2390,22 @@
       return;
     }
 
+    R._tabBar     = tabBar;
+    R._tabContent = tabContent;
+
     // Store currently active tab + panel so we can restore exactly on close
     const _prevActiveLi    = tabBar.querySelector('li.nav-item.active');
     const _prevActivePanel = tabContent.querySelector(':scope > .tab-pane.active, :scope > tab.active');
     if (_prevActiveLi)    R._prevActiveLi    = _prevActiveLi;
     if (_prevActivePanel) R._prevActivePanel = _prevActivePanel;
-
-    // Deactivate all current C7 tabs and panels
-    tabBar.querySelectorAll('li.nav-item').forEach(li => {
-      li.classList.remove('active');
-      const a = li.querySelector('a.nav-link');
-      if (a) { a.classList.remove('active'); a.setAttribute('aria-selected', 'false'); }
-    });
-    tabContent.querySelectorAll(':scope > tab, :scope > .tab-pane').forEach(p => {
-      p.classList.remove('active');
-      p.style.display = 'none';
-    });
+    // Deactivation is done by showOurs() below, which also records what it hid.
 
     // Inject our tab li - close x lives inside the tab label, matching C7/Pack v3 pattern
     const tabLi = document.createElement('li');
     tabLi.id = 'mpk-tab-li';
-    tabLi.className = 'nav-item active';
+    tabLi.className = 'nav-item';
     tabLi.innerHTML = `
-      <a class="nav-link active" aria-selected="true" href="javascript:void(0)" style="display:inline-flex;align-items:center;gap:6px;padding-right:8px;">
+      <a class="nav-link" aria-selected="false" href="javascript:void(0)" style="display:inline-flex;align-items:center;gap:6px;padding-right:8px;">
         Malpa Pick
         <span id="mpk-tab-close" title="Close (Esc)" style="display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:3px;font-size:14px;line-height:1;color:#384042;cursor:pointer;opacity:.6;margin-left:2px;transition:opacity .15s,background .15s;-webkit-tap-highlight-color:transparent;">x</span>
       </a>`;
@@ -2349,14 +2425,25 @@
       e.target.style.background = '';
     });
 
+    // Clicking our own tab brings it back to the front
+    tabLi.addEventListener('click', (e) => {
+      if (e.target.closest('#mpk-tab-close')) return;
+      e.preventDefault();
+      showOurs();
+    });
+
     // Inject our panel
     const panel = document.createElement('div');
     panel.id = 'mpk-tab-view';
-    panel.className = 'tab-pane active';
+    panel.className = 'tab-pane';
 
     // Build the root structure
     panel.innerHTML = `<div id="mpk-root"></div>`;
     tabContent.appendChild(panel);
+
+    // Take the screen, recording what we hid, and yield to C7 from here on
+    showOurs();
+    watchTabs();
 
     // Attach keyboard listener
     document.addEventListener('keydown', onGlobalKey);
@@ -4409,12 +4496,29 @@
     document.removeEventListener('keydown', onGlobalKey);
     window.removeEventListener('resize', measureHeight);
 
+    if (R._tabObs) { R._tabObs.disconnect(); R._tabObs = null; }
+    _tabSyncing = true;
+
     // Restore sidebar to its previous state
     if (!R._sidebarWasMinimized) document.body.classList.remove('sidebar-minimized');
     if (!R._brandWasMinimized)   document.body.classList.remove('brand-minimized');
 
+    // Undo every inline display we set BEFORE removing ourselves, or C7's tabs
+    // stay stuck hidden after we are gone.
+    restoreOtherPanels();
+    const _weWereActive = document.getElementById('mpk-tab-li')?.classList.contains('active');
+
     document.getElementById('mpk-tab-li')?.remove();
     document.getElementById('mpk-tab-view')?.remove();
+
+    // Only take the screen back if we were the tab on it. If the picker had
+    // already switched to another tab, leave their selection alone.
+    if (!_weWereActive) {
+      _tabSyncing = false;
+      State.reset();
+      R = {};
+      return;
+    }
 
     // Restore exactly the tab + panel that were active before we opened
     if (R._prevActiveLi && document.contains(R._prevActiveLi)) {
@@ -4450,6 +4554,7 @@
       }
     }
 
+    _tabSyncing = false;
     State.reset();
     R = {};
   }
@@ -4471,7 +4576,8 @@
   // -----------------------------------------------------------------------------
 
   function openPick() {
-    if (document.getElementById('mpk-tab-view')) return; // already open
+    // Already open but sitting behind another C7 tab - bring it forward
+    if (document.getElementById('mpk-tab-view')) { showOurs(); return; }
     try {
       injectCSS();
       buildShell();
@@ -4489,6 +4595,17 @@
       document.body.appendChild(errDiv);
     }
   }
+
+  // -----------------------------------------------------------------------------
+  // Exposed for on-device troubleshooting and the offline test harness.
+  // -----------------------------------------------------------------------------
+  window.__malpaPick = {
+    VERSION: '4.10.0',
+    State, get R() { return R; },
+    openPick, closeUI, injectNav,
+    showOurs, hideOurs, syncTabs, restoreOtherPanels,
+    getToken, hasToken: () => !!getToken(),
+  };
 
   // -----------------------------------------------------------------------------
   // 9. BOOT
