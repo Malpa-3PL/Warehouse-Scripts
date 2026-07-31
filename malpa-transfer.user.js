@@ -1,19 +1,22 @@
 // ==UserScript==
 // @name         Malpa Transfer (Canary7 TC51)
 // @namespace    https://malpa3pl.com.au/
-// @version      1.0.0
+// @version      1.1.0
 // @description  Fast location-to-location stock transfer for Canary7 on the Zebra TC51. Scan FROM, tick the SKUs, scan TO, transfer. Replaces the native Inventory Adjustment > Transfer tab.
 // @author       Malpa 3PL
 // @homepageURL  https://github.com/zaynnev/malpa3pl
 // @supportURL   https://github.com/zaynnev/malpa3pl/issues
 // @updateURL    https://raw.githubusercontent.com/zaynnev/malpa3pl/main/malpa-transfer.user.js
 // @downloadURL  https://raw.githubusercontent.com/zaynnev/malpa3pl/main/malpa-transfer.user.js
-// @match        https://malpa.canary7.com/*
-// @match        https://stgauth.canary7.com/*
+// @match        *://*.canary7.com/*
+// @match        *://canary7.com/*
 // @grant        GM_xmlhttpRequest
+// @grant        GM_registerMenuCommand
 // @connect      stgauth.canary7.com
 // @connect      malpa.canary7.com
+// @connect      *
 // @run-at       document-idle
+// @noframes     false
 // ==/UserScript==
 
 /* ---------------------------------------------------------------------------
@@ -621,9 +624,11 @@
         `;
         document.body.appendChild(root);
 
+        // Also the "is the script even running?" indicator - if this button is not
+        // visible on the device, the script did not load (check @match / the URL).
         const launch = document.createElement('button');
         launch.id = 'mt-launch';
-        launch.textContent = 'Malpa Transfer';
+        launch.textContent = 'Malpa Transfer v1.1';
         document.body.appendChild(launch);
 
         els = {
@@ -886,17 +891,94 @@
         }, true);
     }
 
+    /* Add a real "Malpa Transfer" entry to Canary7's own menu / sidebar.
+     * The build's markup is unknown, so rather than hardcode selectors this finds an
+     * EXISTING menu item by its label, clones it (inheriting the app's own styling)
+     * and relabels the clone. Angular renders the nav late, so it keeps watching for
+     * a while. Purely additive - if no menu is found, nothing happens and the
+     * floating button remains the way in. */
+    const MENU_LABELS = /^(inventory|inventory adjustment|adjustment|adjustments|receiving|receipts|shipments|picking|putaway|stock|dashboard|home|reports|cycle count)$/i;
+
+    function injectMenuEntry() {
+        if (document.getElementById('mt-menu-entry')) return true;
+
+        const candidates = [...document.querySelectorAll('a,li,button')].filter((n) => {
+            if (els.root && els.root.contains(n)) return false;
+            const txt = (n.textContent || '').trim();
+            if (!txt || txt.length > 30) return false;
+            if (!MENU_LABELS.test(txt)) return false;
+            const r = n.getBoundingClientRect();
+            return r.width > 0 && r.height > 0;      // must actually be visible
+        });
+        if (!candidates.length) return false;
+
+        // Prefer the item with the most same-shaped siblings - that's the real nav list.
+        candidates.sort((a, b) => {
+            const sibs = (n) => (n.parentNode ? n.parentNode.children.length : 0);
+            return sibs(b) - sibs(a);
+        });
+        const model = candidates[0];
+        const parent = model.parentNode;
+        if (!parent) return false;
+
+        const entry = model.cloneNode(true);
+        entry.id = 'mt-menu-entry';
+        entry.removeAttribute('href');
+        // Replace the label text wherever it lives, keeping the app's own markup.
+        const relabel = (node) => {
+            if (node.nodeType === 3) {
+                if (node.textContent.trim()) { node.textContent = 'Malpa Transfer'; return true; }
+                return false;
+            }
+            for (const c of node.childNodes) if (relabel(c)) return true;
+            return false;
+        };
+        if (!relabel(entry)) entry.textContent = 'Malpa Transfer';
+        entry.style.cursor = 'pointer';
+        entry.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            open();
+        }, true);
+        parent.appendChild(entry);
+        console.log('[MalpaTransfer] menu entry added next to "' + (model.textContent || '').trim() + '"');
+        return true;
+    }
+
+    function watchForMenu() {
+        if (injectMenuEntry()) return;
+        let tries = 0;
+        const obs = new MutationObserver(() => {
+            if (++tries > 400 || injectMenuEntry()) obs.disconnect();
+        });
+        obs.observe(document.body, { childList: true, subtree: true });
+        // Angular can swap the whole nav on route change - re-check periodically too.
+        const iv = setInterval(() => {
+            if (injectMenuEntry() && ++tries > 60) clearInterval(iv);
+            if (tries++ > 60) clearInterval(iv);
+        }, 1000);
+        setTimeout(() => { obs.disconnect(); clearInterval(iv); }, 120000);
+    }
+
     function init() {
         buildUI();
         hijackNativeTab();
-        console.log('[MalpaTransfer] v1.0.0 loaded. API base', apiBase());
+        watchForMenu();
+        // Guaranteed way in even if every UI injection fails: Tampermonkey's own menu.
+        try {
+            if (typeof GM_registerMenuCommand === 'function') {
+                GM_registerMenuCommand('Open Malpa Transfer', open);
+            }
+        } catch (_) {}
+        console.log('[MalpaTransfer] v1.1.0 loaded on ' + location.host + '. API base', apiBase());
     }
 
     // Exposed for troubleshooting on the device and for the offline test harness.
     window.__malpaTransfer = {
         CONFIG, State, Sniff, api, open, close,
         groupRows, validateRow, movableQty, buildTransferBody, resolveLocation, readLocationStock,
-        apiBase, warehouseId, hasToken: () => !!authToken()
+        apiBase, warehouseId, hasToken: () => !!authToken(),
+        version: '1.1.0', injectMenuEntry, host: location.host
     };
 
     if (document.readyState === 'loading') {
