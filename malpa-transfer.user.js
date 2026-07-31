@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Transfer
 // @namespace    https://malpa.canary7.com
-// @version      2.5.0
+// @version      2.6.0
 // @description  Location-to-location stock transfer for Canary7 WMS - TC51 optimised
 // @author       Malpa 3PL
 // @homepageURL  https://github.com/zaynnev/malpa3pl
@@ -97,7 +97,7 @@
   // 0. CONSTANTS
   // ---------------------------------------------------------------------------
   const TAG          = '[MalpaTransfer]';
-  const VERSION      = '2.5.0';   // keep in step with @version in the header
+  const VERSION      = '2.6.0';   // keep in step with @version in the header
   const API_ROOT     = 'https://stgauth.canary7.com';
   const API_BASE     = API_ROOT + '/index.php?r=';
   const WAREHOUSE_ID = 10;                      // 10 = Darra (Malpa's only live WH)
@@ -1044,24 +1044,11 @@
     document.getElementById('mtr-to-go').addEventListener('click', commitTo);
 
     document.getElementById('mtr-from-clr').addEventListener('click', () => {
-      R.from.value = '';
-      delete R.from.dataset.committed;
-      R.fromMsg.className = 'mtr-loc-msg';
-      R.fromMsg.textContent = '';
-      State.from = null;
-      State.rows = [];
-      Status.clear();
-      renderRows();
+      clearFrom();
       R.from.focus();
     });
     document.getElementById('mtr-to-clr').addEventListener('click', () => {
-      R.to.value = '';
-      delete R.to.dataset.committed;
-      R.toMsg.className = 'mtr-loc-msg';
-      R.toMsg.textContent = '';
-      State.to = null;
-      Status.clear();
-      refreshGo();
+      clearTo();
       R.to.focus();
     });
 
@@ -1101,7 +1088,12 @@
       R.count.textContent = State.rows.length ? n + ' of ' + State.rows.length + ' selected' : '';
     }
     if (R.all) R.all.checked = State.rows.length > 0 && n === State.rows.length;
-    R.go.textContent = n ? 'TRANSFER ' + n + ' LINE' + (n === 1 ? '' : 'S') : 'TRANSFER';
+    // Name the destination on the button - the operator should never have to
+    // trust that the TO field still says what they think it says.
+    R.go.textContent = n
+      ? 'TRANSFER ' + n + ' LINE' + (n === 1 ? '' : 'S') +
+        (State.to ? ' → ' + State.to.location_code : '')
+      : 'TRANSFER';
   }
 
   function renderRows() {
@@ -1296,6 +1288,43 @@
       renderRows();
     });
     paint();
+  }
+
+  /* Field resets. keepStatus leaves the result banner up, so after a completed
+   * transfer the operator still sees what moved while the fields go blank. */
+  function clearFrom(keepStatus) {
+    if (!R.from) return;
+    R.from.value = '';
+    delete R.from.dataset.committed;
+    R.fromMsg.className = 'mtr-loc-msg';
+    R.fromMsg.textContent = '';
+    State.from = null;
+    State.rows = [];
+    if (!keepStatus) Status.clear();
+    renderRows();
+  }
+
+  function clearTo(keepStatus) {
+    if (!R.to) return;
+    R.to.value = '';
+    delete R.to.dataset.committed;
+    R.toMsg.className = 'mtr-loc-msg';
+    R.toMsg.textContent = '';
+    State.to = null;
+    if (!keepStatus) Status.clear();
+    refreshGo();
+  }
+
+  // Clean slate for the next move: both fields blank, FROM armed for the scanner.
+  function resetAfterTransfer() {
+    clearFrom(true);
+    clearTo(true);
+    R._armed = 'mtr-from';
+    if (R.from) {
+      R.from.classList.add('mtr-armed');
+      R.to.classList.remove('mtr-armed');
+      setTimeout(() => R.from.focus(), 60);
+    }
   }
 
   async function loadFrom(code, opts) {
@@ -1493,8 +1522,15 @@
     Log.step(route + ': ' + okCount + ' ok, ' + failCount + ' failed');
 
     setBusy(false);
-    // Refresh FROM to reality. quiet:true leaves the result banner on screen.
-    await loadFrom(State.from.location_code, { quiet: true });
+    if (failCount === 0) {
+      // Clean slate for the next move. The banner stays up so the operator can
+      // still read what moved and where.
+      resetAfterTransfer();
+    } else {
+      // Something failed - keep both locations loaded and refresh FROM to reality
+      // so the operator can see what's left and retry without rescanning.
+      await loadFrom(State.from.location_code, { quiet: true });
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -1613,6 +1649,7 @@
     apiGet, apiPost, getToken,
     groupRows, validateRow, movableQty, buildTransferBody,
     resolveLocation, searchLocations, chooseLocation, readLocationStock, injectNav, openQtyPad,
+    clearFrom, clearTo, resetAfterTransfer, doTransfer, refreshGo, renderRows, loadFrom, checkTo,
     showOurs, hideOurs, syncTabs, restoreOthers,
     apiBase: () => API_BASE, warehouseId: () => String(WAREHOUSE_ID),
     hasToken: () => !!getToken(), normaliseScan: _normaliseScan,
