@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Receiving
 // @namespace    https://malpa.canary7.com
-// @version      2.2.6
+// @version      2.2.7
 // @description  Fast single-screen receiving for Canary7 WMS - TC51 optimised
 // @author       Malpa 3PL
 // @updateURL    https://raw.githubusercontent.com/zaynnev/malpa3pl/main/malpa-receiving.user.js
@@ -644,6 +644,7 @@
     panel.style.display = '';
     panel.classList.add('active');
     _setTabActive(li, true);
+    R._activatedAt = Date.now();   // opens the brief Angular-repaint window
     document.body.classList.add('sidebar-minimized', 'brand-minimized');
     setTimeout(measureHeight, 50);
   }
@@ -659,23 +660,56 @@
     tabBar.addEventListener('click', R._tabGuard, true);
   }
 
-  // The click guard only catches tab-BAR clicks. C7 also switches or opens tabs
-  // from the sidebar and programmatically, and those routes left our panel
-  // active and stacked on top of the real one. Watching tab-content for a
-  // sibling panel becoming active covers every route.
-  function attachPanelWatcher(tabContent) {
-    if (R._panelObs) return;
-    R._panelObs = new MutationObserver(() => {
-      const panel = document.getElementById('mrc-tab-view');
-      if (!panel || !panel.classList.contains('active')) return;
-      const actives = tabContent.querySelectorAll(':scope > tab.active, :scope > .tab-pane.active');
-      for (const p of actives) {
-        if (p !== panel) { minimiseSelf(); return; }
+  // Keeping our panel hidden whenever a C7 tab is in front.
+  //
+  // This cannot rely on a captured tab-content reference or on C7's stylesheet:
+  // opening a NEW tab appends a pane (sometimes to a container Angular has since
+  // replaced), and our panel is a div.tab-pane that C7's CSS will not necessarily
+  // hide just because the active class is absent. Left alone it stayed on screen,
+  // stacked under the new tab's content. So the rule is enforced on our panel's
+  // CURRENT parent, and our own display is always set explicitly.
+  function enforceTabVisibility() {
+    const panel = document.getElementById('mrc-tab-view');
+    if (!panel) return;
+    const parent = panel.parentElement;
+    if (!parent) return;
+
+    const others = Array.from(parent.children)
+      .filter(p => p !== panel && (p.matches?.('tab, .tab-pane')));
+    const active   = others.filter(p => p.classList.contains('active'));
+    const weActive = panel.classList.contains('active');
+
+    if (weActive && active.length) {
+      // A pane we already hid turning itself back on *immediately* after we came
+      // to the front is Angular finishing its render, not the operator going
+      // somewhere - push it back down and stay put. Anything we have never seen
+      // is a new tab, and anything that happens later is real navigation; both
+      // mean we step aside.
+      const allKnown = active.every(p => _hiddenPanels.some(r => r.el === p));
+      const justActivated = Date.now() - (R._activatedAt || 0) < 1200;
+      if (allKnown && justActivated) {
+        active.forEach(p => { p.classList.remove('active'); p.style.display = 'none'; });
+      } else {
+        minimiseSelf();
       }
+      return;
+    }
+    // Belt and braces: never visible while not the active tab.
+    if (!weActive && panel.style.display !== 'none') panel.style.display = 'none';
+    if (weActive && panel.style.display === 'none')  panel.style.display = '';
+  }
+
+  function attachPanelWatcher() {
+    if (R._panelObs) return;
+    R._panelObs = new MutationObserver(enforceTabVisibility);
+    // Watch the whole tab region rather than one captured node, so a new tab
+    // appended anywhere in there is still noticed.
+    const host = document.querySelector('div.tab-content')?.parentElement || document.body;
+    R._panelObs.observe(host, {
+      attributes: true, attributeFilter: ['class'], childList: true, subtree: true,
     });
-    R._panelObs.observe(tabContent, {
-      attributes: true, attributeFilter: ['class'], childList: true, subtree: false,
-    });
+    // Cheap safety net for anything the observer cannot see.
+    R._visTimer = setInterval(enforceTabVisibility, 400);
   }
 
   function buildShell() {
@@ -715,7 +749,7 @@
     R._brandWasMinimized   = document.body.classList.contains('brand-minimized');
 
     attachTabSwitchGuard(tabBar);
-    attachPanelWatcher(tabContent);
+    attachPanelWatcher();
     activateSelf();
     attachViewportWatch();
 
@@ -1927,6 +1961,7 @@
     document.removeEventListener('keydown', onGlobalKey);
     detachViewportWatch();
     if (R._panelObs) { R._panelObs.disconnect(); R._panelObs = null; }
+    if (R._visTimer) { clearInterval(R._visTimer); R._visTimer = null; }
     Voice.cancel();
 
     if (!R._sidebarWasMinimized) document.body.classList.remove('sidebar-minimized');
