@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Transfer
 // @namespace    https://malpa.canary7.com
-// @version      2.0.0
+// @version      2.1.0
 // @description  Location-to-location stock transfer for Canary7 WMS - TC51 optimised
 // @author       Malpa 3PL
 // @homepageURL  https://github.com/zaynnev/malpa3pl
@@ -14,6 +14,16 @@
 // ==/UserScript==
 
 /* =============================================================================
+ * v2.1.0 - location lookup moved onto the legacy monolith; on-screen console
+ *          replaced by a plain success/error banner for the picker.
+ *   - v2.0.0 called /inbound/api/wms/v1/location and got a 404. "inbound" is a
+ *     SERVICE NAME used by the Malpa proxy (`/canary7/<service>/<path>`), not a
+ *     real URL on the tenant. Locations are served by the legacy monolith at
+ *     index.php?r=configuration/location - same base as every other call here.
+ *   - That filter is a PREFIX match ("A10-B02" returns S01, S02, S11, ...), so
+ *     resolveLocation() requires an exact code match or a partial scan would
+ *     silently resolve to the wrong bin.
+ *
  * v2.0.0 - rebuilt to match the malpa-pick / malpa-replen house pattern.
  *
  * v1.x never appeared on the device. Three structural reasons, all fixed here:
@@ -73,10 +83,9 @@
   // 0. CONSTANTS
   // ---------------------------------------------------------------------------
   const TAG          = '[MalpaTransfer]';
-  const VERSION      = '2.0.0';
+  const VERSION      = '2.1.0';   // keep in step with @version in the header
   const API_ROOT     = 'https://stgauth.canary7.com';
   const API_BASE     = API_ROOT + '/index.php?r=';
-  const LOCATION_API = API_ROOT + '/inbound/api/wms/v1/location';
   const WAREHOUSE_ID = 10;                      // 10 = Darra (Malpa's only live WH)
   const TRANSFER_ADJUSTMENT_TYPE_ID = '7';      // 7 = Transfer, adjustment_class 3
   const COMMENT      = 'Malpa Transfer (TC51)';
@@ -133,12 +142,6 @@
       headers: mkHeaders(),
       body: JSON.stringify(data),
     });
-    return _handle(res);
-  }
-
-  // The location endpoint is the `inbound` microservice, not the legacy monolith.
-  async function apiGetLocation(qs) {
-    const res = await fetch(LOCATION_API + '?' + qs, { method: 'GET', headers: mkHeaders() });
     return _handle(res);
   }
 
@@ -215,45 +218,44 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 4. CONSOLE LOGGER  (visible on-device log)
+  // 4. LOG  (browser console only - diagnostics for us, not for the picker)
   // ---------------------------------------------------------------------------
-  const Log = (() => {
-    let el = null;
-    const buf = [];
-    const setEl = (e) => {
-      el = e;
-      if (el) { el.innerHTML = ''; buf.forEach(([k, m]) => paint(k, m)); }
-    };
-    function paint(kind, msg) {
-      if (!el) return;
-      const row = document.createElement('div');
-      row.className = 'mtr-log-row mtr-' + kind;
-      row.textContent = msg;
-      el.appendChild(row);
-      el.scrollTop = el.scrollHeight;
-    }
-    function line(kind, msg) {
-      const ts = new Date().toLocaleTimeString('en-AU', { hour12: false });
-      const full = '[' + ts + '] ' + msg;
-      buf.push([kind, full]);
-      if (buf.length > 400) buf.shift();
-      paint(kind, full);
-      if (kind === 'err') console.error(TAG, msg);
-      else if (kind === 'warn') console.warn(TAG, msg);
-      else console.log(TAG, msg);
-    }
-    return {
-      setEl,
-      info: (m) => line('info', m),
-      ok: (m) => line('ok', '✓ ' + m),
-      err: (m) => line('err', '✗ ' + m),
-      warn: (m) => line('warn', '! ' + m),
-      step: (m) => line('step', '→ ' + m),
-      rule: () => line('rule', '─'.repeat(30)),
-      clear: () => { buf.length = 0; if (el) el.innerHTML = ''; },
-      text: () => buf.map((b) => b[1]).join('\n'),
-    };
-  })();
+  const Log = {
+    info: (m) => console.log(TAG, m),
+    ok: (m) => console.log(TAG, '✓ ' + m),
+    err: (m) => console.error(TAG, '✗ ' + m),
+    warn: (m) => console.warn(TAG, '! ' + m),
+    step: (m) => console.log(TAG, '→ ' + m),
+  };
+
+  // ---------------------------------------------------------------------------
+  // 4b. STATUS BANNER  (what the picker actually sees when a task finishes)
+  // ---------------------------------------------------------------------------
+  const Status = {
+    el: null,
+    setEl(e) { this.el = e; this.clear(); },
+    clear() {
+      if (!this.el) return;
+      this.el.style.display = 'none';
+      this.el.innerHTML = '';
+      this.el.className = 'mtr-status';
+    },
+    /* kind: ok | err | warn.  lines[] = optional detail, one per row. */
+    show(kind, title, lines) {
+      if (!this.el) return;
+      this.el.className = 'mtr-status mtr-status-' + kind;
+      this.el.style.display = 'block';
+      const mark = kind === 'ok' ? '✓' : (kind === 'err' ? '✗' : '!');
+      let html = '<div class="mtr-status-title">' + mark + ' ' + _esc(title) + '</div>';
+      const list = (lines || []).filter(Boolean);
+      if (list.length) {
+        html += '<div class="mtr-status-lines">' +
+          list.map((l) => '<div>' + _esc(l) + '</div>').join('') + '</div>';
+      }
+      this.el.innerHTML = html;
+      this.el.scrollTop = 0;
+    },
+  };
 
   // ---------------------------------------------------------------------------
   // 5. UTIL
@@ -278,14 +280,21 @@
   // ---------------------------------------------------------------------------
   // 6. DATA
   // ---------------------------------------------------------------------------
+  /* Locations come from the LEGACY monolith: index.php?r=configuration/location.
+   * NOT /inbound/api/wms/v1/location - that path 404s from the browser (it is a
+   * proxy-side route name, not a real URL), which is what broke v2.0.0.
+   * The filter is a PREFIX match - "A10-B02" returns S01, S02, S11... - so an
+   * exact-code check is mandatory or a partial scan silently picks the wrong bin. */
   async function resolveLocation(code) {
     const clean = String(code || '').trim().toUpperCase();
     if (!clean) throw new Error('No location entered');
-    const list = await apiGetLocation(
-      'location_code=' + encodeURIComponent(clean) + '&per-page=5'
-    );
+    const path = 'configuration/location' +
+      '&location_code=' + encodeURIComponent(clean) +
+      '&fields=' + encodeURIComponent(
+        'id,location_code,warehouse_id,status,location_class_id,allow_multiple_items,enable_license_plate') +
+      '&per-page=50';
+    const list = await apiGet(path);
     const arr = Array.isArray(list) ? list : [];
-    // The endpoint filters loosely, so insist on an exact code match.
     const hit = arr.find((l) => String(l.location_code).toUpperCase() === clean);
     if (!hit) throw new Error('Location "' + clean + '" not found');
     if (String(hit.warehouse_id) !== String(WAREHOUSE_ID)) {
@@ -518,27 +527,20 @@
       .mtr-err { font-size: 11px; color: #ff5454; font-weight: 600; margin-top: 3px; }
       .mtr-empty { padding: 18px 10px; text-align: center; color: #9faecb; font-size: 13px; }
 
-      /* -- Footer / console -- */
+      /* -- Footer + status banner -- */
       .mtr-foot { flex-shrink: 0; border-top: 1px solid #e1e6ef; background: #fff; padding: 8px 10px 10px; }
-      .mtr-conbar {
-        display: flex; align-items: center; gap: 6px; padding: 8px 0 4px;
-        font-size: 10px; color: #9faecb; font-weight: 600; letter-spacing: .06em;
+      .mtr-status {
+        display: none; padding: 10px 12px; margin-bottom: 8px; border-left: 5px solid;
+        max-height: 132px; overflow-y: auto; -webkit-overflow-scrolling: touch;
       }
-      .mtr-conbar button {
-        background: #f0f2f5; border: 1px solid #e1e6ef; padding: 4px 8px;
-        font: 500 11px Roboto, sans-serif; color: #20455c; cursor: pointer;
+      .mtr-status-title { font: 600 15px/1.3 Roboto, sans-serif; }
+      .mtr-status-lines {
+        margin-top: 5px; font: 500 12px/1.5 Roboto, sans-serif; opacity: .9;
+        overflow-wrap: anywhere;
       }
-      .mtr-conbar .mtr-spacer { margin-left: auto; }
-      #mtr-console {
-        background: #0e1a22; color: #d7e3ea; font: 11px/1.45 ui-monospace, Menlo, Consolas, monospace;
-        padding: 6px 8px; height: 96px; overflow-y: auto; white-space: pre-wrap;
-        word-break: break-word; -webkit-overflow-scrolling: touch;
-      }
-      #mtr-console.mtr-tall { height: 240px; }
-      .mtr-log-row { padding: 1px 0; }
-      .mtr-ok { color: #7ee2a8; } .mtr-err { color: #ff9b90; font-weight: 600; }
-      .mtr-warn { color: #ffd479; } .mtr-step { color: #8cd2ff; }
-      .mtr-info { color: #c3d3dd; } .mtr-rule { color: #3c5666; }
+      .mtr-status-ok   { background: #eaf7ee; border-color: #12833f; color: #12833f; }
+      .mtr-status-err  { background: #fdecea; border-color: #c5221f; color: #b3261e; }
+      .mtr-status-warn { background: #fff8e6; border-color: #d99400; color: #8a5a00; }
 
       #mtr-veil {
         position: absolute; inset: 0; background: rgba(255,255,255,.7); display: none;
@@ -739,15 +741,8 @@
       </div>
 
       <div class="mtr-foot">
+        <div class="mtr-status" id="mtr-status"></div>
         <button id="mtr-go" class="mtr-btn mtr-btn-go" disabled>TRANSFER</button>
-        <div class="mtr-conbar">
-          <span>CONSOLE</span>
-          <span class="mtr-spacer"></span>
-          <button id="mtr-expand">Expand</button>
-          <button id="mtr-copy">Copy</button>
-          <button id="mtr-clear">Clear</button>
-        </div>
-        <div id="mtr-console"></div>
       </div>`;
 
     R.root = root;
@@ -760,8 +755,7 @@
     R.all = document.getElementById('mtr-all');
     R.count = document.getElementById('mtr-count');
     R.go = document.getElementById('mtr-go');
-    R.console = document.getElementById('mtr-console');
-    Log.setEl(R.console);
+    Status.setEl(document.getElementById('mtr-status'));
 
     const commitFrom = () => loadFrom(R.from.value);
     const commitTo = () => checkTo(R.to.value);
@@ -791,19 +785,6 @@
       Log.info(on ? 'All ' + State.rows.length + ' lines selected' : 'Selection cleared');
     });
     R.go.addEventListener('click', doTransfer);
-
-    document.getElementById('mtr-expand').addEventListener('click', (e) => {
-      R.console.classList.toggle('mtr-tall');
-      e.target.textContent = R.console.classList.contains('mtr-tall') ? 'Shrink' : 'Expand';
-    });
-    document.getElementById('mtr-copy').addEventListener('click', () => {
-      const t = Log.text();
-      if (navigator.clipboard) {
-        navigator.clipboard.writeText(t).then(
-          () => Log.info('Console copied'), () => Log.warn('Copy blocked by the browser'));
-      } else Log.warn('Clipboard unavailable');
-    });
-    document.getElementById('mtr-clear').addEventListener('click', () => Log.clear());
 
     Audio.init();
     renderRows();
@@ -944,7 +925,7 @@
     State.rows = [];
     renderRows();
     if (!clean) { State.from = null; refreshGo(); return; }
-    if (!quiet) Audio.chime('scan');
+    if (!quiet) { Audio.chime('scan'); Status.clear(); }
     setBusy(true);
     try {
       const loc = await resolveLocation(clean);
@@ -957,25 +938,28 @@
       renderRows();
 
       if (!State.rows.length) {
-        Log.warn('FROM ' + loc.location_code + ' is empty');
+        if (!quiet) Status.show('warn', loc.location_code + ' is empty', ['Nothing here to transfer.']);
         Audio.chime('warn');
       } else {
         const total = State.rows.reduce((s, r) => s + r.onHand, 0);
-        Log.ok('FROM ' + loc.location_code + ': ' + State.rows.length + ' line' +
-               (State.rows.length === 1 ? '' : 's') + ', ' + total + ' units');
+        Log.ok('FROM ' + loc.location_code + ': ' + State.rows.length + ' lines, ' + total + ' units');
+        // Surface the two things a picker can't infer from the rows alone.
+        const notes = [];
         State.rows.filter((r) => r.lps.length > 1).forEach((r) =>
-          Log.warn(r.itemCode + ': ' + r.lps.length +
-            ' licence plates merged into one line (C7 cannot target an LP on transfer)'));
+          notes.push(r.itemCode + ': ' + r.lps.length + ' licence plates merged - Canary7 takes ' +
+            'from the oldest (' + r.lps[0] + ') and the destination gets no LP'));
         State.rows.filter((r) => movableQty(r) < r.onHand).forEach((r) =>
-          Log.warn(r.itemCode + ': allocated stock - max movable ' +
-            movableQty(r) + ' of ' + r.onHand));
+          notes.push(r.itemCode + ': allocated stock, max movable ' + movableQty(r) + ' of ' + r.onHand));
+        if (notes.length && !quiet) Status.show('warn', 'Check these lines before moving', notes);
         if (!quiet && R.to) setTimeout(() => R.to.focus(), 60);
       }
     } catch (e) {
       State.from = null;
+      const msg = String((e && e.message) || e);
       R.fromMsg.className = 'mtr-loc-msg bad';
-      R.fromMsg.textContent = String((e && e.message) || e);
-      Log.err('FROM ' + clean + ': ' + ((e && e.message) || e));
+      R.fromMsg.textContent = msg;
+      Log.err('FROM ' + clean + ': ' + msg);
+      Status.show('err', 'From location: ' + msg, ['Scanned: ' + clean]);
       Audio.chime('error');
       buzz('error');
     } finally {
@@ -1001,13 +985,16 @@
       R.toMsg.textContent = 'TO ' + loc.location_code + ' (id ' + loc.id + ')';
       Log.ok('TO ' + loc.location_code + ' ready');
       if (loc.allow_multiple_items === 0) {
-        Log.warn(loc.location_code + ' does not allow multiple items - a mixed transfer may fail');
+        Status.show('warn', loc.location_code + ' holds one item only',
+          ['A mixed transfer into this bin may be rejected.']);
       }
     } catch (e) {
       State.to = null;
+      const msg = String((e && e.message) || e);
       R.toMsg.className = 'mtr-loc-msg bad';
-      R.toMsg.textContent = String((e && e.message) || e);
-      Log.err('TO ' + clean + ': ' + ((e && e.message) || e));
+      R.toMsg.textContent = msg;
+      Log.err('TO ' + clean + ': ' + msg);
+      Status.show('err', 'To location: ' + msg, ['Scanned: ' + clean]);
       Audio.chime('error');
       buzz('error');
     } finally {
@@ -1018,33 +1005,39 @@
 
   async function doTransfer() {
     if (State.busy) return;
-    if (!State.from) { Log.err('Scan a FROM location first'); Audio.chime('error'); return; }
-    if (!State.to) { Log.err('Scan a TO location first'); Audio.chime('error'); return; }
+    if (!State.from) {
+      Status.show('err', 'Scan a FROM location first'); Audio.chime('error'); buzz('error'); return;
+    }
+    if (!State.to) {
+      Status.show('err', 'Scan a TO location first'); Audio.chime('error'); buzz('error'); return;
+    }
     if (String(State.from.id) === String(State.to.id)) {
-      Log.err('FROM and TO are the same location - nothing to do');
-      Audio.chime('error');
+      Status.show('err', 'FROM and TO are the same location');
+      Audio.chime('error'); buzz('error');
       return;
     }
     const picked = State.rows.filter((r) => r.checked);
     if (!picked.length) {
-      Log.warn('NOTHING MOVED - no lines ticked');
+      Status.show('warn', 'Nothing moved', ['No lines were ticked.']);
       Audio.chime('warn');
       return;
     }
     const bad = picked.map((r) => ({ r, err: validateRow(r) })).filter((x) => x.err);
     if (bad.length) {
+      Status.show('err', 'Nothing moved - fix ' + bad.length +
+        ' line' + (bad.length === 1 ? '' : 's'), bad.map((x) => x.r.itemCode + ': ' + x.err));
       bad.forEach((x) => Log.err(x.r.itemCode + ': ' + x.err));
-      Log.warn('NOTHING MOVED - fix the lines above');
       Audio.chime('error');
       buzz('error');
       return;
     }
 
     setBusy(true);
-    Log.rule();
+    Status.clear();
     Log.step('TRANSFER ' + State.from.location_code + ' → ' + State.to.location_code +
-             '  (' + picked.length + ' line' + (picked.length === 1 ? '' : 's') + ')');
+             '  (' + picked.length + ' lines)');
 
+    const failures = [];
     let okCount = 0, failCount = 0;
     // Sequential on purpose: C7 resolves stock oldest-record-first, so parallel
     // calls against one bin could race.
@@ -1062,12 +1055,14 @@
         Log.ok(label + ' moved');
       } catch (e) {
         failCount++;
-        Log.err(label + ' FAILED - ' + ((e && e.message) || e));
+        const why = String((e && e.message) || e);
+        failures.push(g.itemCode + (g.batchNo ? ' [' + g.batchNo + ']' : '') + ' - ' + why);
+        Log.err(label + ' FAILED - ' + why);
       }
     }
 
     // The adjust response echoes PRE-move data, so confirm from a fresh read.
-    Log.step('Verifying against a fresh read...');
+    const confirmed = [];
     try {
       const after = await readLocationStock(State.to.location_code);
       const rows = groupRows(after, State.to.id);
@@ -1075,34 +1070,36 @@
         const m = rows.find((x) => x.itemId === g.itemId && x.iuomId === g.iuomId &&
           (x.batchNo || null) === (g.batchNo || null) && x.status === g.status);
         if (m) {
-          Log.info('  ' + State.to.location_code + ' now holds ' + m.onHand + ' × ' +
-            g.itemCode + (g.batchNo ? ' [' + g.batchNo + ']' : ''));
-        } else {
-          Log.warn('  ' + g.itemCode + ' not visible at ' + State.to.location_code + ' yet');
+          confirmed.push(g.itemCode + (g.batchNo ? ' [' + g.batchNo + ']' : '') +
+            ' - ' + State.to.location_code + ' now holds ' + m.onHand);
         }
       }
+      Log.info('verified: ' + confirmed.length + '/' + picked.length + ' visible at destination');
     } catch (e) {
       Log.warn('Could not verify destination: ' + ((e && e.message) || e));
     }
 
-    Log.rule();
+    const route = State.from.location_code + ' → ' + State.to.location_code;
     if (failCount === 0) {
-      Log.ok('DONE - ' + okCount + ' line' + (okCount === 1 ? '' : 's') + ' transferred, 0 failed');
+      Status.show('ok', okCount + ' line' + (okCount === 1 ? '' : 's') + ' moved to ' +
+        State.to.location_code, confirmed);
       Audio.chime('ok');
       buzz('ok');
     } else if (okCount === 0) {
-      Log.err('FAILED - nothing transferred (' + failCount +
-        ' error' + (failCount === 1 ? '' : 's') + ')');
+      Status.show('err', 'Transfer failed - nothing moved', failures);
       Audio.chime('error');
       buzz('error');
     } else {
-      Log.warn('PARTIAL - ' + okCount + ' moved, ' + failCount + ' failed. Check above.');
+      Status.show('warn', 'Partly done - ' + okCount + ' moved, ' + failCount + ' failed',
+        failures.concat(['Moved lines are already at ' + State.to.location_code + '.']));
       Audio.chime('error');
       buzz('error');
     }
+    Log.step(route + ': ' + okCount + ' ok, ' + failCount + ' failed');
 
     setBusy(false);
-    await loadFrom(State.from.location_code, { quiet: true });   // refresh to reality
+    // Refresh FROM to reality. quiet:true leaves the result banner on screen.
+    await loadFrom(State.from.location_code, { quiet: true });
   }
 
   // ---------------------------------------------------------------------------
@@ -1136,8 +1133,10 @@
       buildShell();
       renderMain();
       Log.info('Malpa Transfer v' + VERSION + ' · warehouse ' + WAREHOUSE_ID);
-      if (!getToken()) Log.err('No Canary7 session token found - log in first');
-      Log.info('Scan FROM → tick lines → scan TO → press TRANSFER');
+      if (!getToken()) {
+        Status.show('err', 'Not logged in to Canary7',
+          ['Log into Canary7 in this tab, then reopen Malpa Transfer.']);
+      }
     } catch (err) {
       console.error(TAG, 'openTransfer error:', err);
       const errDiv = document.createElement('div');
@@ -1208,8 +1207,8 @@
   // 14. DEBUG HANDLE  (troubleshooting on-device + offline test harness)
   // ---------------------------------------------------------------------------
   window.__malpaTransfer = {
-    VERSION, State, open: openTransfer, close: closeUI,
-    apiGet, apiPost, apiGetLocation, getToken,
+    VERSION, State, Status, open: openTransfer, close: closeUI,
+    apiGet, apiPost, getToken,
     groupRows, validateRow, movableQty, buildTransferBody,
     resolveLocation, readLocationStock, injectNav,
     apiBase: () => API_BASE, warehouseId: () => String(WAREHOUSE_ID),
