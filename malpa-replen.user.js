@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Malpa C7 - Replen Early Qty
 // @namespace    malpa
-// @version      4.6
-// @description  Shows replen qty + To Location before scanning; keeps Confirm Units editable but re-checks available stock (get-unallocated-inventory) at execute and blocks over-moves.
+// @version      4.7
+// @description  Shows replen qty + To Location before scanning (matched to the on-screen job, profile-scoped); keeps Confirm Units editable; blocks confirmed over-moves via a live available-stock check.
 // @match        https://malpa.canary7.com/*
 // @grant        none
 // @homepageURL  https://github.com/zaynnev/malpa3pl
@@ -17,8 +17,9 @@
   const TAG = '[Malpa Replen]';
   const QTY_ID = 'malpa-qty-line';
 
-  const jobsById = {};       // every get-replenishment-jobs row, keyed by row id
+  const jobsById = {};       // get-replenishment-jobs rows for the CURRENT profile, keyed by row id
   let currentJobId = null;   // job_id from the latest assign-replenishment-job call
+  let lastProfileId = null;  // profile_id of the jobs currently cached
   let lastAuth = null;       // Authorization header captured from C7's own requests
   const availByInv = {};     // available_quantity seen from get-unallocated-inventory
 
@@ -27,10 +28,24 @@
   // ---------------------------------------------------------------------------
   // 1. NETWORK: cache the job list + track the assigned job_id + capture auth
   // ---------------------------------------------------------------------------
-  function cacheJobs(data) {
+  function cacheJobs(data, profileId) {
     if (!Array.isArray(data)) return;
+    // Different profile than what's cached? Drop the old jobs so we never match
+    // a stale job from a previous profile/session.
+    if (profileId != null && String(profileId) !== String(lastProfileId)) {
+      for (const k of Object.keys(jobsById)) delete jobsById[k];
+      currentJobId = null;
+      lastProfileId = String(profileId);
+      const l = document.getElementById(QTY_ID); if (l) l.remove();
+      console.log(TAG, 'profile changed to', profileId, '- cache cleared');
+    }
     data.forEach(j => { if (j && j.id != null) jobsById[j.id] = j; });
-    console.log(TAG, 'cached', data.length, 'jobs (total known:', Object.keys(jobsById).length + ')');
+    console.log(TAG, 'cached', data.length, 'jobs (profile', profileId + ', total', Object.keys(jobsById).length + ')');
+  }
+
+  function profileIdOf(url) {
+    const m = url && url.match(/[?&]profile_id=(\d+)/);
+    return m ? m[1] : null;
   }
 
   function noteAssign(url) {
@@ -69,7 +84,7 @@
     this.addEventListener('load', function () {
       try {
         if (this.__malpaUrl && this.__malpaUrl.indexOf('get-replenishment-jobs') !== -1) {
-          cacheJobs(JSON.parse(this.responseText));
+          cacheJobs(JSON.parse(this.responseText), profileIdOf(this.__malpaUrl));
         } else if (this.__malpaUrl && this.__malpaUrl.indexOf('get-unallocated-inventory') !== -1) {
           noteUnalloc(this.__malpaUrl, this.responseText);
         }
@@ -89,7 +104,7 @@
         try {
           const url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url);
           if (url && url.indexOf('get-replenishment-jobs') !== -1) {
-            res.clone().json().then(cacheJobs).catch(() => {});
+            res.clone().json().then(d => cacheJobs(d, profileIdOf(url))).catch(() => {});
           }
         } catch (e) {}
         return res;
@@ -227,23 +242,23 @@
     const btn = e.currentTarget || findNextBtn();
     const row = currentJob();
     const invId = row ? invIdOf(row) : null;
-    const planned = row ? qtyOf(row) : null;
-    const fromCode = (row && row.fromLocation && row.fromLocation.location_code) ||
+
+    // If we can't confidently identify the job or its inventory, DON'T interfere
+    // — let C7 handle it normally. Blocking on an uncertain/wrong match is what
+    // stopped valid replens. (A wrong match is worse than no check.)
+    if (!row || invId == null) {
+      console.warn(TAG, 'no confident match / inventory id — availability check skipped, letting C7 proceed');
+      return;
+    }
+
+    const fromCode = (row.fromLocation && row.fromLocation.location_code) ||
                      valueOf(findByLabel('From Location :'), 'From Location :') || 'the from-location';
 
-    // Block the execute until we've verified. FAIL CLOSED from here on.
+    // Confident match: block the execute until we've verified the live figure.
     e.preventDefault();
     e.stopImmediatePropagation();
 
     if (inFlight) return;
-
-    if (invId == null) {
-      // Can't identify the inventory to check. Only let through the known-safe
-      // planned quantity; block anything above it.
-      if (planned != null && qty <= planned) { proceed(btn); }
-      else { showError('Cannot verify available stock for this item \u2014 move blocked.'); inp.focus(); }
-      return;
-    }
 
     inFlight = true;
     fetchAvailable(invId).then(avail => {
@@ -278,27 +293,55 @@
   // ---------------------------------------------------------------------------
   // 3. FIND THE CURRENTLY-LOADED JOB
   // ---------------------------------------------------------------------------
+  function screenKeys() {
+    return {
+      item: valueOf(findByLabel('Item :'), 'Item :'),
+      from: valueOf(findByLabel('From Location :'), 'From Location :'),
+      to:   valueOf(findByLabel('To Location :'), 'To Location :'),
+    };
+  }
+
+  // A row is only usable if it does not contradict anything shown on screen.
+  function consistentWithScreen(r, k) {
+    if (!k.item && !k.from && !k.to) return false;               // can't read screen -> don't trust
+    if (k.item && r.item && r.item.item_code !== k.item) return false;
+    if (k.from && r.fromLocation && r.fromLocation.location_code !== k.from) return false;
+    if (k.to && r.toLocation && r.toLocation.location_code !== k.to) return false;
+    return true;
+  }
+
   function currentJob() {
     const rows = Object.values(jobsById);
     if (!rows.length) return null;
+    const k = screenKeys();
 
-    // Best: the job the assign call told us about.
+    // 1) The assigned job, but ONLY if it matches what's on screen (guards
+    //    against a stale assign from a previous job/profile).
     if (currentJobId != null) {
       const r = rows.find(x => x.job_id === currentJobId || (x.job && x.job.id === currentJobId));
-      if (r) return r;
+      if (r && consistentWithScreen(r, k)) return r;
     }
-    // Fallback: match the From Location shown on screen.
-    const fromCode = valueOf(findByLabel('From Location :'), 'From Location :');
-    if (fromCode) {
-      const r = rows.find(x => x.fromLocation && x.fromLocation.location_code === fromCode);
-      if (r) return r;
+
+    // 2) From Location is unique per replen job — match on it, then confirm the
+    //    item agrees. Require an unambiguous single match.
+    if (k.from) {
+      let cand = rows.filter(r => r.fromLocation && r.fromLocation.location_code === k.from);
+      if (k.item) {
+        const narrowed = cand.filter(r => r.item && r.item.item_code === k.item);
+        if (narrowed.length) cand = narrowed;
+      }
+      if (cand.length === 1 && consistentWithScreen(cand[0], k)) return cand[0];
     }
-    // Fallback: match the Item shown on screen.
-    const itemCode = valueOf(findByLabel('Item :'), 'Item :');
-    if (itemCode) {
-      const r = rows.find(x => x.item && x.item.item_code === itemCode);
-      if (r) return r;
+
+    // 3) Item + To Location, unambiguous only.
+    if (k.item && k.to) {
+      const cand = rows.filter(r => r.item && r.item.item_code === k.item && r.toLocation && r.toLocation.location_code === k.to);
+      if (cand.length === 1) return cand[0];
     }
+
+    // No confident match. Do NOT guess — a wrong row shows a wrong qty and
+    // checks the wrong inventory.
+    console.log(TAG, 'no confident job match for screen', k);
     return null;
   }
 
