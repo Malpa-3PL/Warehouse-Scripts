@@ -2,8 +2,8 @@
 // @name         Packing Guide Sidebar
 // @namespace    https://malpa.canary7.com
 // @version      18.1
-// @updateURL    https://raw.githubusercontent.com/zaynnev/malpa3pl/main/malpa-packguide.user.js
-// @downloadURL  https://raw.githubusercontent.com/zaynnev/malpa3pl/main/malpa-packguide.user.js
+// @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-packguide.user.js
+// @downloadURL  https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-packguide.user.js
 // @description  Per-client operational packing guides for the Malpa Pack window — auto-selects the company being packed
 // @author       Malpa 3PL
 // @match        https://*.canary7.com/*
