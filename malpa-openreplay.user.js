@@ -7,8 +7,8 @@
 // @match        https://*.canary7.com/*
 // @run-at       document-start
 // @grant        none
-// @updateURL    https://raw.githubusercontent.com/zaynnev/malpa3pl/main/malpa-openreplay.user.js
-// @downloadURL  https://raw.githubusercontent.com/zaynnev/malpa3pl/main/malpa-openreplay.user.js
+// @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-openreplay.user.js
+// @downloadURL  https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-openreplay.user.js
 // ==/UserScript==
 
 /*
