@@ -1,14 +1,14 @@
 // ==UserScript==
 // @name         Malpa C7 - Replen Early Qty
 // @namespace    malpa
-// @version      4.8
+// @version      4.8.1
 // @description  Shows replen qty + To Location before scanning (matched to the on-screen job, profile-scoped); keeps Confirm Units editable; blocks over-moves against LIVE on-hand at the actual execute call, not just the Next button.
 // @match        https://*.canary7.com/*
 // @grant        none
 // @homepageURL  https://github.com/zaynnev/malpa3pl
 // @supportURL   https://github.com/zaynnev/malpa3pl/issues
-// @updateURL    https://raw.githubusercontent.com/zaynnev/malpa3pl/main/malpa-replen.user.js
-// @downloadURL  https://raw.githubusercontent.com/zaynnev/malpa3pl/main/malpa-replen.user.js
+// @updateURL     https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-replen.user.js
+// @downloadURL   https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-replen.user.js
 // ==/UserScript==
 
 // -----------------------------------------------------------------------------
