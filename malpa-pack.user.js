@@ -2,8 +2,8 @@
 // @name         Malpa Pack v3
 // @namespace    https://malpa.canary7.com
 // @version      3.3.86
-// @updateURL    https://raw.githubusercontent.com/zaynnev/malpa3pl/main/malpa-pack.user.js
-// @downloadURL  https://raw.githubusercontent.com/zaynnev/malpa3pl/main/malpa-pack.user.js
+// @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-pack.user.js
+// @downloadURL  https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-pack.user.js
 // @description  High-throughput packing station for Canary7 WMS — optimistic scanning, async API queue, dynamic profiles
 // @author       Malpa 3PL
 // @match        https://*.canary7.com/*
