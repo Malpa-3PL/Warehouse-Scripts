@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Receiving
 // @namespace    https://malpa.canary7.com
-// @version      2.2.8
+// @version      2.4.3
 // @description  Fast single-screen receiving for Canary7 WMS - TC51 optimised
 // @author       Malpa 3PL
 // @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-receiving.user.js
@@ -21,6 +21,10 @@
   const API_BASE     = 'https://stgauth.canary7.com/index.php?r=';
   const WMS_BASE     = 'https://malpa.canary7.com/inbound/api/wms/v1/';
   const WAREHOUSE_ID = 10;
+
+  // Receipt history paging (receiving/receipt-container).
+  const LOG_PAGE_SIZE = 200;
+  const LOG_MAX_PAGES = 10;
 
   // Receiving profile is ALWAYS Putaway (one step: check in + locate together).
   const PUTAWAY_PROCESS_ID = 3;
@@ -66,7 +70,13 @@
       try {
         for (const key of ['access_token', 'token', 'id_token', 'auth_token']) {
           const v = store.getItem(key);
-          if (v && v.length > 20) return v;
+          // Strip JSON quoting FIRST, then any stored "Bearer " prefix - a token
+          // saved as "\"Bearer ey...\"" defeats the other order and still goes
+          // out as "Bearer Bearer ey...". Either mistake produces a 401 that
+          // looks exactly like a genuine session timeout.
+          if (v && v.length > 20) {
+            return v.trim().replace(/^"|"$/g, '').replace(/^Bearer\s+/i, '').trim();
+          }
         }
       } catch (_) {}
     }
@@ -110,6 +120,10 @@
       Accept: 'application/json',
       Authorization: `Bearer ${getToken()}`,
       'x-warehouse-id': String(WAREHOUSE_ID),
+      // Client-generated correlation id. The API reference lists this among the
+      // headers expected on every request; the monolith tolerates its absence
+      // but the service tree is stricter.
+      'x-reference-id': `mrc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
       ...extra,
     };
     if (_sessionId) h['x-session-id'] = _sessionId;
@@ -122,8 +136,20 @@
     for (let i = 0; i < 5 && !_sessionId; i++) await new Promise(r => setTimeout(r, 50));
   }
 
-  async function _handle(res) {
-    if (res.status === 401) { _showSessionExpired(); throw new Error('Session expired'); }
+  // opts.quiet401: a 401 here must NOT take over the screen. Used for the
+  // history panel, which lives on a different microservice - if that service
+  // ever disagrees about auth, the operator should get an error inside the panel
+  // rather than a full "Session expired" takeover of a session that is plainly
+  // alive (the receipt itself loaded seconds earlier).
+  async function _handle(res, opts = {}) {
+    if (res.status === 401) {
+      if (!opts.quiet401) _showSessionExpired();
+      // Sentinel on a code, not a message - callers must not string-match.
+      const e = new Error(opts.quiet401 ? 'not authorised' : 'Session expired');
+      e.code = 'SESSION_EXPIRED';
+      e.httpStatus = 401;
+      throw e;
+    }
     if (res.status === 404) { const e = new Error('Not found'); e.notFound = true; throw e; }
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
@@ -152,14 +178,33 @@
     await waitForSession();
     return _handle(await fetch(WMS_BASE + path, { method: 'GET', headers: mkHeaders() }));
   }
-
   let _sessionExpiredShown = false;
   function _showSessionExpired() {
-    if (_sessionExpiredShown) return;
-    _sessionExpiredShown = true;
+    // Latch ONLY if the overlay actually made it into the DOM.
+    //
+    // The boot prefetch (profiles + locations) fires ~600ms after the sidebar
+    // link is injected - long before the operator opens the tab and long before
+    // #mrc-root exists. If that early call 401s, latching here used to record a
+    // timeout that could never be shown, and every later render then painted
+    // that stale latch: the operator got "Session expired" out of nowhere on the
+    // next thing they touched, with a perfectly healthy session.
+    _sessionExpiredShown = _paintSessionExpired(true);
+  }
+
+  // Kept separate and idempotent so render() can put the banner back. render()
+  // rebuilds #mrc-root wholesale, which used to destroy this overlay while the
+  // "already shown" flag stayed set - so a session timeout during a check-in
+  // silently swallowed the only prompt to log back in.
+  // force: paint even though the latch is not set yet (the setter uses the
+  // return value to decide whether to latch at all). Returns true if the overlay
+  // is now on screen.
+  function _paintSessionExpired(force) {
+    if (!force && !_sessionExpiredShown) return false;
     const root = document.getElementById('mrc-root');
-    if (!root) return;
+    if (!root) return false;
+    if (document.getElementById('mrc-sess')) return true;
     const b = document.createElement('div');
+    b.id = 'mrc-sess';
     b.style.cssText = 'position:absolute;inset:0;z-index:9999;background:rgba(0,0,0,.78);' +
       'display:flex;flex-direction:column;align-items:center;justify-content:center;' +
       'padding:24px;gap:14px;text-align:center';
@@ -173,8 +218,9 @@
     root.style.position = 'relative';
     root.appendChild(b);
     document.getElementById('mrc-sess-x')?.addEventListener('click', () => {
-      b.remove(); _sessionExpiredShown = false; State.resetReceipt(); render();
+      _sessionExpiredShown = false; b.remove(); State.resetReceipt(); render();
     });
+    return true;
   }
 
   // ---------------------------------------------------------------------------
@@ -201,10 +247,6 @@
     })(),
     lastLocation: null,
 
-    voiceEnabled: (() => {
-      try { const v = sessionStorage.getItem('mrc_voice'); return v === null ? true : v === '1'; }
-      catch (_) { return true; }
-    })(),
 
     done: 0,
     failedItems: [],
@@ -215,11 +257,18 @@
     fbType: 'dim',
     focusTarget: null, // element id to focus after the next render
 
+    // Receipt history panel (inventory transaction log)
+    logOpen: false,
+    logRows: null,     // null = never fetched for this receipt
+    logBusy: false,
+    logErr: '',
+
     resetReceipt() {
       this.header = null; this.receiptId = ''; this.details = [];
       this.itemsById = {}; this.refMap = {}; this.cur = null;
       this.done = 0; this.failedItems = [];
       this.err = ''; this.fb = ''; this.busy = null; this.notice = '';
+      this.logOpen = false; this.logRows = null; this.logBusy = false; this.logErr = '';
     },
     resetLine() {
       this.cur = null; this.fb = ''; this.fbType = 'dim'; this.err = '';
@@ -265,6 +314,42 @@
       }
       .mrc-prog { height:2px; background:#e1e6ef; flex-shrink:0; }
       .mrc-prog-fill { height:2px; background:#20a8d8; transition:width .3s ease; }
+
+      /* ---- receipt history dropdown ---- */
+      .mrc-hist-btn {
+        flex-shrink:0; border:1px solid #e1e6ef; background:#fff; color:#20a8d8;
+        font-size:12px; font-family:Roboto,sans-serif; padding:3px 9px; cursor:pointer;
+        display:inline-flex; align-items:center; gap:5px; line-height:1.4;
+        -webkit-tap-highlight-color:transparent; touch-action:manipulation;
+      }
+      .mrc-hist-btn:active { background:#f0f8fd; }
+      .mrc-hist-btn .car { font-size:9px; }
+      /* overflow:auto on BOTH axes - autosized columns are allowed to run wider
+         than the panel and scroll sideways rather than squashing item codes. */
+      .mrc-hist {
+        flex-shrink:0; border-bottom:1px solid #e1e6ef; background:#fbfcfd;
+        max-height:38vh; overflow:auto; -webkit-overflow-scrolling:touch;
+      }
+      /* width:auto + table-layout:auto = columns size to their content.
+         min-width:100% keeps it filling the panel when the content is narrow. */
+      .mrc-hist table {
+        width:auto; min-width:100%; border-collapse:collapse;
+        font-size:12px; table-layout:auto;
+      }
+      /* Full grid lines, everything centred. */
+      .mrc-hist th {
+        position:sticky; top:0; z-index:1; background:#f1f4f8; color:#5d7d9a;
+        font-weight:500; text-align:center; padding:5px 9px;
+        border:1px solid #d3dae5; white-space:nowrap;
+      }
+      .mrc-hist td {
+        padding:5px 9px; border:1px solid #e1e6ef; color:#374767;
+        text-align:center; white-space:nowrap;
+      }
+      /* Quantity alone is double size - it is the number being checked. */
+      .mrc-hist td.q { font-size:24px; font-weight:500; color:#b5551d; line-height:1.1; }
+      .mrc-hist td.t { color:#5d7d9a; font-variant-numeric:tabular-nums; }
+      .mrc-hist-empty { padding:12px; font-size:12px; color:#9faecb; text-align:center; }
 
       .mrc-card-body {
         flex:1; min-height:0; overflow-y:auto; -webkit-overflow-scrolling:touch;
@@ -328,7 +413,12 @@
       .mrc-fc::placeholder { color:#c0cadd; }
       .mrc-fc[readonly], .mrc-fc:disabled { background:#e1e6ef; opacity:1; }
       .mrc-fc.big { font-size:21px; font-weight:500; min-height:46px; letter-spacing:.02em; }
-      .mrc-fc.qty { font-size:26px; font-weight:500; min-height:50px; color:#b5551d; }
+      /* Quantity is the number the operator double-checks most, so it gets the
+         largest type on the screen. Tune font-size/min-height here. */
+      .mrc-fc.qty {
+        font-size:38px; font-weight:500; min-height:64px; color:#b5551d;
+        text-align:center; letter-spacing:.03em; padding:.35rem .5rem;
+      }
       /* Check digits are 1-3 characters - a full-width box wastes the row. */
       .mrc-fc.cd {
         width:130px; font-size:22px; font-weight:500; min-height:46px;
@@ -415,12 +505,6 @@
       .mrc-ov-body strong { color:#e03131; font-weight:500; }
       .mrc-ov-acts { display:flex; flex-direction:column; gap:6px; padding:0 14px 14px; }
 
-      .mrc-voice {
-        flex-shrink:0; border:none; background:transparent; color:#9faecb;
-        font-size:15px; padding:2px 4px; cursor:pointer; line-height:1;
-        -webkit-tap-highlight-color:transparent; touch-action:manipulation;
-      }
-      .mrc-voice.muted { opacity:.45; }
 
       .mrc-flash {
         position:absolute; inset:0; z-index:9999; opacity:0; pointer-events:none;
@@ -871,6 +955,105 @@
     try { return await apiGet(path); } catch (_) { return null; }
   }
 
+  // ---- receipt history (receipt containers) ---------------------------------
+  //
+  // Sourced from receiving/receipt-container on the legacy monolith, keyed by
+  // receipt_header_id - the id we already hold. This replaced the /logging/
+  // inventory_log route, which was the wrong tool for the job: it is keyed by a
+  // free-text reference, needs a date window, sits on a service that answered
+  // 404 for references that plainly had history, and is gated by a Canary7 role
+  // that not every operator has (verified: 200 for one role, 403 for another).
+  // Containers are receipt-scoped, on the same host and auth as every other call
+  // this script makes, and carry everything the panel needs.
+
+  // id -> display name. The user list ignores both `id=` and `fields=` filters,
+  // so it comes back whole (~130KB); fetched once on first use and kept for the
+  // page, with the id->name map mirrored into sessionStorage so reopening the
+  // tab is free.
+  let _userNames = null;
+
+  function _loadUserCache() {
+    if (_userNames) return _userNames;
+    try {
+      const raw = sessionStorage.getItem('mrc_users');
+      if (raw) { _userNames = JSON.parse(raw); return _userNames; }
+    } catch (_) {}
+    return null;
+  }
+
+  async function fetchUserNames() {
+    const cached = _loadUserCache();
+    if (cached) return cached;
+    try {
+      const data = await apiGet('configuration/user&per-page=500&page=1');
+      const list = Array.isArray(data) ? data : (data?.items || []);
+      const map = {};
+      for (const u of list) {
+        if (u && u.id != null) map[String(u.id)] = u.name || u.username || ('User ' + u.id);
+      }
+      _userNames = map;
+      try { sessionStorage.setItem('mrc_users', JSON.stringify(map)); } catch (_) {}
+      return map;
+    } catch (e) {
+      console.warn('[MalpaRecv] user names unavailable:', e.message);
+      _userNames = {};      // do not retry on every open
+      return _userNames;
+    }
+  }
+
+  function userName(id) {
+    if (id == null) return '-';
+    const m = _userNames || {};
+    return m[String(id)] || ('User ' + id);
+  }
+
+  // Unix SECONDS -> "dd/mm HH:MM". Operators care about time of day; the date is
+  // there for a receipt worked across a shift boundary.
+  function _fmtWhen(sec) {
+    if (!sec) return '-';
+    const n = Number(sec);
+    if (!isFinite(n) || n <= 0) return '-';
+    const d = new Date(n > 1e12 ? n : n * 1000);
+    if (isNaN(d.getTime())) return '-';
+    const p = x => String(x).padStart(2, '0');
+    return `${p(d.getDate())}/${p(d.getMonth() + 1)} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
+
+  // Every container booked against this receipt. Paged; a short page ends it and
+  // LOG_MAX_PAGES stops a runaway if the server ever ignores `page`.
+  async function fetchReceiptLog(headerId) {
+    if (!headerId) return [];
+    const EXPAND = encodeURIComponent('item,batch,toLocation,containerType');
+    const rows = [];
+    const seen = new Set();
+    for (let page = 1; page <= LOG_MAX_PAGES; page++) {
+      // Monolith base already ends in ?r=, so every extra param uses &.
+      const data = await apiGet(
+        `receiving/receipt-container&receipt_header_id=${encodeURIComponent(headerId)}` +
+        `&expand=${EXPAND}&per-page=${LOG_PAGE_SIZE}&page=${page}`);
+      const batch = Array.isArray(data) ? data : (data?.items || []);
+      if (!batch.length) break;
+      let added = 0;
+      for (const r of batch) {
+        // Container rows carry a real primary key, so de-duping on it is safe
+        // and doubles as the runaway guard.
+        const key = r?.id;
+        if (key != null) {
+          if (seen.has(key)) continue;
+          seen.add(key);
+        }
+        rows.push(r);
+        added++;
+      }
+      if (batch.length < LOG_PAGE_SIZE || added === 0) break;
+    }
+    // Resolve the operator names for the ids actually present.
+    if (rows.length) await fetchUserNames();
+    // Newest first - the operator is nearly always checking what just happened.
+    rows.sort((a, b) => (Number(b.created_at) || 0) - (Number(a.created_at) || 0));
+    return rows;
+  }
+
   async function refreshDetail(detail, item) {
     const c = State.cur;
     return apiGet(`receiving/receipt-detail/get-detail-by-item` +
@@ -903,50 +1086,8 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 7. VOICE + AUDIO
+  // 7. AUDIO (chimes + haptics)
   // ---------------------------------------------------------------------------
-
-  function _formatLocForSpeech(loc, prevLoc) {
-    if (!loc) return '';
-    const segs = String(loc).split('-');
-    const prev = prevLoc ? String(prevLoc).split('-') : [];
-    let skip = 0;
-    for (let i = 0; i < segs.length - 1; i++) {
-      if (prev[i] && prev[i].toUpperCase() === segs[i].toUpperCase()) skip++; else break;
-    }
-    return segs.slice(skip).map(seg => {
-      const m = seg.match(/^([A-Za-z]*)(\d+)$/);
-      if (!m) return seg;
-      return m[1] ? m[1] + ' ' + parseInt(m[2], 10) : String(parseInt(m[2], 10));
-    }).join(', ');
-  }
-
-  const Voice = {
-    speak(t) {
-      if (!State.voiceEnabled || !window.speechSynthesis) return;
-      window.speechSynthesis.cancel();
-      const u = new SpeechSynthesisUtterance(String(t));
-      u.rate = 1.8; u.volume = 1;
-      window.speechSynthesis.speak(u);
-    },
-    putaway(qty, uom, loc, prev) {
-      let s = '';
-      if (uom && uom.toLowerCase() !== 'each') {
-        s = ' ' + (qty > 1 && !uom.toLowerCase().endsWith('s') ? uom + 's' : uom);
-      }
-      this.speak(`Put ${qty}${s} to ${_formatLocForSpeech(loc, prev)}`);
-    },
-    noLocation() { this.speak('No existing location. Scan a bin.'); },
-    cancel() { if (window.speechSynthesis) window.speechSynthesis.cancel(); },
-    // Errors bypass the mute toggle - a reject must always be audible.
-    error(m) {
-      if (!window.speechSynthesis) return;
-      window.speechSynthesis.cancel();
-      const u = new SpeechSynthesisUtterance(String(m));
-      u.rate = 1.7; u.volume = 1;
-      window.speechSynthesis.speak(u);
-    },
-  };
 
   const Audio = {
     _ctx: null,
@@ -1015,10 +1156,27 @@
   function linesCompleted() { return State.details.filter(d => (d.open_quantity || 0) <= 0).length; }
   function totalDetailLines() { return State.details.length; }
 
+  // Pick the detail line to receive against.
+  //
+  // Prefer a line with quantity still open, lowest line number first. If every
+  // line for this item is already satisfied, fall back to the LAST one rather
+  // than refusing: base Canary7 lets you keep receiving against a completed
+  // line (the profile carries allow_over_receiving), and blocking it stranded
+  // operators whenever a receipt arrived with more stock than it declared.
+  // Going over still has to pass the type-OVER confirmation in submitQty.
   function openDetailForItem(itemId) {
-    return State.details
-      .filter(d => d.item_id === itemId && (d.open_quantity || 0) > 0)
-      .sort((a, b) => (a.line_number || 0) - (b.line_number || 0))[0] || null;
+    const mine = State.details
+      .filter(d => d.item_id === itemId)
+      .sort((a, b) => (a.line_number || 0) - (b.line_number || 0));
+    if (!mine.length) return null;
+    return mine.find(d => (d.open_quantity || 0) > 0) || mine[mine.length - 1];
+  }
+
+  // True when every line for this item is already fully received, so the next
+  // receipt against it is an over-receive.
+  function itemIsComplete(itemId) {
+    const mine = State.details.filter(d => d.item_id === itemId);
+    return mine.length > 0 && mine.every(d => (d.open_quantity || 0) <= 0);
   }
 
   // Every barcode that identifies the current item (its code + all UoM refs).
@@ -1050,10 +1208,9 @@
 
   function say(msg, type) { State.fb = msg; State.fbType = type || 'dim'; }
 
-  function reject(msg, spoken) {
+  function reject(msg) {
     say(msg, 'err');
     Audio.chime('error');
-    Voice.error(spoken || msg);
     flash('err');
     render();
   }
@@ -1065,6 +1222,114 @@
   // already satisfied collapse to a compact one-line summary so the whole flow
   // stays on screen. Inputs are ordinary text fields, so Canary7's native
   // keyboard is what the operator gets.
+
+  function _logErrText(e) {
+    if (e?.httpStatus === 403) {
+      return 'Your Canary7 role cannot view this receipt history.';
+    }
+    return 'Could not load history: ' + (e?.message || 'unknown error');
+  }
+
+  // One-shot: set when the history panel is opened, consumed by render().
+  let _logJustOpened = false;
+  // Monotonic id for history fetches. A slow fetch for receipt A must not paint
+  // its rows under receipt B, and an older fetch must not overwrite a newer one.
+  let _logReq = 0;
+
+  // Swap just the history table in place. Deliberately NOT a full render():
+  // rebuilding #mrc-root from an async callback wipes half-typed input and drops
+  // the in-flight write lock.
+  function renderHistoryOnly() {
+    const card = document.querySelector('.mrc-card');
+    if (!card) return;
+    const existing = card.querySelector('.mrc-hist');
+    // Same condition render() uses, so the two can never disagree about whether
+    // the panel belongs on screen.
+    if (!State.header || !State.logOpen) { existing?.remove(); return; }
+    const tmp = document.createElement('div');
+    tmp.innerHTML = historyHtml();
+    const fresh = tmp.firstElementChild;
+    if (!fresh) return;
+    if (existing) existing.replaceWith(fresh);
+    else card.querySelector('.mrc-prog')?.insertAdjacentElement('afterend', fresh);
+  }
+
+  // Receipt history table. Only the four columns the floor asked for:
+  // who did it, what, where it went, how much.
+  function historyHtml() {
+    if (State.logBusy) {
+      return `<div class="mrc-hist"><div class="mrc-hist-empty">
+        <span class="mrc-spin"></span>Loading history...</div></div>`;
+    }
+    if (State.logErr) {
+      return `<div class="mrc-hist"><div class="mrc-hist-empty">
+        ${_esc(State.logErr)}</div></div>`;
+    }
+    const rows = State.logRows || [];
+    if (!rows.length) {
+      return `<div class="mrc-hist"><div class="mrc-hist-empty">
+        Nothing booked against this receipt yet.</div></div>`;
+    }
+    const body = rows.map(r => {
+      const who  = userName(r.created_by);
+      const code = r.item?.item_code || '';
+      const loc  = r.toLocation?.location_code || '';
+      const when = _fmtWhen(r.created_at);
+      return `
+      <tr>
+        <td class="t" title="${_esc(when)}">${_esc(when)}</td>
+        <td title="${_esc(who)}">${_esc(who)}</td>
+        <td title="${_esc(code)}">${_esc(code || '-')}</td>
+        <td title="${_esc(loc)}">${_esc(loc || '-')}</td>
+        <td class="q">${_esc(r.quantity ?? '-')}</td>
+      </tr>`;
+    }).join('');
+    return `
+      <div class="mrc-hist" id="mrc-hist">
+        <table>
+          <thead><tr><th>Time</th><th>User</th><th>Item</th><th>Location</th>
+            <th>Qty</th></tr></thead>
+          <tbody>${body}</tbody>
+        </table>
+      </div>`;
+  }
+
+  // Fetched on open, and re-fetched on every re-open so it never shows a stale
+  // picture after someone else has received against the same receipt.
+  async function toggleHistory() {
+    if (State.logOpen) { State.logOpen = false; render(); return; }
+    State.logOpen = true;
+    _logJustOpened = true;   // suppress the keyboard for this render only
+    State.logBusy = true;
+    State.logErr  = '';
+    const ref = State.header?.id || null;      // receipt_header_id
+    const req = ++_logReq;
+    render();
+    try {
+      const rows = await fetchReceiptLog(ref);
+      // Ignore a result the operator has already navigated away from.
+      const nowRef = State.header?.id || null;
+      if (req !== _logReq || nowRef !== ref) return;
+      State.logRows = rows;
+    } catch (e) {
+      if (req !== _logReq) return;
+      State.logErr = _logErrText(e);
+      State.logRows = [];
+    } finally {
+      // Only the fetch that still owns the generation may settle the panel.
+      // Clearing the spinner unconditionally looked safer but was worse: a
+      // superseded fetch would clear it while its replacement was still running,
+      // and the panel would then confidently render "Nothing booked against this
+      // receipt yet" - the one answer it must never give wrongly, since this is
+      // where an operator checks whether a write landed.
+      if (req === _logReq) {
+        State.logBusy = false;
+        // Patch the table in place. A full render() here would clear anything
+        // half-typed and fight an in-flight write.
+        renderHistoryOnly();
+      }
+    }
+  }
 
   function doneRow(label, value, opts = {}) {
     return `
@@ -1095,6 +1360,12 @@
     if (!root) return;
     // Decide BEFORE the rebuild wipes activeElement.
     const mayFocus = focusIsOurs();
+    // Consume the history one-shot HERE, unconditionally. Leaving it to
+    // focusStage meant it survived any render that did not focus (panel closed,
+    // focus outside our form) and then suppressed the keyboard on an unrelated
+    // later render, killing manual entry until a field was tapped.
+    const openingLog = _logJustOpened;
+    _logJustOpened = false;
 
     const c       = State.cur;
     const hasRcpt = !!State.header;
@@ -1168,6 +1439,11 @@
           </div>`;
         rows += `<div class="mrc-static"><b>Item Description :</b>
           <span class="v">${_esc(c.item.description || '')}</span></div>`;
+        // Receiving beyond a satisfied line is allowed, but never silently.
+        if (c.overLine) {
+          rows += `<div class="mrc-banner">This line is already fully received.
+            Anything entered here is an over-receive and will ask you to type OVER.</div>`;
+        }
         rows += fieldRow(`Check-In Quantity(open quantity : ${openBase})`,
           `<input id="mrc-qty" class="mrc-fc qty" type="text" inputmode="numeric"
              autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
@@ -1267,10 +1543,12 @@
           <span class="mrc-card-meta">${hasRcpt
             ? `${done} / ${total} lines completed &middot; ${openUnits()} units open`
             : 'Putaway &middot; one step check in &amp; locate'}</span>
-          <button class="mrc-voice${State.voiceEnabled ? '' : ' muted'}" id="mrc-voice"
-            title="Toggle voice" aria-label="Toggle voice">${State.voiceEnabled ? '&#128266;' : '&#128263;'}</button>
+          ${hasRcpt ? `<button class="mrc-hist-btn" id="mrc-hist-btn"
+            aria-expanded="${State.logOpen}" aria-controls="mrc-hist">History
+            <span class="car">${State.logOpen ? '&#9650;' : '&#9660;'}</span></button>` : ''}
         </div>
         <div class="mrc-prog"><div class="mrc-prog-fill" style="width:${pct}%"></div></div>
+        ${hasRcpt && State.logOpen ? historyHtml() : ''}
         <div class="mrc-card-body" id="mrc-body">
           ${State.notice ? `<div class="mrc-banner ok">${_esc(State.notice)}</div>` : ''}
           ${State.err ? `<div class="mrc-banner">${_esc(State.err)}</div>` : ''}
@@ -1293,7 +1571,13 @@
       </div>`;
 
     wire(stage);
-    if (mayFocus) focusStage(stage);
+    if (mayFocus) focusStage(stage, openingLog);
+    // A render can be triggered from outside the write (an async history load),
+    // and innerHTML rebuilding throws away every disabled flag. Re-assert the
+    // lock from the single source of truth rather than trusting call sites.
+    if (_writeInFlight) lockForm();
+    // The rebuild above destroys any overlay, so put the session banner back.
+    _paintSessionExpired();
     setTimeout(measureHeight, 20);
   }
 
@@ -1315,8 +1599,11 @@
   // field again.
   let _kbDismissed = false;
 
-  function focusStage(stage) {
-    if (_kbDismissed) {
+  // openingLog: this render is the one that puts the history table up, so keep
+  // the keyboard down for it. Passed in rather than read from module state so it
+  // cannot leak into an unrelated render.
+  function focusStage(stage, openingLog) {
+    if (_kbDismissed || openingLog) {
       setTimeout(() => {
         const cc = document.getElementById('mrc-catch');
         if (!cc) return;
@@ -1381,15 +1668,11 @@
          location: submitLocation, checkdigit: submitCheckDigit }[stage] || (() => {}))(raw);
     });
 
-    document.getElementById('mrc-voice')?.addEventListener('click', () => {
-      State.voiceEnabled = !State.voiceEnabled;
-      try { sessionStorage.setItem('mrc_voice', State.voiceEnabled ? '1' : '0'); } catch (_) {}
-      if (!State.voiceEnabled) Voice.cancel();
-      render();
-    });
 
     // Deliberately bound to the box alone - the whole row was far too easy to
     // hit by accident.
+    document.getElementById('mrc-hist-btn')?.addEventListener('click', () => { toggleHistory(); });
+
     document.getElementById('mrc-keep-box')?.addEventListener('click', () => {
       State.keepLocation = !State.keepLocation;
       try { sessionStorage.setItem('mrc_keeploc', State.keepLocation ? '1' : '0'); } catch (_) {}
@@ -1521,7 +1804,7 @@
       if (!header) {
         State.header = null;
         State.err = `Receipt ${id} not found, or nothing left to check in.`;
-        render(); Audio.chime('error'); Voice.error('Receipt not found');
+        render(); Audio.chime('error');
         return;
       }
       State.header  = header;
@@ -1559,19 +1842,21 @@
       const onReceipt = State.details.some(d =>
         String(d.item?.item_code || '').trim().toLowerCase() === key);
       reject(onReceipt ? 'Item data failed to load - use C7 for this line'
-                       : 'Not on this receipt',
-             onReceipt ? 'Item data error' : 'Item not on this receipt');
+                       : 'Not on this receipt');
       return;
     }
     const item = State.itemsById[hit.itemId];
     const detail = openDetailForItem(hit.itemId);
-    if (!item)   { reject('Item data missing - rescan', 'Item error'); return; }
-    if (!detail) { reject('No open quantity left on this item', 'Line already complete'); return; }
+    if (!item)   { reject('Item data missing - rescan'); return; }
+    // Only a genuine absence from the receipt is refused now. A line that is
+    // merely finished is allowed through as an over-receive.
+    if (!detail) { reject('No line for this item on the receipt'); return; }
+    const complete = itemIsComplete(hit.itemId);
 
     // Auto-select the UoM the scanned reference belongs to; still editable.
     let uom = hit.uomId ? (item.itemUnitOfMeasures || []).find(u => u.id === hit.uomId) : null;
     if (!uom) uom = defaultUomFor(item);
-    if (!uom) { reject('Item has no unit of measure', 'Item error'); return; }
+    if (!uom) { reject('Item has no unit of measure'); return; }
 
     State.cur = {
       detail, item, uom,
@@ -1580,11 +1865,11 @@
       qty: uom.factor || 1,
       batchNo: detail.expected_batch_no || '',
       expiry:  detail.expected_batch_expiry || '',
-      qtyDone: false, batchDone: false,
+      qtyDone: false, batchDone: false, overLine: complete,
       location: null, suggested: null, locResolved: false, viaKeep: false,
     };
-    say('Item verified', 'ok');
-    Audio.chime('item_ok');
+    say(complete ? 'Item verified - line already complete' : 'Item verified', 'ok');
+    Audio.chime(complete ? 'warn' : 'item_ok');
     flash('ok');
     render();
   }
@@ -1622,22 +1907,21 @@
     }
 
     const qty = parseFloat(val);
-    if (!val || isNaN(qty) || qty <= 0) { reject('Enter a quantity greater than zero', 'Invalid quantity'); return; }
+    if (!val || isNaN(qty) || qty <= 0) { reject('Enter a quantity greater than zero'); return; }
     if (!Number.isInteger(qty) && !c.item.allow_partial_units) {
-      reject('Whole units only for this item', 'Whole units only'); return;
+      reject('Whole units only for this item'); return;
     }
     // A factor-6 carton cannot hold 13 eaches.
     if (factor > 1 && qty % factor !== 0) {
       const lo = Math.floor(qty / factor) * factor, hi = lo + factor;
-      reject(`${qty} is not a whole ${uomName(c.uom)} (x${factor}) - use ${lo || factor} or ${hi}`,
-             `Not a whole ${uomName(c.uom)}`);
+      reject(`${qty} is not a whole ${uomName(c.uom)} (x${factor}) - use ${lo || factor} or ${hi}`);
       return;
     }
     c.qty = qty;
 
     if (qty > open) {
       if (!State.profile.allow_over_receiving) {
-        reject(`Over-receiving is off. Open is ${open}.`, 'Over receiving not allowed'); return;
+        reject(`Over-receiving is off. Open is ${open}.`); return;
       }
       showOverConfirm(qty, open);
       return;
@@ -1660,7 +1944,7 @@
     // Fall back to state: on Android the picker can commit a value without the
     // element still being in the DOM we read from.
     const e = (document.getElementById('mrc-expiry')?.value || c.expiry || '').trim();
-    if (!b) { reject('Batch number is required', 'Batch required'); return; }
+    if (!b) { reject('Batch number is required'); return; }
     // Expiry is not blocked on - C7 accepts a null expiry, and refusing to move
     // on because a picker was dismissed is exactly the trap being fixed here.
     if (c.detail.expected_batch_no &&
@@ -1683,7 +1967,6 @@
       c.location = State.lastLocation; c.suggested = State.lastLocation;
       c.viaKeep = true; c.locResolved = true;
       render();
-      Voice.putaway(c.qty, uomName(c.uom), c.location.location_code, null);
       return;
     }
 
@@ -1699,11 +1982,9 @@
     if (none) {
       c.location = null; c.suggested = null;
       render();
-      Voice.noLocation();
     } else {
       c.location = loc; c.suggested = loc;
       render();
-      Voice.putaway(c.qty, uomName(c.uom), loc.location_code, State.lastLocation?.location_code);
     }
   }
 
@@ -1716,15 +1997,14 @@
     render();
     const loc = await resolveLocation(code);
     State.busy = null;
-    if (!loc)             { reject('Location not found', 'Location not found'); return; }
-    if (loc.status !== 1) { reject('Location is inactive', 'Location inactive'); return; }
+    if (!loc)             { reject('Location not found'); return; }
+    if (loc.status !== 1) { reject('Location is inactive'); return; }
     // No "accepted" message - an unacceptable bin never gets this far, so
     // confirming the obvious is just noise.
     c.location = loc;
     say('', 'dim');
     Audio.chime('item_ok');
     render();
-    Voice.putaway(c.qty, uomName(c.uom), loc.location_code, State.lastLocation?.location_code);
   }
 
   function submitCheckDigit(raw) {
@@ -1744,8 +2024,7 @@
     } else {
       const el = document.getElementById('mrc-cd');
       if (el) el.value = '';
-      reject(noDigit ? 'Wrong location' : 'Wrong check digit',
-             noDigit ? 'Wrong location' : 'Wrong check digit');
+      reject(noDigit ? 'Wrong location' : 'Wrong check digit');
     }
   }
 
@@ -1758,7 +2037,6 @@
     if (!card) return;
     document.getElementById('mrc-over-ov')?.remove();
     Audio.chime('warn');
-    Voice.error('Over receiving. Type OVER to confirm.');
 
     const ov = document.createElement('div');
     ov.className = 'mrc-ov';
@@ -1808,6 +2086,14 @@
   // scanner repeating its terminator, must never produce two writes.
   let _writeInFlight = false;
 
+  // render() rebuilds #mrc-root, so any disabled attributes are thrown away.
+  // Every render performed while a write is settling must re-apply this, or the
+  // re-focused check-digit field will happily accept another scan.
+  function lockForm() {
+    document.querySelectorAll('#mrc-root input, #mrc-root select, #mrc-root button')
+      .forEach(el => { el.disabled = true; });
+  }
+
   async function doCheckin() {
     const c = State.cur;
     if (!c || !c.location || _writeInFlight) return;
@@ -1816,8 +2102,7 @@
     State.busy = 'Checking in...';
     State.fb = '';
     render();
-    document.querySelectorAll('#mrc-root input, #mrc-root select, #mrc-root button')
-      .forEach(el => { el.disabled = true; });
+    lockForm();
 
     // Snapshot the success path's inputs so nothing can be pulled out from
     // under us between the await and the render.
@@ -1833,9 +2118,21 @@
       try {
         result = await postCheckin(c.detail, c.item, c.uom, qty, locRec.id);
       } catch (firstErr) {
-        if (firstErr.message?.includes('Session expired')) throw firstErr;
+        if (firstErr.code === 'SESSION_EXPIRED') throw firstErr;
         // Deterministic refusal - nothing was written, so surface it now.
         if (firstErr.c7Code) throw firstErr;
+
+        // OVER-RECEIVE: never auto-retry.
+        // The "did it land?" test below compares open_quantity, which C7 floors
+        // at zero. When qty exceeds what was open the expected value is negative,
+        // so the test can NEVER pass and the code would fall through to a blind
+        // second POST - a genuine double-receive. There is no idempotency key to
+        // lean on, so refuse to guess and hand it to the operator, who can settle
+        // it from the History panel.
+        if (qty > openBefore) {
+          firstErr.indeterminate = true;
+          throw firstErr;
+        }
 
         // The first POST may have COMMITTED before the error surfaced (proxy
         // timeout, dropped socket, non-JSON 200). Checkin has no idempotency
@@ -1864,6 +2161,8 @@
       State.done++;
       State.lastLocation = locRec;
 
+      // Optimistic local update so the figures are right even if the re-read
+      // below fails. It is immediately overwritten when the re-read succeeds.
       let idx = State.details.findIndex(d => d.id === detailId);
       if (idx < 0) idx = State.details.findIndex(d => d.id === c.detail.id);
       if (idx >= 0) {
@@ -1872,25 +2171,86 @@
           ? recoveredOpen
           : Math.max(0, (d.open_quantity || 0) - baseQty);
         // updated_at is deliberately NOT touched - C7 owns that value.
-      } else {
-        console.warn('[MalpaRecv] detail', detailId, 'not local - reloading');
-        await reloadDetails();
       }
 
-      // `total` is the open quantity remaining across the WHOLE receipt
-      // (verified: a 101-unit receipt returned 41 after a 60-unit check-in).
-      const remaining = (result && typeof result.total === 'number') ? result.total : openUnits();
+      // Identify the receipt BEFORE the re-read, so a mid-flight reset cannot
+      // produce a "  closed - all 0 lines received" notice.
+      const numBefore   = State.header?.receipt_num || State.receiptId;
+      const linesBefore = totalDetailLines();
+
+      // The write has landed, so anything already on the History panel is now
+      // out of date. Mark it busy BEFORE the render below, or that render would
+      // briefly present pre-write rows - or "Nothing booked" - as settled.
+      // The _logReq bump orphans any fetch still running from an earlier line:
+      // without it that older fetch still owns the generation and would clear
+      // the spinner with its own pre-write rows part way through this refresh.
+      if (State.logOpen) { _logReq++; State.logBusy = true; State.logErr = ''; }
+
+      // Now go back to C7 for the truth. This is what keeps lines-completed and
+      // units-open honest when several operators share a receipt.
+      State.busy = 'Refreshing receipt...';
+      render();
+      lockForm();                       // render() dropped the disabled flags
+      const fresh = await refreshReceipt();
+
+      // Keep an open history panel in step, but do NOT block the next scan on
+      // it: fetchReceiptLog can walk several pages and this is the hot path.
+      if (State.logOpen && !fresh.closed) {
+        const ref = State.header?.id || null;   // receipt_header_id
+        const req = ++_logReq;
+        // This fetch now owns the generation, so it also owns the spinner -
+        // otherwise the fetch it just superseded would clear it early and the
+        // panel would show a stale or empty table as though it were final.
+        State.logBusy = true;
+        // Clear any earlier failure too: historyHtml() checks logErr BEFORE
+        // logRows, so a stale error would hide the rows this fetch is about to
+        // load for the rest of the receipt.
+        State.logErr = '';
+        renderHistoryOnly();
+        const settle = () => {
+          if (req !== _logReq) return;
+          State.logBusy = false;
+          renderHistoryOnly();
+        };
+        fetchReceiptLog(ref)
+          .then(rows => {
+            // Only paint if this is still the newest fetch AND still the same
+            // receipt - otherwise these rows belong to a receipt the operator
+            // has already moved on from.
+            const nowRef = State.header?.id || null;
+            if (req !== _logReq || !State.logOpen || nowRef !== ref) return;
+            State.logRows = rows;
+          })
+          .catch(e => {
+            // NEVER swallow this. An empty catch let a failed refresh settle
+            // into "Nothing booked against this receipt yet" straight after a
+            // write that had actually succeeded - an operator reading that would
+            // reasonably receive the line a second time. Say it failed instead.
+            if (req !== _logReq) return;
+            State.logErr = _logErrText(e);
+          })
+          .then(settle);
+      }
+
+      // Prefer the re-read. `total` from the write is the receipt-wide open
+      // quantity and is only used if the re-read could not be done.
+      const remaining = fresh.ok
+        ? (fresh.closed ? 0 : openUnits())
+        : ((result && typeof result.total === 'number') ? result.total : openUnits());
 
       State.busy = null;
       State.cur  = null;
+      // A successful write settles any previous warning - including the
+      // "may or may not have been recorded" banner, which would otherwise stay
+      // up for the rest of the receipt.
+      State.err  = '';
 
       if (remaining <= 0) {
         // Receipt is closed. Say so plainly and go back to the receipt prompt -
         // leaving the item row up would invite scans against a finished receipt.
-        const num   = State.header?.receipt_num || State.receiptId;
-        const lines = totalDetailLines();
+        const num   = numBefore;
+        const lines = linesBefore;
         Audio.chime('receipt_done');
-        Voice.speak('Receipt complete');
         if (navigator.vibrate) navigator.vibrate([30, 50, 30, 50, 60]);
         State.resetReceipt();
         State.notice = `${num} closed - all ${lines} line${lines === 1 ? '' : 's'} received. ` +
@@ -1899,32 +2259,83 @@
         say(`Checked in ${qty} ${uomLabel} to ${locRec.location_code}`, 'ok');
       }
       flash('ok');
-      // Lands on the item row with the receipt still open, or on the receipt
-      // row once it has closed - either way the next scan has a home.
-      render();
+      // The unlock render lives in the finally - single exit, see below.
     } catch (err) {
       console.error('[MalpaRecv] checkin failed:', err);
       Audio.chime('error');
-      Voice.error('Check in failed');
       if (navigator.vibrate) navigator.vibrate([60, 30, 60]);
       State.busy = null;
-      // 1087 = bin already holds a different item and is flagged single-item.
-      State.err = 'Check in failed: ' + err.message + (err.c7Code === 1087
-        ? ' - this bin will not take a second item. Use the pencil to pick another.'
-        : ' - nothing was received.');
-      render();
+      if (err.indeterminate) {
+        // An over-receive that errored. We cannot tell from open_quantity
+        // whether it landed, and retrying could double it, so say so plainly.
+        // Tear the line down as well: leaving the check-digit row up and focused
+        // means one more pull of the same trigger re-posts the very write we
+        // just refused to guess about. Make them re-scan the item deliberately.
+        State.cur = null;
+        State.err = 'Check in may or may not have been recorded: ' + err.message +
+          ' - close and reopen History to check before receiving this again.';
+      } else {
+        // 1087 = bin already holds a different item and is flagged single-item.
+        State.err = 'Check in failed: ' + err.message + (err.c7Code === 1087
+          ? ' - this bin will not take a second item. Use the pencil to pick another.'
+          : ' - nothing was received.');
+      }
+      // An open History panel predates this attempt, and the indeterminate
+      // banner above sends the operator straight to it. It must not be allowed
+      // to answer "Nothing booked against this receipt yet" about a write whose
+      // outcome we do not know. Orphan any in-flight fetch and mark it stale.
+      // Only for the indeterminate case: a deterministic refusal (1087, session
+      // expiry) wrote nothing, so the panel on screen is still accurate and
+      // replacing a correct table with a warning would just be noise.
+      if (err.indeterminate && State.logOpen) {
+        _logReq++;
+        State.logBusy = false;
+        State.logErr  = 'History is out of date after a failed check in - ' +
+                        'close and reopen History to reload it.';
+      }
     } finally {
+      // SINGLE EXIT. render() re-asserts the input lock whenever a write is in
+      // flight, and nothing else re-renders afterwards, so the latch must be
+      // dropped and the form repainted on every possible path - including a
+      // throw inside the catch block. Getting this wrong hands back a fully
+      // disabled form (scan catcher included) and bricks the handheld.
       _writeInFlight = false;
+      try {
+        render();
+      } catch (e) {
+        // Last line of defence. If the repaint itself fails, the DOM still
+        // carries the write lock, so hand the inputs back by hand rather than
+        // leaving the operator with a dead screen.
+        console.error('[MalpaRecv] render after checkin:', e);
+        document.querySelectorAll('#mrc-root input, #mrc-root select, #mrc-root button')
+          .forEach(el => { el.disabled = false; });
+      }
     }
   }
 
-  async function reloadDetails() {
+  // Re-read the receipt from Canary7.
+  //
+  // The header is the only trustworthy source of open_quantity once more than
+  // one operator is working the same receipt: local arithmetic only ever knew
+  // about check-ins made on THIS handheld, so the lines-completed and units-open
+  // figures drifted as soon as a colleague received anything. Called after every
+  // check-and-put so the view is live.
+  //
+  // Returns { ok, closed }. C7 answers get-by-num with a 404 once a receipt has
+  // nothing left to check in, so notFound means closed rather than an error.
+  async function refreshReceipt() {
+    if (!State.receiptId) return { ok: false, closed: false };
     try {
       const header = await fetchReceiptHeader(State.receiptId);
-      if (!header) { State.details = []; return; }
-      State.header = header;
+      if (!header) return { ok: true, closed: true };
+      State.header  = header;
       State.details = (header.receiptDetails || []).map(d => ({ ...d }));
-    } catch (e) { console.warn('[MalpaRecv] reloadDetails:', e.message); }
+      return { ok: true, closed: openUnits() <= 0 };
+    } catch (e) {
+      if (e.notFound) return { ok: true, closed: true };
+      console.warn('[MalpaRecv] refreshReceipt:', e.message);
+      return { ok: false, closed: false };
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -1962,7 +2373,6 @@
     detachViewportWatch();
     if (R._panelObs) { R._panelObs.disconnect(); R._panelObs = null; }
     if (R._visTimer) { clearInterval(R._visTimer); R._visTimer = null; }
-    Voice.cancel();
 
     if (!R._sidebarWasMinimized) document.body.classList.remove('sidebar-minimized');
     if (!R._brandWasMinimized)   document.body.classList.remove('brand-minimized');
