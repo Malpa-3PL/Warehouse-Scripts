@@ -1,11 +1,14 @@
 // ==UserScript==
 // @name         Malpa Pallet Pack
 // @namespace    malpa
-// @version      1.6.2
+// @version      1.7.1
 // @match        https://*.canary7.com/*
+// @homepageURL  https://github.com/zaynnev/malpa3pl
+// @supportURL   https://github.com/zaynnev/malpa3pl/issues
 // @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-palletpack.user.js
 // @downloadURL  https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-palletpack.user.js
 // @grant        none
+// @run-at       document-idle
 // ==/UserScript==
 
 /*
@@ -35,11 +38,97 @@
  *  Scaffolding lifted from Malpa Pick v4.8.9 (session/nav/focus/audio) and
  *  Malpa Pack v3.3.78 (APIQueue + create/move/pack-short-v2/close call shapes).
  *
- *  v1.2.3 — Shell now uses Malpa Pick's native tab-pane model: the view is injected
- *  as a real .tab-pane inside C7's div.tab-content (not a fixed overlay), so it fills
- *  the content area automatically and reflows when the sidebar collapses. Height is
- *  measured in JS (measureHeight); width is handled by C7's own flow. Removes the old
- *  positionRoot / tab-poll / mutation-observer overlay machinery.
+ *  v1.2.3 — Shell is a fixed overlay pinned to C7's content area. We never reparent or
+ *  restyle C7's own chrome, so its tabs cannot break.
+ *
+ *  ------------------------------------------------------------------------------
+ *  v1.7.1 — three field defects fixed (v1.7.0), then hardened after an independent code
+ *  review (v1.7.1). v1.7.0 was never released; 1.7.1 is the first build of this work to
+ *  reach the fleet. Each root cause was reproduced in the code and the API behaviour
+ *  behind it re-probed live (warehouse 10, read-only) before patching.
+ *
+ *  (1) OPENED IN A SQUEEZED RIGHT-HAND COLUMN until the operator tapped the tab.
+ *      positionRoot() measured `.sidebar`'s right edge at the exact moment the operator
+ *      tapped the sidebar launcher - i.e. while the drawer was still OPEN and overlaying
+ *      the content - and pinned `left` to it (~62% of a TC51 screen), leaving `right:0`.
+ *      Nothing re-measured afterwards: the only MutationObserver watched <body class>,
+ *      and C7 collapses the drawer by toggling a class on the sidebar itself, so the
+ *      stale `left` survived until a tab-chip tap happened to re-run positionRoot -
+ *      exactly the reported workaround.
+ *      Fix: measure C7's TAB BAR, then div.tab-content, and only fall back to the
+ *      sidebar. Both sit INSIDE the content area, so their left edge IS the content's
+ *      left edge in either layout: a docked sidebar pushes them, an overlaying drawer
+ *      does not. A sanity gate rejects any measurement that would leave the panel under
+ *      60% of the viewport or under 280px; a settle schedule re-measures while the
+ *      drawer animates; observers now watch the sidebar element, the tab bar,
+ *      <html>/<body> classes, transitionend and visualViewport.
+ *
+ *  (2) "SESSION EXPIRED" WHILE THE SESSION WAS DEMONSTRABLY ALIVE, mostly on
+ *      "View scanned". That screen is the only one that calls the item lookup on a
+ *      DIFFERENT host - the general microservice at malpa.canary7.com/general/... -
+ *      and ANY 401 from it ran _showSessionExpired(), whose Dismiss then wiped the
+ *      operator's entire blind scan, while every packing call on stgauth kept working.
+ *      Two amplifiers: C7 intermittently answers a rotating JWT with HTTP 500
+ *      {"message":"jwt expired"} (re-confirmed live - the same GET failed twice, then
+ *      succeeded unchanged), and Angular rotates the token silently, so a call in
+ *      flight across a rotation draws a 401 that means nothing.
+ *      Fix: the barcode lookup now uses `configuration/item&reference=` on the SAME
+ *      monolith base every other call already authenticates against, with the
+ *      microservice kept only as a fallback. Auth failures are classified in ONE place:
+ *      retry once if the token rotated mid-flight, then PROBE the API before claiming
+ *      expiry, and never let a non-critical lookup raise the modal at all. The sentinel
+ *      is now err.code === 'SESSION_EXPIRED' (a message-string test and an
+ *      err.status === 401 test disagreed, so a queued 401 was retried three times
+ *      behind an already-visible modal). Dismiss no longer destroys the scan: nothing
+ *      is committed until Finish, so the local cache stays valid across a re-login.
+ *
+ *  (3) AN OFF-SHIPMENT OUTER COUNTED AS 1, NOT 48. Unexpected barcodes were tallied as
+ *      raw scan events because only the shipment's own UOMs were indexed. They are now
+ *      resolved (deduped, one call per distinct barcode, fire-and-forget so the scan
+ *      path stays synchronous) to the exact UOM whose reference matches, and counted
+ *      scans x factor. This also CLOSES A BLIND-VERIFICATION LEAK: an expected outer
+ *      moved the units pill by 48 while an unexpected one moved it by 1, which told the
+ *      operator they had scanned the wrong thing.
+ *
+ *  Live probes behind this build (read-only, warehouse 10):
+ *    GET index.php?r=configuration/item&reference=<barcode>
+ *        &expand=itemUnitOfMeasures.unitOfMeasure,itemUnitOfMeasures.itemUnitOfMeasureReference
+ *      -> 200 [{ id, item_code, description, itemUnitOfMeasures:[{ id, factor,
+ *              unitOfMeasure:{name}, itemUnitOfMeasureReference:[{reference}] }] }]
+ *      -> ARSBSRDSP resolves Each/1, Inner/6, Outer/48.
+ *      -> The reference match is EXACT (a truncated barcode returns []), unlike
+ *         configuration/location, which prefix-matches.
+ *      -> An unknown reference returns 200 [].
+ *      -> Some references carry dirty quoting, so both sides are normalised (quotes and
+ *         whitespace stripped, upper-cased) before comparison.
+ *    index.php?r=item/item does NOT exist on the monolith (Yii InvalidRouteException);
+ *      configuration/item is the route.
+ *
+ *  Hardening added in the 1.7.1 review round, each with a regression test:
+ *    - The session-expiry "already showing?" test is the DOM, not a boolean. A boolean
+ *      survived the next render()'s innerHTML rewrite and latched ON forever, after
+ *      which no expiry could ever be reported again. initData() now recognises the
+ *      sentinel instead of rendering over its own modal.
+ *    - An expiry during commit no longer strands the operator on a spinner whose X had
+ *      no listener (renderCommitting never called wireHeader) — it returns to the scan
+ *      screen with the closed containers intact.
+ *    - The retry queue now retries ONLY transport failures and gateway codes
+ *      (408/429/502/503/504). Canary7 delivers business rejections as HTTP 500 with a
+ *      numeric code; retrying one re-fires a mutation against live stock.
+ *    - The barcode lookup sends the RAW scanned string (the reference match is exact,
+ *      so upper-casing it could miss), and caches on the normalised key. A lookup that
+ *      errors is capped at 2 attempts instead of re-firing two hosts on every scan.
+ *    - The units pill is repainted on the same fixed delay for a hit and a miss, so a
+ *      pill that visibly self-corrects cannot become the new tell (see
+ *      scheduleScanMetaUpdate).
+ *    - Closing a container counts unexpected units in its empty-box guard, so the
+ *      refusal message can no longer contradict the pill and reveal a bad box.
+ *    - barcodeIndex keeps the EXACT code authoritative and the normalised form as a
+ *      weak alias, so two items whose codes differ only by whitespace can never
+ *      collapse onto one key and credit the wrong stock.
+ *    - wireReposition() unwires first (openUI is reachable again if Angular removes our
+ *      root); transitionend is filtered to the drawer itself; the measurement gates use
+ *      the LAYOUT viewport so the panel does not jump when the soft keyboard opens.
  * ═══════════════════════════════════════════════════════════════════════════════
  */
 
@@ -54,6 +143,7 @@
   // malpa.canary7.com is a static Angular app (S3/CloudFront — calling index.php
   // there returns an XML AccessDenied 403); the Canary7 API itself is served from
   // stgauth.canary7.com, which is what both proven sibling scripts call.
+  const VERSION          = '1.7.1';   // keep in step with @version or the fleet won't update
   const API_BASE         = 'https://stgauth.canary7.com/index.php?r=';
   const WAREHOUSE_ID     = 10;      // guide §5 — HAR shows 10; CONFIRM for production
   const PACK_LOCATION_ID = 72037;   // guide §3 D5 / §5 — packing/close location (code WDD-02); per-station constant, CONFIRM
@@ -72,12 +162,16 @@
   // 1. AUTH + API LAYER  (copied from Pick §1)
   // ===========================================================================
 
+  // Strip a Bearer prefix and JSON quoting before use: a value stored as `"eyJ..."`
+  // is sent as `Bearer "eyJ..."` and draws a 401 that looks exactly like an expiry.
   function getToken() {
     for (const store of [localStorage, sessionStorage]) {
       try {
         for (const key of ['access_token', 'token', 'id_token', 'auth_token']) {
           const v = store.getItem(key);
-          if (v && v.length > 20) return v;
+          if (v && v.length > 20) {
+            return v.trim().replace(/^Bearer\s+/i, '').replace(/^"|"$/g, '');
+          }
         }
       } catch (_) {}
     }
@@ -140,53 +234,165 @@
     }
   }
 
-  async function apiGet(path) {
-    await waitForSession();
-    const res = await fetch(API_BASE + path, { method: 'GET', headers: mkHeaders() });
-    if (res.status === 401) { _showSessionExpired(); throw new Error('Session expired'); }
-    if (!res.ok) {
-      const body = await res.json().catch(() => ({}));
-      const err = new Error(body.message || `API error ${res.status}`);
-      err.status = res.status;
-      throw err;
-    }
-    return res.json();
+  // ── AUTH FAILURE CLASSIFICATION (v1.7.0) ──────────────────────────────────
+  // A 401 from Canary7 is a QUESTION, not an answer. Two non-expiry causes are
+  // routine on the floor and both used to raise the expiry modal:
+  //   • Angular rotates the access token in the background. A call already in
+  //     flight across the rotation returns 401 while the next call succeeds.
+  //   • The monolith intermittently answers with HTTP 500 {"message":"jwt expired"}
+  //     and then serves the identical request unchanged seconds later (re-confirmed
+  //     live while preparing this build).
+  // So: retry once if the token moved, then ASK the API whether the session is dead,
+  // and only then tell the operator it is.
+  function _isAuthFailure(status, body) {
+    if (status === 401) return true;
+    const m = String((body && (body.message || body.error)) || '');
+    return status >= 500 && /jwt|token|unauthor/i.test(m) && /expire|invalid|missing/i.test(m);
   }
 
-  async function apiPost(path, data) {
-    await waitForSession();
-    const res = await fetch(API_BASE + path, {
-      method: 'POST', headers: mkHeaders(), body: JSON.stringify(data),
+  function _mkError(status, body, fallback) {
+    const raw = (body && (body.message || body.error));
+    const err = new Error(typeof raw === 'string' && raw ? raw : (fallback || `API error ${status}`));
+    err.status = status;
+    err.body = body;
+    return err;
+  }
+
+  // The sentinel. Test err.code — NEVER err.message (the old message-string test and
+  // the queue's err.status === 401 test disagreed, so a queued 401 was retried three
+  // times behind an already-visible modal).
+  function _sessionExpiredError(status) {
+    const err = new Error('Session expired');
+    err.code = 'SESSION_EXPIRED';
+    err.status = status || 401;
+    return err;
+  }
+  const isSessionExpired = (err) => !!err && err.code === 'SESSION_EXPIRED';
+
+  // Cheap authenticated read whose only job is to answer "is the session really
+  // dead?". Single-flight, verdict cached 5s so a burst of 401s asks once.
+  // A network failure is NOT an expiry — it returns alive, so a flaky wifi moment
+  // never costs the operator their scan.
+  let _aliveProbe = null, _aliveVerdict = null, _aliveAt = 0, _authFailStreak = 0;
+  function sessionIsAlive() {
+    const now = Date.now();
+    // The cache exists to stop a burst of concurrent 401s probing N times — and the
+    // single-flight promise below already collapses a truly concurrent burst, so the
+    // cache only ever saves a SEQUENTIAL repeat. It must not outlive its usefulness: a
+    // second consecutive auth failure means the last verdict is suspect, so re-probe
+    // rather than keep reporting a dead session as a transient blip. The streak is
+    // cleared by any successful call and by dismissing the banner.
+    if (_authFailStreak < 2 && _aliveVerdict !== null && now - _aliveAt < 5000) {
+      return Promise.resolve(_aliveVerdict);
+    }
+    if (_aliveProbe) return _aliveProbe;
+    _aliveProbe = (async () => {
+      try {
+        const res = await fetch(API_BASE + 'configuration/container-type&per-page=1&page=1',
+                                { method: 'GET', headers: mkHeaders() });
+        if (res.ok) return true;
+        const body = await res.json().catch(() => ({}));
+        return !_isAuthFailure(res.status, body);
+      } catch (_) {
+        return true;
+      }
+    })().then((v) => {
+      _aliveVerdict = v; _aliveAt = Date.now(); _aliveProbe = null;
+      LOG('session probe:', v ? 'alive' : 'dead');
+      return v;
     });
-    if (res.status === 401) { _showSessionExpired(); throw new Error('Session expired'); }
-    if (!res.ok) {
-      const body = await res.json().catch(() => ({}));
-      const err = new Error(body.message || `API error ${res.status}`);
-      err.status = res.status;
+    return _aliveProbe;
+  }
+  // Force the next auth failure to re-probe (used on dismiss, and by the harness).
+  function _resetAliveProbe() { _aliveVerdict = null; _aliveAt = 0; _authFailStreak = 0; }
+
+  // The single door every Canary7 call goes through.
+  //   critical:false → a nice-to-have read (the barcode lookup). It may fail, but it
+  //                    must NEVER put a session modal over the operator's screen.
+  async function apiFetch(url, init = {}, opts = {}) {
+    const critical = opts.critical !== false;
+    const label = opts.label || url;
+    await waitForSession();
+    const tokenBefore = getToken();
+
+    let res = await fetch(url, { ...init, headers: mkHeaders(init.headers || {}) });
+    if (res.ok) { _authFailStreak = 0; return res.json().catch(() => ({})); }
+
+    let body = await res.json().catch(() => ({}));
+    if (!_isAuthFailure(res.status, body)) throw _mkError(res.status, body);
+    _authFailStreak++;
+
+    // 1. Did Angular rotate the token underneath us? Then this 401 means nothing.
+    const tokenAfter = getToken();
+    if (tokenAfter && tokenAfter !== tokenBefore) {
+      LOG('auth failure with a rotated token — retrying once:', label);
+      res = await fetch(url, { ...init, headers: mkHeaders(init.headers || {}) });
+      if (res.ok) { _authFailStreak = 0; return res.json().catch(() => ({})); }
+      body = await res.json().catch(() => ({}));
+      if (!_isAuthFailure(res.status, body)) throw _mkError(res.status, body);
+    }
+
+    // 2. Ask the API before claiming the session died.
+    const alive = await sessionIsAlive();
+    if (alive) {
+      WARN('auth-shaped failure but the session is alive — transient:',
+           res.status, (body && body.message) || '', label);
+      const err = _mkError(res.status, body, 'Canary7 rejected that call. Try again.');
+      err.code = 'AUTH_BLIP';
       throw err;
     }
-    return res.json();
+    if (critical) _showSessionExpired();
+    throw _sessionExpiredError(res.status);
   }
 
-  // Session expiry — overlay whatever screen is active, reset to profile select
-  let _sessionExpiredShown = false;
+  const apiGet = (path, opts) =>
+    apiFetch(API_BASE + path, { method: 'GET' }, { label: path, ...(opts || {}) });
+  const apiPost = (path, data, opts) =>
+    apiFetch(API_BASE + path, { method: 'POST', body: JSON.stringify(data) },
+             { label: path, ...(opts || {}) });
+
+  // Session expiry — only reachable once sessionIsAlive() has confirmed the session
+  // is genuinely dead. Dismiss no longer throws the scan away: NOTHING is committed
+  // until Finish, the blind cache is entirely local, and commit re-resolves the live
+  // packing context anyway — so after re-authenticating the operator can carry on
+  // exactly where they were. Losing a part-scanned pallet to a transient 401 was the
+  // worst part of this bug.
+  // The "is it already up?" test is the DOM itself, never a boolean: every render()
+  // rewrites root.innerHTML and would destroy the banner while leaving a boolean latched
+  // true — after which no expiry could ever be reported again and calls would fail silently.
   function _showSessionExpired() {
-    if (_sessionExpiredShown) return;
-    _sessionExpiredShown = true;
-    const root = document.getElementById('mpp-root');
-    if (!root) { _sessionExpiredShown = false; return; }
+    // Only report while Pallet Pack is actually ON SCREEN. The 600ms boot prefetch runs
+    // with no UI at all, and a backgrounded session leaves #mpp-root in the DOM at
+    // display:none — in both cases a body-mounted, inset:0 banner would cover Canary7's
+    // own screen for something the operator is not currently doing. The next call they
+    // make raises it again.
+    const _r = document.getElementById('mpp-root');
+    if (!_r || _r.style.display === 'none') return;
+    if (document.getElementById('mpp-session-dismiss')) return;
+    // Mounted on <body>, NOT inside #mpp-root: every render() rewrites root.innerHTML,
+    // which used to destroy this banner the instant any screen repainted. It is
+    // position:fixed anyway, so it lands in the same place and carries its own copy of
+    // the design tokens (see .mpp-session-overlay in the CSS).
     const banner = document.createElement('div');
-    banner.className = 'mpp-overlay';
+    banner.className = 'mpp-overlay mpp-session-overlay';
     banner.innerHTML = `
       <div class="mpp-modal" style="text-align:center">
-        <div class="mpp-modal-title" style="text-align:center">🔒 Session Expired</div>
-        <div class="mpp-note">Your C7 session has timed out.<br>Log back in to continue packing.</div>
-        <button id="mpp-session-dismiss" class="mpp-btn mpp-btn-primary" style="margin-top:4px">Dismiss</button>
+        <div class="mpp-modal-title" style="text-align:center">🔒 Session expired</div>
+        <div class="mpp-note">Canary7 signed this device out.<br>
+          Log back in on another tab, then carry on — <b>nothing has been committed
+          and your scans are still here</b>.</div>
+        <button id="mpp-session-dismiss" class="mpp-btn mpp-btn-primary" style="margin-top:4px">Keep my scans</button>
+        <button id="mpp-session-reset" class="mpp-btn mpp-btn-ghost">Start over</button>
       </div>`;
-    root.appendChild(banner);
+    document.body.appendChild(banner);
+    const dismiss = () => { banner.remove(); _resetAliveProbe(); };
     document.getElementById('mpp-session-dismiss')?.addEventListener('click', () => {
-      banner.remove();
-      _sessionExpiredShown = false;
+      dismiss();
+      setTimeout(_refocusScanInput, 60);
+    });
+    document.getElementById('mpp-session-reset')?.addEventListener('click', () => {
+      if (!confirmDiscardC7Work('Starting over')) return;
+      dismiss();
       resetAll();
       renderProfileSelect();
     });
@@ -227,12 +433,18 @@
         task.onSuccess && task.onSuccess(result);
         task.resolve(result);
       } catch (err) {
-        // job/"null"/completePacking errors are not retryable (guide §2.3 / §15)
-        const nonRetryable = err.message && (
-          err.message.includes('completePacking') ||
-          err.message.includes('packShortV2') ||
-          err.status === 401
-        );
+        // Canary7 delivers BUSINESS rejections as HTTP 500 with a numeric code — they
+        // are deterministic refusals, not transient faults, and retrying one re-fires a
+        // mutation against live stock. So: retry ONLY what can plausibly succeed
+        // unchanged — a transport failure (fetch threw, no status) or a gateway blip.
+        // Everything with a definite HTTP status is a decision, and decisions stand.
+        const s = err.status;
+        const transport = s === undefined || s === null;
+        const gateway = s === 502 || s === 503 || s === 504 || s === 408 || s === 429;
+        const nonRetryable =
+          err.code === 'SESSION_EXPIRED' ||
+          err.code === 'AUTH_BLIP' ||
+          (!transport && !gateway);
         task.attempt++;
         if (!nonRetryable && task.attempt < this._maxRetries) {
           const delay = 500 * Math.pow(2, task.attempt - 1);
@@ -276,6 +488,9 @@
       seq,
       containerNo: null,
       containerTypeId: null,
+      _c7Id: null,            // C7 container id, once created (commit ledger)
+      _c7ContainerNo: null,   // the number C7 actually accepted
+      _c7Packed: false,       // created AND closed — never touch it again
       lines: new Map(),          // item_id -> base units placed in THIS box
       unexpected: new Map(),     // UPPER(barcode) -> count of unexpected scans in THIS box
       weight: null, length: null, width: null, height: null,
@@ -287,8 +502,9 @@
     shipmentHeaderId: null,
     items: new Map(),            // item_id -> { itemCode, description, requiredBase, scannedBase, unitWeight }
     barcodeIndex: new Map(),     // UPPER(barcode) -> { itemId, factor, uomId }
-    unexpected: new Map(),       // UPPER(barcode) -> count
-    unexpectedResolved: new Map(), // UPPER(barcode) -> { itemCode, description } | { unknown:true }
+    unexpected: new Map(),       // normRef(barcode) -> scan count
+    unexpectedRaw: new Map(),    // normRef(barcode) -> the exact string that was scanned
+    unexpectedResolved: new Map(), // normRef(barcode) -> { itemCode, description, factor, uomName } | { unknown:true }
     containers: [],              // finalised Container boundaries
     current: null,               // the box being filled now
 
@@ -298,15 +514,18 @@
       this.items = new Map();
       this.barcodeIndex = new Map();
       this.unexpected = new Map();
+      this.unexpectedRaw = new Map();
       this.unexpectedResolved = new Map();
+      _unexpectedAttempts.clear();   // a new shipment gets a clean slate on the network
       this.containers = [];
       this.current = newContainer(1);
     },
-    // Reset only scanned state (guide §13) — keep item requirements + barcodeIndex
+    // Reset only scanned state (guide §13) — keep item requirements + barcodeIndex.
+    // unexpectedResolved is a pure barcode→UOM fact, not scan state, so it is kept:
+    // re-scanning the same wrong carton must not re-query C7.
     resetScans() {
       for (const it of this.items.values()) it.scannedBase = 0;
       this.unexpected = new Map();
-      this.unexpectedResolved = new Map();
       this.containers = [];
       this.current = newContainer(1);
     },
@@ -394,6 +613,12 @@
 
   function num(v) { const n = Number(v); return Number.isFinite(n) ? n : 0; }
 
+  // Barcode/reference normalisation — ONE definition, used on both sides of every
+  // comparison. C7's own reference rows carry dirty quoting (a live row for
+  // ARSBSRDSP reads `"""0129351262016618"`) and a scanner can deliver stray
+  // whitespace, so neither side is trusted raw.
+  function normRef(v) { return String(v == null ? '' : v).replace(/["'\s]/g, '').toUpperCase(); }
+
   // Longest-prefix container-type match (guide §14)
   function containerTypeFromNumber(no) {
     const up = String(no || '').trim().toUpperCase();
@@ -436,6 +661,8 @@
     } catch (err) {
       WARN('initData failed:', err.message);
       _initStarted = false;
+      // On an expiry the modal is already up — re-rendering here would wipe it.
+      if (isSessionExpired(err)) return;
       if (State.screen === 'PROFILE') renderProfileSelect('Could not load profiles: ' + err.message);
     }
   }
@@ -537,22 +764,48 @@
       }
       entry.requiredBase += num(ln.quantity);
 
-      // Build barcodeIndex from UOM references (guide §8)
+      // Build barcodeIndex from UOM references (guide §8).
+      // TWO keys per barcode. The EXACT form (trim + upper) is authoritative. The
+      // normalised form — quotes and whitespace stripped, which is what makes C7's
+      // dirty reference rows scannable at all — is only ever an ALIAS: it may fill a
+      // free slot, it never displaces anything, and a real code always evicts an alias.
+      // Without that rule two different items whose codes differ only by whitespace
+      // would collapse onto one key and a scan would credit the wrong stock.
+      // `weak` = fill a free slot or displace an alias, never displace a real entry —
+      // even one belonging to the SAME item. Some clients use the EAN as the SKU, so the
+      // bare item_code can BE one of that item's own UOM references; overwriting it at
+      // factor 1 would silently count an Outer of 24 as a single unit.
+      const indexBarcode = (rawCode, entry, weak) => {
+        const exact = String(rawCode == null ? '' : rawCode).trim().toUpperCase();
+        if (exact) {
+          const prev = Cache.barcodeIndex.get(exact);
+          if (!prev || prev._alias || (!weak && prev.itemId === entry.itemId)) {
+            Cache.barcodeIndex.set(exact, entry);
+          } else if (weak && prev.itemId !== entry.itemId) {
+            // Not a weak-write no-op: two different items really do claim this code.
+            WARN('barcode claimed by two items:', exact, '->', prev.itemId, 'and', entry.itemId,
+                 '— keeping the first; scans of it need checking by hand.');
+          } else if (!weak) {
+            WARN('barcode claimed by two items:', exact, '->', prev.itemId, 'and', entry.itemId,
+                 '— keeping the first; scans of it need checking by hand.');
+          }
+        }
+        const alias = normRef(rawCode);
+        if (alias && alias !== exact && !Cache.barcodeIndex.has(alias)) {
+          Cache.barcodeIndex.set(alias, { ...entry, _alias: true });
+        }
+      };
       for (const u of uoms) {
         const factor = num(u.factor) || 1;
         const uomId = u.id;
         for (const ref of (u.itemUnitOfMeasureReference || [])) {
-          const code = (ref.reference || '').trim().toUpperCase();
-          if (code) Cache.barcodeIndex.set(code, { itemId, factor, uomId });
+          indexBarcode(ref.reference, { itemId, factor, uomId });
         }
       }
       // Bare item_code → factor 1, UNLESS profile is Only-Accept-Reference (guide §2.3)
       if (!onlyRef && item.item_code) {
-        const code = String(item.item_code).trim().toUpperCase();
-        if (!Cache.barcodeIndex.has(code)) {
-          const baseUom = uoms.find(u => (num(u.factor) || 1) === 1) || uoms[0];
-          Cache.barcodeIndex.set(code, { itemId, factor: 1, uomId: baseUom?.id });
-        }
+        const baseUom = uoms.find(u => (num(u.factor) || 1) === 1) || uoms[0];
+        indexBarcode(item.item_code, { itemId, factor: 1, uomId: baseUom?.id }, true);
       }
     }
 
@@ -578,49 +831,134 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 7b. BARCODE → ITEM LOOKUP  (for unexpected scans — display the real item code
-  //     instead of the raw barcode). Uses the C7 item endpoint with ?reference=,
-  //     which resolves any UPC/EAN/reference to its item. This is READ-ONLY and is
-  //     only ever called when building the mismatch / view-scanned report — never
-  //     during scanning, so it can't leak correctness to the blind operator.
+  // 7b. BARCODE → ITEM LOOKUP  (for unexpected scans: the real item code instead of a
+  //     raw barcode, AND the factor of the UOM that barcode names). READ-ONLY.
+  //     Since v1.7.0 it IS called from the scan path — fire-and-forget, deduped to one
+  //     call per distinct barcode. That does not leak correctness: the scan handler
+  //     stays synchronous, the chime/vibration/flash are byte-identical for a hit and
+  //     a miss, and the only thing the answer changes is a unit tally that is repainted
+  //     on the same delay either way (see scheduleScanMetaUpdate). No write of any kind
+  //     fires before Finish.
   // ---------------------------------------------------------------------------
-  // NB: served from the app origin (malpa.canary7.com), a REST path — NOT the
-  // stgauth index.php?r= base the packing calls use. Same auth headers apply.
-  const ITEM_LOOKUP_BASE = 'https://malpa.canary7.com/general/api/wms/v1/item';
+  // The expand that carries what we need: the item AND every UOM with its factor and
+  // its references, so we can tell WHICH UOM the scanned barcode belongs to.
+  const ITEM_LOOKUP_QS =
+    'expand=itemUnitOfMeasures.unitOfMeasure,itemUnitOfMeasures.itemUnitOfMeasureReference' +
+    '&fields=id,item_code,description,itemUnitOfMeasures.id,itemUnitOfMeasures.factor,' +
+    'itemUnitOfMeasures.unitOfMeasure.name,itemUnitOfMeasures.itemUnitOfMeasureReference.reference' +
+    '&per-page=5&page=1';
+
+  // PRIMARY: the monolith — the same base, and the same credentials, that every
+  // packing call in this script already uses successfully.
+  //
+  // The previous build asked the `general` microservice on the app origin instead, and
+  // a 401 from that SECOND host called _showSessionExpired() — which is why "View
+  // scanned" could throw a session-expired modal over a session that was demonstrably
+  // alive, and then wipe the operator's scan. Probed live before switching:
+  //   index.php?r=item/item          → Yii InvalidRouteException (does not exist)
+  //   index.php?r=configuration/item&reference=… → 200, item + UOM factors, exact
+  //                                                match, unknown reference → [].
+  // FALLBACK: the microservice, retained because it does answer this query. It is sent
+  // the same expand; if it ever declines to return itemUnitOfMeasures the lookup still
+  // yields the item code and simply degrades to factor 1 — the pre-1.7.0 behaviour,
+  // never a wrong multiplier.
+  // BOTH are critical:false — a cosmetic lookup must never take the operator's screen.
+  const ITEM_LOOKUP_MICRO = 'https://malpa.canary7.com/general/api/wms/v1/item';
+
   async function lookupItemByReference(barcode) {
-    await waitForSession();
-    const url = ITEM_LOOKUP_BASE +
-      '?expand=company,item_group&per-page=5&page=1&sort=item_code' +
-      '&fields=id,item_code,description,long_description,status,commodity_code,company.company_code,item_group.name' +
-      '&reference=' + encodeURIComponent(barcode);
-    const res = await fetch(url, { method: 'GET', headers: mkHeaders() });
-    if (res.status === 401) { _showSessionExpired(); throw new Error('Session expired'); }
-    if (!res.ok) throw new Error('Item lookup error ' + res.status);
-    const data = await res.json();
+    const ref = encodeURIComponent(barcode);
+    const opts = { critical: false, label: 'item-lookup' };
+    let data;
+    try {
+      data = await apiFetch(`${API_BASE}configuration/item&reference=${ref}&${ITEM_LOOKUP_QS}`,
+                            { method: 'GET' }, opts);
+    } catch (e) {
+      if (isSessionExpired(e)) throw e;          // no point asking the second host
+      WARN('monolith item lookup failed:', e.status || '', e.message, '— trying the microservice');
+      data = await apiFetch(`${ITEM_LOOKUP_MICRO}?reference=${ref}&${ITEM_LOOKUP_QS}`,
+                            { method: 'GET' }, opts);
+    }
     const arr = Array.isArray(data) ? data : (data?.items || []);
     return arr[0] || null;
   }
-  const _unexpectedLookups = new Map();   // UPPER(barcode) -> in-flight Promise (dedupe)
+
+  // Which UOM does this barcode belong to? That, not the item, is what decides
+  // whether one scan is 1 unit or 48 (defect 3).
+  function uomForReference(item, barcode) {
+    const want = normRef(barcode);
+    for (const u of (item?.itemUnitOfMeasures || [])) {
+      for (const r of (u.itemUnitOfMeasureReference || [])) {
+        if (normRef(r.reference) === want) {
+          return { factor: num(u.factor) || 1, uomName: u.unitOfMeasure?.name || '' };
+        }
+      }
+    }
+    // Resolved to the item but not to a UOM row (e.g. it matched on item_code).
+    // Fall back to the base UOM — one each. Never guess a multiplier.
+    const base = (item?.itemUnitOfMeasures || []).find(u => (num(u.factor) || 1) === 1);
+    return { factor: 1, uomName: base?.unitOfMeasure?.name || '' };
+  }
+  const _unexpectedLookups = new Map();   // normRef(barcode) -> in-flight Promise (dedupe)
+  const _unexpectedAttempts = new Map();  // normRef(barcode) -> failed attempts so far
+  const MAX_LOOKUP_ATTEMPTS = 2;
+  // `barcode` is the RAW scanned string. C7's reference match is EXACT (probed), so the
+  // query must carry exactly what came off the scanner — normRef upper-cases and strips
+  // characters, which is right for a cache key and wrong for the wire.
   function resolveUnexpected(barcode) {
-    const key = String(barcode || '').toUpperCase();
+    const key = normRef(barcode);
+    if (!key) return Promise.resolve({ unknown: true, factor: 1, uomName: '' });
     if (Cache.unexpectedResolved.has(key)) return Promise.resolve(Cache.unexpectedResolved.get(key));
     if (_unexpectedLookups.has(key)) return _unexpectedLookups.get(key);
-    const p = lookupItemByReference(key)
+    // Give up after a couple of failures rather than re-firing two hosts on every scan
+    // of a barcode C7 cannot resolve — that is a request storm on a degraded network,
+    // right on the scan path.
+    if ((_unexpectedAttempts.get(key) || 0) >= MAX_LOOKUP_ATTEMPTS) {
+      return Promise.resolve({ unknown: true, factor: 1, uomName: '' });
+    }
+    const raw = String(barcode == null ? '' : barcode).trim() || key;
+    const p = lookupItemByReference(raw)
       .then(item => {
+        const uom = uomForReference(item, key);
         const resolved = item
-          ? { itemCode: item.item_code, description: item.description || item.long_description || '' }
-          : { unknown: true };
+          ? { itemCode: item.item_code, description: item.description || item.long_description || '',
+              factor: uom.factor, uomName: uom.uomName }
+          : { unknown: true, factor: 1, uomName: '' };
         Cache.unexpectedResolved.set(key, resolved);
         _unexpectedLookups.delete(key);
+        // Deliberately NO repaint here. The pill is painted once per scan, on a fixed
+        // delay, by scheduleScanMetaUpdate(). A late correction arriving after that
+        // paint would make the number visibly jump 1 -> 48 for a miss and never for a
+        // hit — the animation becomes the tell. A slow lookup therefore leaves the pill
+        // low until the next scan; every screen that matters (View scanned, Close
+        // Container, Finish) reads the Cache directly and is always correct.
         return resolved;
       })
       .catch(err => {
         _unexpectedLookups.delete(key);
-        WARN('barcode lookup failed for', key, '—', err.message);
-        return { unknown: true };   // fall back to showing the raw barcode
+        // An auth failure says nothing about this barcode — don't spend an attempt on it.
+        const authy = isSessionExpired(err) || err.code === 'AUTH_BLIP';
+        if (!authy) _unexpectedAttempts.set(key, (_unexpectedAttempts.get(key) || 0) + 1);
+        WARN('barcode lookup failed for', key, '—', err.message,
+             authy ? '(auth failure — no attempt spent)'
+                   : `(attempt ${_unexpectedAttempts.get(key)}/${MAX_LOOKUP_ATTEMPTS})`);
+        return { unknown: true, factor: 1, uomName: '' };   // show the raw barcode, count 1
       });
     _unexpectedLookups.set(key, p);
     return p;
+  }
+
+  // Units contributed by an unexpected barcode = scans x the factor of ITS UOM.
+  // Until the background lookup lands we count 1 each (exactly what the old build
+  // always did); the tally then corrects itself.
+  function unexpectedFactor(code) {
+    const r = Cache.unexpectedResolved.get(normRef(code));
+    const f = r && num(r.factor);
+    return f > 0 ? f : 1;
+  }
+  function unexpectedUnits(map) {
+    let n = 0;
+    for (const [code, scans] of (map || new Map())) n += scans * unexpectedFactor(code);
+    return n;
   }
   // Patch every unexpected row inside `scope` (a rendered modal): swap the raw
   // barcode label for the resolved item code once the lookup returns. Falls back to
@@ -629,19 +967,44 @@
     if (!scope) return;
     scope.querySelectorAll('[data-unex]').forEach(row => {
       const code = row.getAttribute('data-unex');
+      const scans = num(row.getAttribute('data-unex-n')) || 1;
       const label = row.querySelector('.mpp-unex-label');
-      if (!label) return;
-      resolveUnexpected(code).then(r => {
-        if (!document.contains(label)) return;
-        if (r && !r.unknown && r.itemCode) {
-          label.innerHTML = `<b>${_esc(r.itemCode)}</b>` +
-            (r.description ? ' ' + _esc(r.description) : '') +
-            ` <span class="mpp-vs-uom-f">(not on this shipment)</span>`;
-        } else {
-          label.innerHTML = `${_esc(code)} <span class="mpp-vs-uom-f">(unknown barcode)</span>`;
+      resolveUnexpected(Cache.unexpectedRaw.get(code) || code).then(r => {
+        if (!document.contains(row)) return;
+        if (label) {
+          if (r && !r.unknown && r.itemCode) {
+            label.innerHTML = `<b>${_esc(r.itemCode)}</b>` +
+              (r.description ? ' ' + _esc(r.description) : '') +
+              ` <span class="mpp-vs-uom-f">(not on this shipment)</span>`;
+          } else {
+            label.innerHTML = `${_esc(code)} <span class="mpp-vs-uom-f">(unknown barcode)</span>`;
+          }
         }
+        // The row was painted before the factor was known. Correct the UOM line and
+        // both totals now, so the operator never reads a stale "x1" for an outer.
+        const factor = (r && num(r.factor) > 0) ? num(r.factor) : 1;
+        const units = scans * factor;
+        const line = row.querySelector('.mpp-unex-line');
+        if (line) line.innerHTML = unexpectedLineHTML(scans, factor, r && r.uomName);
+        const total = row.querySelector('.mpp-unex-total');
+        if (total) total.textContent = String(units);
+        const qty = row.querySelector('.mpp-unex-qty');
+        if (qty) qty.textContent = unexpectedQtyText(scans, factor);
       });
     });
+  }
+  // "4 Outers (48 each)" once the factor is known, "x4" while it is not.
+  function unexpectedLineHTML(scans, factor, uomName) {
+    if (factor > 1) {
+      const nm = _esc(_plural(uomName || 'Unit', scans));
+      return `${scans} ${nm} <span class="mpp-vs-uom-f">(${factor} each)</span>`;
+    }
+    return `&times;${scans}`;
+  }
+  function unexpectedQtyText(scans, factor) {
+    return factor > 1
+      ? `unexpected \u00d7${scans} = ${scans * factor} units`
+      : `unexpected \u00d7${scans}`;
   }
 
   // ===========================================================================
@@ -652,10 +1015,14 @@
     if (State.screen === 'SHIPMENT_ENTRY') { onShipmentScan(raw); return; }
     if (State.screen !== 'SCAN') return;
 
-    const code = String(raw || '').trim().toUpperCase();
+    // Exact first, normalised alias second — the same precedence the index was built
+    // with, so an item whose code legitimately contains a space can never be resolved
+    // through another item's alias.
+    const exact = String(raw == null ? '' : raw).trim().toUpperCase();
+    const code = normRef(raw);
     if (!code) return;
 
-    const hit = Cache.barcodeIndex.get(code);
+    const hit = Cache.barcodeIndex.get(exact) || Cache.barcodeIndex.get(code);
     if (hit) {
       const it = Cache.items.get(hit.itemId);
       if (it) it.scannedBase += hit.factor;
@@ -667,12 +1034,21 @@
       // blind, never signal wrong). (guide decision #2)
       Cache.unexpected.set(code, (Cache.unexpected.get(code) || 0) + 1);
       Cache.current.unexpected.set(code, (Cache.current.unexpected.get(code) || 0) + 1);
+      Cache.unexpectedRaw.set(code, String(raw).trim());   // exact string for the wire
+      // Resolve this barcode's real UOM factor in the background — deduped, so one
+      // call per distinct barcode for the life of the shipment. Fire-and-forget: the
+      // scan path stays synchronous and the feedback below is unchanged, so nothing
+      // about it tells the operator whether the scan was expected. It only stops an
+      // off-shipment OUTER being counted as a single unit (defect 3) — and it closes
+      // a blind-verification leak, because the units pill used to jump by 48 for an
+      // expected outer and by 1 for an unexpected one.
+      resolveUnexpected(Cache.unexpectedRaw.get(code));
     }
     // Identical feedback for hit and miss — do NOT leak correctness
     Audio.chime('scan');
     vibrate([30]);
     flashScan();
-    updateScanScreenMeta();
+    scheduleScanMetaUpdate();
   }
 
   // ===========================================================================
@@ -691,19 +1067,136 @@
   // never mutate C7's DOM, there is no tab "bounce" and no blank native menus. The only
   // real teardown is × / Esc → closeUI().
   let _mppRepositionObserver = null;
+  let _mppResizeObserver = null;
+  let _mppSettleTimers = [];
+  let _mppSidebarEl = null;
+  let _mppOnTransitionEnd = null;
 
-  // Pin the overlay to the content area: top = bottom of the C7 tab bar, left = right
-  // edge of the sidebar. Recomputed on show, on resize, and whenever the sidebar
-  // collapses/expands (it toggles a <body> class — watched by a MutationObserver).
+  // ── Where does C7's content area actually start? (v1.7.0) ─────────────────
+  // Measure something INSIDE the content column, never the sidebar. C7's tab bar and
+  // div.tab-content both live in that column, so their LEFT edge is the content's
+  // left edge under either layout: a docked sidebar pushes them across, an overlaying
+  // drawer leaves them where they are.
+  //
+  // The old code measured the sidebar's RIGHT edge — and the one moment it was
+  // guaranteed to measure it wrongly was the moment the operator tapped the sidebar
+  // launcher, because the drawer was still open and covering ~62% of a TC51 screen.
+  // The panel was pinned into the strip left over, and nothing re-measured until a
+  // tab-chip tap happened to call this again. Hence "click the tab to fix it".
+  //
+  // Every candidate must survive a sanity gate: whatever is left has to be a usable
+  // panel (>= 60% of the viewport and >= 280px). An open drawer cannot pass it, which
+  // is the entire point.
+  function measureChrome() {
+    // Gate on the LAYOUT viewport: getBoundingClientRect is in layout coordinates, and
+    // mixing in visualViewport.height made the panel jump the moment the soft keyboard
+    // opened during weight/dimension entry.
+    const de = document.documentElement || {};
+    const vw = Math.round(de.clientWidth || window.innerWidth || 0);
+    const vh = Math.round(de.clientHeight || window.innerHeight || 0);
+    if (!vw || !vh) return { top: 0, left: 0 };
+    const minWidth = Math.max(280, Math.round(vw * 0.6));
+    const sane = (b) => b && b.width > 0 && b.left >= 0 && b.left < vw &&
+                        b.top >= 0 && b.top < vh * 0.5 && (vw - b.left) >= minWidth;
+
+    // (a) The tab bar — the best anchor: it yields the left edge AND the top in one go.
+    const tabBar = document.querySelector('ul.nav.nav-tabs[role="tablist"]');
+    if (tabBar) {
+      const b = tabBar.getBoundingClientRect();
+      if (sane(b) && b.bottom > 0 && b.bottom < vh * 0.5) {
+        return { top: Math.round(b.bottom), left: Math.round(b.left) };
+      }
+      if (sane(b)) return { top: 0, left: Math.round(b.left) };   // bar is tall/wrapped
+    }
+    // (b) The tab-content pane — same column, no bottom edge to reason about.
+    const pane = document.querySelector('div.tab-content');
+    if (pane) {
+      const b = pane.getBoundingClientRect();
+      if (sane(b)) return { top: Math.round(Math.max(0, b.top)), left: Math.round(b.left) };
+    }
+    // (c) Last resort: a DOCKED sidebar, and only if a usable panel remains beside it.
+    const sidebar = document.querySelector('div.sidebar, .sidebar');
+    if (sidebar) {
+      const b = sidebar.getBoundingClientRect();
+      if (b.width > 0 && b.right > 0 && b.right < vw && (vw - b.right) >= minWidth) {
+        return { top: 0, left: Math.round(b.right) };
+      }
+    }
+    // (d) Take the whole viewport. On a handheld, covering C7's header is correct.
+    return { top: 0, left: 0 };
+  }
+
+  // Idempotent: only writes when a value actually changed, so the observers below
+  // cannot thrash layout (and cannot feed themselves).
   function positionRoot() {
     const r = document.getElementById('mpp-root');
     if (!r || r.style.display === 'none') return;
-    const sidebar = document.querySelector('div.sidebar, .sidebar');
-    const tabBar  = document.querySelector('ul.nav.nav-tabs[role="tablist"]');
-    let top = 0, left = 0;
-    if (tabBar)  { const b = tabBar.getBoundingClientRect();  if (b.bottom > 0 && b.bottom < window.innerHeight) top  = Math.round(b.bottom); }
-    if (sidebar) { const b = sidebar.getBoundingClientRect(); if (b.right  > 0 && b.right  < window.innerWidth)  left = Math.round(b.right); }
-    r.style.top = top + 'px'; r.style.left = left + 'px'; r.style.right = '0px'; r.style.bottom = '0px';
+    const m = measureChrome();
+    const top = m.top + 'px', left = m.left + 'px';
+    if (r.style.top !== top) r.style.top = top;
+    if (r.style.left !== left) r.style.left = left;
+    if (r.style.right !== '0px') r.style.right = '0px';
+    if (r.style.bottom !== '0px') r.style.bottom = '0px';
+  }
+
+  // C7's drawer ANIMATES shut and Angular re-lays-out the tab bar a beat after a route
+  // change, so one measurement at open time is never enough. Re-measure across the
+  // settle window. Cheap, because each pass is a no-op unless something moved.
+  function positionRootSettled() {
+    positionRoot();
+    _mppSettleTimers.forEach(clearTimeout);
+    _mppSettleTimers = [60, 160, 320, 600, 1000].map((ms) => setTimeout(positionRoot, ms));
+    if (window.requestAnimationFrame) requestAnimationFrame(positionRoot);
+  }
+
+  // Watch everything that can move the content column. The old build watched only
+  // <body class>; C7 collapses its drawer by re-classing the SIDEBAR, so the one
+  // event that mattered was the one event nobody was listening for.
+  function wireReposition() {
+    unwireReposition();   // idempotent by construction: if #mpp-root was torn out by
+                          // anything other than closeUI(), openUI() lands here again
+    window.addEventListener('resize', positionRootSettled);
+    window.addEventListener('orientationchange', positionRootSettled);
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', positionRoot);
+      window.visualViewport.addEventListener('scroll', positionRoot);
+    }
+    const attrOpts = { attributes: true, attributeFilter: ['class', 'style'] };
+    _mppRepositionObserver = new MutationObserver(() => positionRoot());
+    _mppRepositionObserver.observe(document.body, attrOpts);
+    _mppRepositionObserver.observe(document.documentElement, attrOpts);
+    _mppSidebarEl = document.querySelector('div.sidebar, .sidebar');
+    if (_mppSidebarEl) {
+      _mppRepositionObserver.observe(_mppSidebarEl, attrOpts);
+      // Only the drawer's own transition, not every nav-link hover inside it.
+      _mppOnTransitionEnd = (e) => { if (!e || e.target === _mppSidebarEl) positionRootSettled(); };
+      _mppSidebarEl.addEventListener('transitionend', _mppOnTransitionEnd);
+    }
+    const tabBar = document.querySelector('ul.nav.nav-tabs[role="tablist"]');
+    if (tabBar) _mppRepositionObserver.observe(tabBar, { attributes: true, attributeFilter: ['class', 'style'], childList: true });
+    if (window.ResizeObserver) {
+      _mppResizeObserver = new ResizeObserver(() => positionRoot());
+      try {
+        if (_mppSidebarEl) _mppResizeObserver.observe(_mppSidebarEl);
+        if (tabBar) _mppResizeObserver.observe(tabBar);
+        _mppResizeObserver.observe(document.documentElement);
+      } catch (_) {}
+    }
+  }
+
+  function unwireReposition() {
+    window.removeEventListener('resize', positionRootSettled);
+    window.removeEventListener('orientationchange', positionRootSettled);
+    if (window.visualViewport) {
+      window.visualViewport.removeEventListener('resize', positionRoot);
+      window.visualViewport.removeEventListener('scroll', positionRoot);
+    }
+    _mppSettleTimers.forEach(clearTimeout);
+    _mppSettleTimers = [];
+    if (_mppSidebarEl && _mppOnTransitionEnd) _mppSidebarEl.removeEventListener('transitionend', _mppOnTransitionEnd);
+    _mppSidebarEl = null; _mppOnTransitionEnd = null;
+    if (_mppRepositionObserver) { _mppRepositionObserver.disconnect(); _mppRepositionObserver = null; }
+    if (_mppResizeObserver) { _mppResizeObserver.disconnect(); _mppResizeObserver = null; }
   }
 
   // Ensure our "Pallet Pack" chip is in the C7 tab bar (re-added if Angular re-rendered
@@ -738,7 +1231,9 @@
     const chip = document.getElementById('mpp-tab-li');
     chip?.classList.add('active');
     chip?.querySelector('a.nav-link')?.classList.add('active');
-    positionRoot();
+    // Settled, not single-shot: the sidebar drawer the operator just tapped is still
+    // open and still animating shut at this instant.
+    positionRootSettled();
     setTimeout(_refocusScanInput, 60);
   }
 
@@ -747,6 +1242,7 @@
     const r = document.getElementById('mpp-root');
     if (!r) return;
     r.style.display = 'none';
+    document.querySelector('.mpp-session-overlay')?.remove();   // don't leave it over C7
     const chip = document.getElementById('mpp-tab-li');
     chip?.classList.remove('active');
     chip?.querySelector('a.nav-link')?.classList.remove('active');
@@ -761,9 +1257,7 @@
     document.body.appendChild(overlay);
     ensureTabChip();
     document.addEventListener('keydown', onGlobalKey, true);
-    window.addEventListener('resize', positionRoot);
-    _mppRepositionObserver = new MutationObserver(() => positionRoot());
-    _mppRepositionObserver.observe(document.body, { attributes: true, attributeFilter: ['class'] });
+    wireReposition();
     showPalletPack();
     if (!State.profiles.length) { initData(); renderProfileSelect('Loading profiles…'); }
     else renderProfileSelect();
@@ -771,9 +1265,10 @@
 
   function closeUI() {
     document.removeEventListener('keydown', onGlobalKey, true);
-    window.removeEventListener('resize', positionRoot);
-    if (_mppRepositionObserver) { _mppRepositionObserver.disconnect(); _mppRepositionObserver = null; }
+    if (_metaTimer) { clearTimeout(_metaTimer); _metaTimer = null; }
+    unwireReposition();
     document.getElementById('mpp-tab-li')?.remove();
+    document.querySelector('.mpp-session-overlay')?.remove();   // it lives on <body>
     document.getElementById('mpp-root')?.remove();
     resetAll();
   }
@@ -783,11 +1278,39 @@
     if (e.key === 'Escape') { e.preventDefault(); confirmClose(); }
   }
 
+  // True once Canary7 holds at least one container for this shipment. After that,
+  // throwing local state away is NOT a neutral act: C7 keeps the boxes, the children in
+  // them are already status 7, and a fresh scan-and-commit cannot pack them again — so
+  // every path that resets must say so out loud first.
+  function c7HoldsContainers() { return Cache.containers.some(c => c._c7Id); }
+  function confirmDiscardC7Work(action) {
+    if (State.screen === 'SUCCESS') return true;   // everything is committed; nothing to lose
+    if (!c7HoldsContainers()) return true;
+    const n = Cache.containers.filter(c => c._c7Id).length;
+    return confirm(
+      `Canary7 already holds ${n} container(s) for this shipment.\n\n` +
+      `${action} loses the record of which ones are done. The stock in them is already ` +
+      `packed and cannot be packed again from here.\n\nCheck the shipment in C7 first. ` +
+      `Continue anyway?`);
+  }
+
   function confirmClose() {
-    // Don't lose in-progress scans silently
-    const hasWork = State.screen === 'SCAN' &&
-      ([...Cache.items.values()].some(i => i.scannedBase > 0) || Cache.containers.length);
-    if (hasWork && !confirm('Close Pallet Pack? Scanned (uncommitted) progress will be lost.')) return;
+    // Never tear the tool down mid-write: closeUI() resets state while the commit loop
+    // is still awaiting, so the writes would carry on with no UI and no re-entry guard.
+    // The spinner always resolves now (success or the error screen), so waiting is safe.
+    if (State.committing) {
+      toast('Packing is running — wait for it to finish or fail.');
+      return;
+    }
+    // Don't lose in-progress scans — or, worse, the ledger of what C7 already holds.
+    // The old gate only fired on the SCAN screen, so closing from the commit-error
+    // screen (State.screen is still COMMITTING there) discarded the ledger silently.
+    // A finished commit is not "work to lose": warning there is just noise on the one
+    // dialog whose value depends on being rare.
+    if (State.screen !== 'SUCCESS' && !confirmDiscardC7Work('Closing Pallet Pack')) return;
+    const hasScans = [...Cache.items.values()].some(i => i.scannedBase > 0) || Cache.containers.length > 0;
+    if (hasScans && !c7HoldsContainers() &&
+        !confirm('Close Pallet Pack? Scanned (uncommitted) progress will be lost.')) return;
     closeUI();
   }
 
@@ -870,7 +1393,7 @@
       Audio.chime('ok');
       renderScanScreen();
     } catch (err) {
-      if (err.message === 'Session expired') return;
+      if (isSessionExpired(err)) return;              // the modal is already up
       Audio.chime('error');
       Voice.error(err.code === 'NOT_FOUND' ? 'Shipment not found' : 'Cannot load shipment');
       setShipFeedback(err.message || 'Could not load shipment', 'err');
@@ -940,12 +1463,27 @@
     if (!el) return;
     let curUnits = 0;
     for (const v of Cache.current.lines.values()) curUnits += v;
-    for (const v of Cache.current.unexpected.values()) curUnits += v;   // unexpected count too
+    curUnits += unexpectedUnits(Cache.current.unexpected);   // scans x their own factor
     el.innerHTML =
       `<span class="mpp-meta-pill">This container: ${curUnits} unit${curUnits === 1 ? '' : 's'}</span>` +
       `<span class="mpp-meta-pill">Containers closed: ${Cache.containers.length}</span>`;
     const badge = document.getElementById('mpp-container-badge');
     if (badge) badge.textContent = `Container ${Cache.containers.length + 1}`;
+  }
+
+  // The units pill is repainted on a fixed short delay after EVERY scan, hit or miss.
+  // That delay is deliberate. An unexpected barcode's factor arrives from a lookup a
+  // moment after the scan, so repainting a miss on a different schedule from a hit
+  // would let the operator read correctness off the ANIMATION — a pill that visibly
+  // corrects itself from 1 to 48 says "that carton was wrong" just as loudly as the
+  // old static 1 did. Same delay for both, so both settle the same way. Everything
+  // that is not scan-triggered (unverify, closing a box, entering the screen) still
+  // repaints immediately.
+  const META_SETTLE_MS = 600;
+  let _metaTimer = null;
+  function scheduleScanMetaUpdate() {
+    if (_metaTimer) clearTimeout(_metaTimer);
+    _metaTimer = setTimeout(() => { _metaTimer = null; updateScanScreenMeta(); }, META_SETTLE_MS);
   }
 
   function flashScan() {
@@ -1032,8 +1570,9 @@
     updateScanScreenMeta();
     vibrate([20]);
   }
-  // Unverify one unexpected scan from the OPEN container, keeping the shipment-wide
-  // unexpected tally (used by the Finish report) in sync. Never goes below zero.
+  // Unverify one unexpected SCAN from the OPEN container — i.e. one of that barcode's
+  // UOM, which is `factor` units, matching how Unverify behaves for a known item.
+  // Keeps the shipment-wide tally (used by the Finish report) in sync. Never negative.
   function unverifyUnexpected(code) {
     const cur = Cache.current;
     const have = cur.unexpected.get(code) || 0;
@@ -1054,9 +1593,14 @@
       const idx = removals.push({ unexpected: code }) - 1;
       rm = `<button class="mpp-vs-rm" data-idx="${idx}" title="Unverify one">Unverify</button>`;
     }
-    return `<div class="mpp-vs-item" data-unex="${_esc(code)}">
+    // Rendered with whatever factor is known now; resolveUnexpectedRows() corrects the
+    // line and the total in place the moment the lookup lands.
+    const factor = unexpectedFactor(code);
+    const resolved = Cache.unexpectedResolved.get(normRef(code));
+    return `<div class="mpp-vs-item" data-unex="${_esc(code)}" data-unex-n="${n}">
         <div class="mpp-vs-item-h mpp-unex-label">${_esc(code)}</div>
-        <div class="mpp-vs-uom"><span>×${n}</span>${rm}</div>
+        <div class="mpp-vs-uom"><span class="mpp-unex-line">${unexpectedLineHTML(n, factor, resolved && resolved.uomName)}</span>${rm}</div>
+        <div class="mpp-vs-total"><span>Total</span><span class="mpp-unex-total">${n * factor}</span></div>
       </div>`;
   }
   // One item = a small card: header (code + description, no qty), one row per UOM,
@@ -1109,8 +1653,13 @@
   // triggered by Finish (guide §11/§15) — after closing we proceed to the match.
   function openCloseContainer(finishAfter) {
     // Nothing scanned into the current box? Don't create an empty container.
+    // Unexpected scans count here too: with the pill reading "48 units", refusing to
+    // close with "nothing scanned into this container yet" both contradicts the screen
+    // and tells the operator every carton in the box was wrong. Verification still
+    // fails at Finish, so nothing incorrect can commit.
     let curUnits = 0;
     for (const v of Cache.current.lines.values()) curUnits += v;
+    curUnits += unexpectedUnits(Cache.current.unexpected);
     if (curUnits === 0) {
       if (finishAfter) { doFinish(); return; }
       toast('Nothing scanned into this container yet.');
@@ -1284,7 +1833,9 @@
     const rows = mismatches.map(m =>
       `<div class="mpp-vs-row mpp-vs-bad"><span><b>${_esc(m.itemCode)}</b></span><span>required ${m.required}, scanned ${m.scanned}</span></div>`);
     const un = unexpected.map(([code, n]) =>
-      `<div class="mpp-vs-row mpp-vs-bad" data-unex="${_esc(code)}"><span class="mpp-unex-label">${_esc(code)}</span><span>unexpected ×${n}</span></div>`);
+      `<div class="mpp-vs-row mpp-vs-bad" data-unex="${_esc(code)}" data-unex-n="${n}">` +
+      `<span class="mpp-unex-label">${_esc(code)}</span>` +
+      `<span class="mpp-unex-qty">${unexpectedQtyText(n, unexpectedFactor(code))}</span></div>`);
     const modal = document.createElement('div');
     modal.className = 'mpp-overlay';
     modal.innerHTML = `
@@ -1297,6 +1848,9 @@
     r.appendChild(modal);
     resolveUnexpectedRows(modal);   // swap raw barcodes for their item codes
     document.getElementById('mpp-mm-ok')?.addEventListener('click', () => {
+      // Reachable after a partial commit (commit error → back to scan → scan → Finish),
+      // and resetScans() drops Cache.containers along with the ledger.
+      if (!confirmDiscardC7Work('Resetting and rescanning')) return;
       modal.remove();
       Cache.resetScans();               // keep items + barcodeIndex (guide §13)
       renderScanScreen();
@@ -1362,7 +1916,13 @@
       const loc = PACK_LOCATION_ID;
 
       // Container-number generator for boxes without an operator-supplied number
+      // Seed past anything a previous attempt already used, so a resumed commit doesn't
+      // spend its first create on a number C7 is certain to reject as a duplicate.
       let genSeq = 1;
+      for (const c of Cache.containers) {
+        const m = /-(\d+)$/.exec(c._c7ContainerNo || '');
+        if (m) genSeq = Math.max(genSeq, Number(m[1]) + 1);
+      }
       const genNumber = () => `${source.container_no}-${genSeq++}`;
 
       // 3. Per container, in order: create → move/pack children → close.
@@ -1371,13 +1931,54 @@
       let ci = 0;
       for (const cont of Cache.containers) {
         ci++;
+        // Commit is RE-ENTRANT. A session expiry, a dropped connection or the Retry
+        // button can all bring us back here after some containers are already packed in
+        // C7 — and re-creating one produces a phantom empty pallet on a live
+        // consignment (the create is rejected as a duplicate number, the duplicate
+        // handler invents a new number, and the box is created and closed with nothing
+        // in it because its children are already status 7). So each container carries
+        // its own ledger and we never do the same work twice.
+        if (cont._c7Packed) {
+          LOG(`container ${ci} already packed in C7 as ${cont._c7ContainerNo} — skipping`);
+          continue;
+        }
+        if (cont._c7Id) {
+          // Created last time but never confirmed closed. Do NOT guess — ask C7 what
+          // actually happened. Three answers, three different right moves:
+          renderCommitting(`Checking container ${ci} in Canary7…`);
+          const st = await inspectContainer(cont._c7Id);
+          if (st.closed) {                       // C7 closed it after all
+            LOG(`container ${ci} (${cont._c7ContainerNo}) is already closed in C7 — skipping`);
+            cont._c7Packed = true;
+            continue;
+          }
+          if (st.known && st.empty) {            // created, nothing moved in: safe to resume
+            LOG(`container ${ci} (${cont._c7ContainerNo}) exists in C7 but is empty — resuming into it`);
+          } else {
+            // It holds children we cannot account for. Packing into it again would move
+            // real stock twice, and this script cannot reconcile it. Stop, name the box,
+            // and let the commit-error screen offer the one safe way forward.
+            const label = cont._c7ContainerNo || cont._c7Id;
+            const e = new Error(st.error || !st.known
+              ? `Canary7 didn't answer when we asked about container ${label}, which was created ` +
+                `but never confirmed closed. Open it in C7: if it is closed, press "Already ` +
+                `closed in C7" below; if it is empty, press Retry commit. We won't guess.`
+              : `Container ${label} was created in Canary7 and already holds stock, but was ` +
+                `never confirmed closed. Open it in C7: if it is complete, close it there and ` +
+                `press "Already closed in C7" below. Retrying blind would pack it twice.`);
+            e.code = 'CONTAINER_UNRESOLVED';
+            e.container = cont;
+            throw e;
+          }
+        }
         renderCommitting(`Packing container ${ci} of ${Cache.containers.length}…`);
 
         // a. create (regenerate number + retry on duplicate 500, guide §14).
         // Direct call (NOT via the retrying queue): a duplicate-number 500 is not
         // transient — retrying the same number always 500s, so we regenerate here.
-        let containerNo = cont.containerNo || genNumber();
-        let created = null;
+        let containerNo = cont._c7ContainerNo || cont.containerNo || genNumber();
+        let containerId = cont._c7Id || null;
+        let created = containerId ? { id: containerId } : null;
         for (let attempt = 0; attempt < 10 && !created; attempt++) {
           try {
             created = await apiPost('shipment/shipment-container/create', {
@@ -1394,13 +1995,18 @@
               restrict_twofactor: 0,
             });
           } catch (e) {
-            if (e.message === 'Session expired') throw e;
+            // Only a genuine duplicate-number rejection earns a fresh number. An
+            // auth-shaped 500 ("jwt expired") used to land here and burn all ten
+            // attempts inventing container numbers against a dead call.
+            if (isSessionExpired(e) || e.code === 'AUTH_BLIP') throw e;
             if (e.status === 500) { containerNo = genNumber(); continue; }  // duplicate no.
             throw e;
           }
         }
         if (!created || !created.id) throw new Error('Could not create container ' + containerNo);
-        const containerId = created.id;
+        containerId = created.id;
+        cont._c7Id = containerId;               // ledger: it exists in C7 from here on
+        cont._c7ContainerNo = containerNo;
 
         // b. allocate each item's units in cont.lines against remaining children (guide §12.b)
         for (const [itemId, baseNeed] of cont.lines) {
@@ -1447,6 +2053,7 @@
 
         // c. close — 500 is a soft warning (C7 closes before print side effects, guide §2.4)
         await closeToContainer(containerId, loc, cont);
+        cont._c7Packed = true;                  // ledger: done, never redo it
       }
 
       // 4. Verify the shipment actually advanced before declaring success. C7 moves
@@ -1466,9 +2073,52 @@
           'Nothing was consigned; check C7 and retry.'));
       }
     } catch (err) {
-      if (err.message === 'Session expired') return;   // overlay already shown
+      if (isSessionExpired(err)) {
+        // The banner is already up (and, living on <body>, survives this render).
+        // Deliberately NOT the scan screen: that hands back a Finish button, and
+        // Finish re-enters commit(). The ledger above makes that safe now, but the
+        // honest screen is the one that says what happened and how far it got.
+        const packed = Cache.containers.filter(c => c._c7Packed).length;
+        WARN(`commit interrupted by a session expiry after ${packed}/${Cache.containers.length} containers`);
+        renderCommitError(new Error(
+          `Canary7 signed this device out mid-commit. ${packed} of ${Cache.containers.length} ` +
+          `container(s) were packed. Log back in, then Retry — already-packed containers ` +
+          `are skipped.`));
+        return;
+      }
       WARN('commit failed:', err.message);
       renderCommitError(err);
+    }
+  }
+
+  // What does Canary7 currently think of a container we created earlier? Only called on
+  // the rare resume path, so it pays for its own query rather than bloating the list
+  // fetch every commit does. NB shipment-container detail returns the whole consignment
+  // group, so filter on the id (api trap §6e).
+  async function inspectContainer(containerId) {
+    try {
+      const raw = await apiGet(
+        `shipment/shipment-container&shipment_number=${encShip(Cache.shipmentNumber)}` +
+        `&expand=status,shipmentDetailChildren&fields=id,container_no,status.id,shipmentDetailChildren.id` +
+        `&per-page=100&page=1`);
+      const arr = Array.isArray(raw) ? raw : (raw?.items || []);
+      const rec = arr.find(c => String(c.id) === String(containerId));
+      if (!rec) return { known: false, closed: false, empty: false };
+      const status = Number(rec.status?.id ?? rec.status_id);
+      // Packed (7) or anything beyond it — someone may have consigned it in C7 between
+      // attempts — means the box is finished and must not be touched again.
+      const closed = Number.isFinite(status) && status >= 7;
+      // "Empty" must be a POSITIVE reading. If the relation did not come back we do not
+      // know what is in the box, and this is the one branch whose answer authorises a
+      // write to live stock — so an absent key is "not empty", never "empty".
+      const kids = rec.shipmentDetailChildren ?? rec.shipment_detail_children;
+      const empty = Array.isArray(kids) && kids.length === 0;
+      return { known: true, closed, empty, status };
+    } catch (e) {
+      if (isSessionExpired(e)) throw e;
+      WARN('could not inspect container', containerId, '—', e.message);
+      // Unknown is unsafe — but say so as "we could not ask", not as "it holds stock".
+      return { known: false, closed: false, empty: false, error: true };
     }
   }
 
@@ -1486,6 +2136,7 @@
       LOG('post-commit leading status:', st);
       return st === 7;
     } catch (e) {
+      if (isSessionExpired(e)) throw e;   // let commit()'s catch own it — don't stack an error screen
       WARN('status verify failed:', e.message);
       return false;   // can't confirm → treat as not-advanced (honest, retryable)
     }
@@ -1494,23 +2145,23 @@
   // close-to-container with Pack's soft-500 handling (guide §2.4). Returns even
   // on 500 (container is closed server-side before print/label side effects).
   async function closeToContainer(containerId, loc, cont) {
-    await waitForSession();
-    const url = API_BASE +
+    const path =
       `shipment/shipment-container/close-to-container` +
       `&close_to_location_id=${loc}&container_id=${containerId}` +
       `&profile_id=${State.profile.id}` +
       `&weight=${num(cont.weight)}&length=${num(cont.length)}` +
       `&width=${num(cont.width)}&height=${num(cont.height)}`;
-    const res = await fetch(url, { method: 'GET', headers: mkHeaders() });
-    const body = await res.json().catch(() => ({}));
-    if (res.status === 401) { _showSessionExpired(); throw new Error('Session expired'); }
-    if (!res.ok) {
-      // Any non-2xx other than 401 is treated as soft — the container is closed
-      // server-side; only post-close side effects (labels/print) failed.
-      WARN('close-to-container soft error:', res.status, body.message || '');
-      return { id: containerId, status_id: 7, _softError: body.message || `Server error ${res.status}` };
+    try {
+      return await apiGet(path);
+    } catch (err) {
+      // An auth-shaped failure is NOT soft — we have no idea whether the container
+      // closed, so it must surface rather than be swallowed as a print-side effect.
+      if (isSessionExpired(err) || err.code === 'AUTH_BLIP') throw err;
+      // Everything else stays soft: C7 closes the container server-side before the
+      // print/label side effects that produce these 500s (guide §2.4).
+      WARN('close-to-container soft error:', err.status, err.message || '');
+      return { id: containerId, status_id: 7, _softError: err.message || `Server error ${err.status}` };
     }
-    return body;
   }
 
   // ---- Commit progress / success / error screens ----------------------------
@@ -1522,6 +2173,7 @@
         <div class="mpp-spinner"></div>
         <div class="mpp-note" id="mpp-commit-msg">${_esc(msg || 'Working…')}</div>
       </div>`;
+    wireHeader();   // the spinner screen still needs a working ✕ — a TC51 has no Esc key
   }
   function updateCommitMsg(msg) { const el = document.getElementById('mpp-commit-msg'); if (el) el.textContent = msg; }
 
@@ -1547,6 +2199,11 @@
   function renderCommitError(err) {
     State.committing = false;
     Audio.chime('error');
+    // A container C7 created but never confirmed closed can only be settled by a human
+    // looking at C7. Once they have, give them a way back in — otherwise Retry throws
+    // the same error forever and the only exit is closing the tool, which discards the
+    // record of what C7 already holds.
+    const stuck = err && err.code === 'CONTAINER_UNRESOLVED' ? err.container : null;
     // Job-type / "null" errors on move/pack mean the shipment's picking job type
     // isn't valid for this profile — surface that, don't imply a transient fault. (guide §2.3/§15)
     let msg = err.message || 'Unknown error';
@@ -1563,10 +2220,18 @@
         <div class="mpp-note">${_esc(err.message || 'Unknown error')}</div>
         <div class="mpp-note">Nothing was reset. You can retry the commit.</div>
         <button id="mpp-retry-btn" class="mpp-btn mpp-btn-primary mpp-btn-lg">Retry commit</button>
+        ${stuck ? `<button id="mpp-stuck-btn" class="mpp-btn mpp-btn-secondary">Already closed in C7 — continue</button>` : ''}
         <button id="mpp-back-scan-btn" class="mpp-btn mpp-btn-ghost">Back to scan screen</button>
       </div>`;
     wireHeader();
     document.getElementById('mpp-retry-btn')?.addEventListener('click', () => commit());
+    document.getElementById('mpp-stuck-btn')?.addEventListener('click', () => {
+      if (!confirm(`Confirm container ${stuck._c7ContainerNo || stuck._c7Id} is CLOSED in Canary7. ` +
+                   `Pallet Pack will skip it and pack the rest.`)) return;
+      stuck._c7Packed = true;
+      LOG('operator confirmed', stuck._c7ContainerNo, 'is closed in C7 — resuming commit');
+      commit();
+    });
     document.getElementById('mpp-back-scan-btn')?.addEventListener('click', () => { State.screen = 'SCAN'; renderScanScreen(); });
   }
 
@@ -1590,7 +2255,8 @@
     if (!rootEl || rootEl.style.display === 'none') return;  // closed or backgrounded
     const inputId = _SCAN_SCREENS[State.screen];
     if (!inputId) return;
-    if (rootEl.querySelector('.mpp-overlay')) return;    // a modal is open
+    if (rootEl.querySelector('.mpp-overlay')) return;               // a modal is open
+    if (document.querySelector('.mpp-session-overlay')) return;     // …or the expiry banner
     const el = document.getElementById(inputId);
     if (!el || !document.contains(el)) return;
     if (document.activeElement === el) return;
@@ -1690,6 +2356,16 @@
         animation:mpp-in .12s ease;
       }
       @keyframes mpp-in{from{opacity:0}to{opacity:1}}
+      /* The session banner is mounted on <body> so a screen re-render cannot destroy
+         it; being outside .mpp-root it needs its own copy of the tokens. */
+      .mpp-session-overlay{
+        --c7-surf:#ffffff; --c7-surf2:#f9f9fa; --c7-surf3:#eef9fd; --c7-bg:#eef1f5;
+        --c7-border:#e1e6ef; --c7-border2:#c0cadd; --c7-text:#394967;
+        --c7-muted:#9faecb; --c7-muted2:#6b7280; --c7-teal:#2ea8d6; --c7-red:#ff5454;
+        --c7-r:4px;
+        --c7-font:-apple-system,BlinkMacSystemFont,'Segoe UI',Inter,Roboto,sans-serif;
+        font-family:var(--c7-font); color:var(--c7-text);
+      }
       /* ── titlebar (C7 tab look) ── */
       .mpp-header{display:flex;align-items:center;justify-content:space-between;
         background:var(--c7-surf);border-bottom:1px solid var(--c7-border);
@@ -1831,7 +2507,31 @@
   }
 
   // ===========================================================================
-  // 16. BOOT  (copied from Pick §9)
+  // 16. DEBUG HANDLE
+  // ===========================================================================
+  // On a TC51 there is no console to breakpoint in, so expose the internals: this is
+  // both the on-device debugging surface and the seam the offline harness tests
+  // through. Read-only use only — nothing here is part of the operator flow.
+  window.__palletpack = {
+    VERSION,
+    State, Cache,
+    // shell
+    measureChrome, positionRoot, positionRootSettled, openUI, closeUI,
+    showPalletPack, hidePalletPack, ensureTabChip,
+    // scanning / verification
+    onScan, computeVerification, unexpectedFactor, unexpectedUnits,
+    inspectContainer, c7HoldsContainers,
+    updateScanScreenMeta, scheduleScanMetaUpdate,
+    uomForReference, normRef, uomParts,
+    // auth
+    getToken, mkHeaders, sessionIsAlive, isSessionExpired, apiFetch,
+    _isAuthFailure, _showSessionExpired, _resetAliveProbe,
+    // data
+    loadShipment, lookupItemByReference, resolveUnexpected, initData,
+  };
+
+  // ===========================================================================
+  // 17. BOOT  (copied from Pick §9)
   // ===========================================================================
 
   captureSessionId();
@@ -1851,6 +2551,19 @@
   new MutationObserver(() => {
     if (!document.getElementById('mpp-nav') && document.querySelector('div.sidebar nav li.nav-item')) {
       injectNav();
+    }
+    // Angular re-renders the tab bar on a route change, taking our chip with it. If a
+    // session is open, put it back — otherwise the only way back to a part-scanned
+    // pallet is the sidebar launcher, and the operator has no reason to know that.
+    const rootEl = document.getElementById('mpp-root');
+    if (rootEl && !document.getElementById('mpp-tab-li')) {
+      ensureTabChip();
+      if (rootEl.style.display !== 'none') {
+        const chip = document.getElementById('mpp-tab-li');
+        chip?.classList.add('active');
+        chip?.querySelector('a.nav-link')?.classList.add('active');
+        positionRootSettled();
+      }
     }
   }).observe(document.body, { childList: true, subtree: true });
 
