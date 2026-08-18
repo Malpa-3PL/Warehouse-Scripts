@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Pallet Pack
 // @namespace    malpa
-// @version      1.7.1
+// @version      1.8.0
 // @match        https://*.canary7.com/*
 // @homepageURL  https://github.com/zaynnev/malpa3pl
 // @supportURL   https://github.com/zaynnev/malpa3pl/issues
@@ -42,6 +42,42 @@
  *  restyle C7's own chrome, so its tabs cannot break.
  *
  *  ------------------------------------------------------------------------------
+ *  v1.8.0 — PARTIAL RESCAN on a failed verification, for allow-listed companies only
+ *  (currently just 49 / Bprimal — see PARTIAL_RESCAN_COMPANY_IDS).
+ *
+ *  Before: any mismatch reset the entire order. On a pallet of several hundred units one
+ *  miscount cost the operator the whole re-scan, which is its own source of error.
+ *
+ *  Now the failure screen also offers "Clear & re-scan these N items": the counts for the
+ *  SKUs that failed are cleared, every SKU that matched keeps its count, and the operator
+ *  re-scans just those few lines from zero. Both directions are cleared, over and under —
+ *  a short count is no evidence that the units already tallied went onto the right SKU, so
+ *  a line that failed gets a clean re-count rather than arithmetic on a number we just
+ *  proved wrong. The report still shows the size and direction of each error, which it
+ *  already did before this version.
+ *
+ *  This is safe to do freely because NOTHING has reached Canary7 at this point: no
+ *  container exists, no child has been moved, no weight has been sent. The entire ledger is
+ *  local until Finish. So there are only two interlocks — the company allow-list, and the
+ *  one case where that premise breaks: a commit that part-failed and left real containers
+ *  behind, after which the full reset is the only option. Both re-checked on tap.
+ *
+ *  Three things the reset has to keep straight, none of them optional:
+ *    • the cleared SKUs come out of every container's line map, or commit would move units
+ *      that no item total credits;
+ *    • a closed box left with nothing is dropped, or commit would create and close an empty
+ *      pallet in Canary7;
+ *    • a closed box that merely changed has its keyed weight reduced by the weight of what
+ *      came out, so the figure sent to close-to-container still describes the box. An
+ *      estimate from item weights; boxes with no item weights on file are left untouched.
+ *  Unexpected/unknown barcodes are always cleared wholesale — they are keyed by barcode,
+ *  not by item, so there is no per-SKU line to be selective about.
+ *
+ *  If any closed box holds units of a cleared SKU, the screen names those boxes so the
+ *  operator can get the units out before re-scanning them.
+ *
+ *  Every other company sees exactly the v1.7.1 screen, wording and single button.
+ *
  *  v1.7.1 — three field defects fixed (v1.7.0), then hardened after an independent code
  *  review (v1.7.1). v1.7.0 was never released; 1.7.1 is the first build of this work to
  *  reach the fleet. Each root cause was reproduced in the code and the API behaviour
@@ -143,10 +179,17 @@
   // malpa.canary7.com is a static Angular app (S3/CloudFront — calling index.php
   // there returns an XML AccessDenied 403); the Canary7 API itself is served from
   // stgauth.canary7.com, which is what both proven sibling scripts call.
-  const VERSION          = '1.7.1';   // keep in step with @version or the fleet won't update
+  const VERSION          = '1.8.0';   // keep in step with @version or the fleet won't update
   const API_BASE         = 'https://stgauth.canary7.com/index.php?r=';
   const WAREHOUSE_ID     = 10;      // guide §5 — HAR shows 10; CONFIRM for production
   const PACK_LOCATION_ID = 72037;   // guide §3 D5 / §5 — packing/close location (code WDD-02); per-station constant, CONFIRM
+
+  // Companies whose failed verification clears ONLY the mismatched item counts and lets the
+  // operator re-scan those items, instead of resetting the whole order (v1.8.0).
+  //   49 = Bprimal — confirmed read-only against legacy `configuration/company`
+  //        (2026-08-19) and cross-checked on shipment BP100932, whose
+  //        shipmentHeader.company_id came back as 49.
+  const PARTIAL_RESCAN_COMPANY_IDS = new Set([49]);
 
   // get-pack-container expand for the commit context resolve (guide §3 D4)
   const PP_GPC_EXPAND = [
@@ -497,9 +540,20 @@
     };
   }
 
+  // Units in a box, counted the one way: known lines plus unexpected scans at their own
+  // factor. The scan-screen pill, the "don't close an empty box" check and the partial
+  // reset's drop test all use this, so they cannot disagree. A 0-valued line does not keep
+  // a box alive.
+  function unitsIn(cont) {
+    let n = 0;
+    for (const v of cont.lines.values()) n += num(v);
+    return n + unexpectedUnits(cont.unexpected);
+  }
+
   const Cache = {
     shipmentNumber: null,
     shipmentHeaderId: null,
+    companyId: null,             // shipmentHeader.company_id — gates the partial rescan (v1.8.0)
     items: new Map(),            // item_id -> { itemCode, description, requiredBase, scannedBase, unitWeight }
     barcodeIndex: new Map(),     // UPPER(barcode) -> { itemId, factor, uomId }
     unexpected: new Map(),       // normRef(barcode) -> scan count
@@ -511,6 +565,7 @@
     reset() {
       this.shipmentNumber = null;
       this.shipmentHeaderId = null;
+      this.companyId = null;
       this.items = new Map();
       this.barcodeIndex = new Map();
       this.unexpected = new Map();
@@ -528,6 +583,72 @@
       this.unexpected = new Map();
       this.containers = [];
       this.current = newContainer(1);
+    },
+    // PARTIAL reset (v1.8.0) — clear the counts for the items that failed to match and
+    // leave every item that DID match alone, so the operator re-scans those few SKUs from
+    // zero instead of the whole pallet.
+    //
+    // Safe to do freely because nothing here has reached Canary7: no container exists, no
+    // child has been moved, no weight has been sent. The whole ledger is local until
+    // Finish. (`partialRescanAvailable` still refuses the one case where that is no longer
+    // true — a commit that part-failed and left real containers behind.)
+    //
+    // Both directions are cleared, over and under. A short count is not evidence that the
+    // units already tallied went onto the right SKU, so the only honest reset for a line
+    // that failed is a clean re-count from zero.
+    //
+    // Three consequences that are NOT optional bookkeeping:
+    //  • The zeroed SKUs come out of every container's line map too. Those maps are what
+    //    commit packs box by box; leaving a stripped SKU in one would have commit move
+    //    units no item total credits.
+    //  • A closed box left with nothing is dropped, or commit would create and close an
+    //    empty pallet in Canary7.
+    //  • A closed box that merely changed has its keyed weight reduced by the weight of
+    //    what came out, so the figure sent to close-to-container still describes the box.
+    //    An estimate from item weights, but strictly better than a weight that includes
+    //    units no longer in there. Boxes with no item weights on file are left alone.
+    //
+    // The OPEN box is kept, not replaced: its surviving lines are physically in that
+    // carton, and the re-scans belong there too.
+    resetMismatchedScans(itemIds) {
+      const ids = new Set(itemIds);
+      for (const id of ids) {
+        const it = this.items.get(id);
+        if (it) it.scannedBase = 0;
+      }
+      const dropped = [];
+      const adjusted = [];
+      for (const c of this.containers) {
+        let touched = false;
+        let removedWeight = 0;
+        for (const id of ids) {
+          const base = c.lines.get(id);
+          if (base === undefined) continue;
+          const it = this.items.get(id);
+          removedWeight += num(base) * ((it && it.unitWeight) || 0);
+          c.lines.delete(id);
+          touched = true;
+        }
+        if (!touched) continue;
+        if (unitsIn(c) <= 0) { dropped.push(c); continue; }
+        if (num(c.weight) > 0 && removedWeight > 0) {
+          c.weight = Math.max(0, Math.round((num(c.weight) - removedWeight) * 100) / 100);
+          adjusted.push(c);
+        }
+        c.unexpected = new Map();
+        }
+      const drop = new Set(dropped);
+      this.containers = this.containers.filter(c => !drop.has(c));
+      this.containers.forEach((c, i) => { c.seq = i + 1; });
+      // Unexpected/unknown barcodes are cleared wholesale, never selectively: they are
+      // keyed by barcode, not by item, so there is no per-SKU line to be selective about.
+      this.unexpected = new Map();
+      for (const id of ids) this.current.lines.delete(id);
+      this.current.unexpected = new Map();
+      this.current.seq = this.containers.length + 1;
+      LOG('partial reset — cleared', ids.size, 'item(s);', dropped.length, 'box(es) dropped;',
+          adjusted.length, 'box weight(s) adjusted');
+      return { itemIds: [...ids], dropped, adjusted };
     },
   };
 
@@ -698,7 +819,7 @@
     const fields = [
       'id', 'quantity', 'original_qty',
       'shipment_header.id', 'shipment_header.shipment_number',
-      'shipment_header.leading_status_id',
+      'shipment_header.leading_status_id', 'shipment_header.company_id',
       'item.id', 'item.item_code', 'item.description',
       'item.itemUnitOfMeasures.id', 'item.itemUnitOfMeasures.factor',
       'item.itemUnitOfMeasures.weight', 'item.itemUnitOfMeasures.unitOfMeasure.name',
@@ -736,6 +857,19 @@
     Cache.reset();
     Cache.shipmentNumber = hdr.shipment_number || shipmentNumber;
     Cache.shipmentHeaderId = hdr.id;
+    // Company decides whether a failed verification clears only the mismatched counts
+    // (v1.8.0). C7 returns the whole expanded shipmentHeader regardless of `fields`, so
+    // company_id is already in this payload; it is named in `fields` above only to record
+    // the dependency. Number('') and Number(null) are both 0 — finite — so isFinite alone
+    // would turn an empty field into "company 0" with nothing in the log.
+    const rawCompany = hdr.company_id;
+    const parsedCompany = (rawCompany === undefined || rawCompany === null || rawCompany === '')
+      ? NaN : Number(rawCompany);
+    Cache.companyId = Number.isFinite(parsedCompany) ? parsedCompany : null;
+    if (Cache.companyId === null) {
+      WARN('shipment_header company_id not readable (got', JSON.stringify(rawCompany) +
+           ') — partial rescan disabled for this shipment.');
+    }
     if (Cache.shipmentHeaderId == null) WARN('shipment_header id not found in load response — create/close will fail.');
 
     const onlyRef = profileOnlyAcceptsReference();
@@ -816,7 +950,8 @@
       WARN('Some lines returned no itemUnitOfMeasures — UOM factors/barcodes may be incomplete.');
     }
     LOG('Loaded shipment', Cache.shipmentNumber, '— items:', Cache.items.size,
-        'barcodes:', Cache.barcodeIndex.size);
+        'barcodes:', Cache.barcodeIndex.size, 'company:', Cache.companyId,
+        'partial rescan:', PARTIAL_RESCAN_COMPANY_IDS.has(Cache.companyId));
   }
 
   // unitWeight = base-unit (factor 1) UOM weight; else derive from an outer UOM (weight/factor)
@@ -1461,9 +1596,7 @@
   function updateScanScreenMeta() {
     const el = document.getElementById('mpp-scan-meta');
     if (!el) return;
-    let curUnits = 0;
-    for (const v of Cache.current.lines.values()) curUnits += v;
-    curUnits += unexpectedUnits(Cache.current.unexpected);   // scans x their own factor
+    const curUnits = unitsIn(Cache.current);   // lines + unexpected scans x their own factor
     el.innerHTML =
       `<span class="mpp-meta-pill">This container: ${curUnits} unit${curUnits === 1 ? '' : 's'}</span>` +
       `<span class="mpp-meta-pill">Containers closed: ${Cache.containers.length}</span>`;
@@ -1657,9 +1790,7 @@
     // close with "nothing scanned into this container yet" both contradicts the screen
     // and tells the operator every carton in the box was wrong. Verification still
     // fails at Finish, so nothing incorrect can commit.
-    let curUnits = 0;
-    for (const v of Cache.current.lines.values()) curUnits += v;
-    curUnits += unexpectedUnits(Cache.current.unexpected);
+    const curUnits = unitsIn(Cache.current);
     if (curUnits === 0) {
       if (finishAfter) { doFinish(); return; }
       toast('Nothing scanned into this container yet.');
@@ -1791,9 +1922,12 @@
   // declares they're done. Returns { mismatches, unexpected, verified }.
   function computeVerification() {
     const mismatches = [];
-    for (const it of Cache.items.values()) {
+    // itemId rides along so the partial reset can clear exactly these lines (v1.8.0).
+    // Iterate entries, not values: the id is the Map key, and it is what container lines
+    // and the barcode index are keyed by.
+    for (const [itemId, it] of Cache.items.entries()) {
       if (it.scannedBase !== it.requiredBase) {
-        mismatches.push({ itemCode: it.itemCode, required: it.requiredBase, scanned: it.scannedBase });
+        mismatches.push({ itemId, itemCode: it.itemCode, required: it.requiredBase, scanned: it.scannedBase });
       }
     }
     const unexpected = [...Cache.unexpected.entries()];
@@ -1811,9 +1945,7 @@
 
     // Verified — treat the still-open box (if any) as the final container: prompt
     // its weight/dims, then commit. Otherwise commit what's already closed.
-    let curUnits = 0;
-    for (const n of Cache.current.lines.values()) curUnits += n;
-    if (curUnits > 0) { openCloseContainer(true); return; }
+    if (unitsIn(Cache.current) > 0) { openCloseContainer(true); return; }
     doFinish();
   }
 
@@ -1825,13 +1957,49 @@
     else { showMismatch(v.mismatches, v.unexpected); }
   }
 
+  // Is the partial rescan available for THIS shipment right now? (v1.8.0)
+  // Only two conditions, because on this path nothing has reached Canary7 — no container
+  // exists, no child has moved, no weight has been sent — so there is no remote state to
+  // get out of step with:
+  //   • the company is allow-listed, and
+  //   • this session has not already created a container in C7. That last one is reachable:
+  //     a commit can part-fail, and the operator can then go back to scanning and Finish
+  //     again. Once real containers exist, clearing counts locally would put the ledger at
+  //     odds with stock C7 has already moved, so the full reset (which routes through
+  //     confirmDiscardC7Work) is the only option offered.
+  function partialRescanAvailable() {
+    return PARTIAL_RESCAN_COMPANY_IDS.has(Cache.companyId) && !c7HoldsContainers();
+  }
+
   function showMismatch(mismatches, unexpected) {
     Audio.chime('error');
     Voice.error('Verification failed');
     vibrate([60, 30, 60]);
     const r = root(); if (!r) return;
-    const rows = mismatches.map(m =>
-      `<div class="mpp-vs-row mpp-vs-bad"><span><b>${_esc(m.itemCode)}</b></span><span>required ${m.required}, scanned ${m.scanned}</span></div>`);
+
+    // PARTIAL RESCAN (v1.8.0, allow-listed company only). Offered when there is at least
+    // one per-item mismatch to clear — with only unexpected barcodes to fix there is no
+    // count to reset, so it would be a button that does nothing a full reset doesn't.
+    const partial = partialRescanAvailable() && mismatches.length > 0;
+
+    // Which closed boxes hold units of a SKU that is about to be cleared. Computed BEFORE
+    // anything is touched, because the operator has to physically get those units back out
+    // in order to re-scan them.
+    const affected = !partial ? [] : Cache.containers.filter(c =>
+      mismatches.some(m => c.lines.has(m.itemId)));
+
+    const rows = mismatches.map(m => {
+      const diff = m.scanned - m.required;
+      // The qty is diagnostic — the direction and size of the error. This report already
+      // disclosed required-vs-scanned before v1.8.0, so it reveals nothing new on a blind
+      // screen. The COUNT ITSELF is cleared either way, so this is not an instruction to
+      // scan a difference: the operator re-scans that SKU from zero.
+      const what = partial
+        ? (diff < 0 ? `${-diff} short` : `${diff} too many`)
+        : `required ${m.required}, scanned ${m.scanned}`;
+      return `<div class="mpp-vs-row mpp-vs-bad"><span><b>${_esc(m.itemCode)}</b></span>` +
+             `<span>${what}</span></div>`;
+    });
     const un = unexpected.map(([code, n]) =>
       `<div class="mpp-vs-row mpp-vs-bad" data-unex="${_esc(code)}" data-unex-n="${n}">` +
       `<span class="mpp-unex-label">${_esc(code)}</span>` +
@@ -1841,13 +2009,53 @@
     modal.innerHTML = `
       <div class="mpp-modal">
         <div class="mpp-modal-title" style="color:var(--c7-red)">✕ Verification failed</div>
-        <div class="mpp-note">Differences (nothing has been committed):</div>
+        ${partial
+          ? `<div class="mpp-note">These counts will be cleared — re-scan these items from
+               scratch. Everything that matched stays scanned. Nothing has been committed.</div>`
+          : `<div class="mpp-note">Differences (nothing has been committed):</div>`}
         <div class="mpp-vs-list">${rows.join('')}${un.join('')}</div>
-        <button class="mpp-btn mpp-btn-primary" id="mpp-mm-ok">Reset &amp; rescan</button>
+        ${partial
+          ? `${affected.length
+               ? `<div class="mpp-note">Open ${affected.map(c => _esc(c.containerNo || ('container ' + c.seq))).join(', ')}
+                    and take those items out first — re-scan them into the container you have open.</div>`
+               : ``}
+             <button class="mpp-btn mpp-btn-primary" id="mpp-mm-partial">Clear &amp; re-scan these ${mismatches.length} item${mismatches.length === 1 ? '' : 's'}</button>
+             <button class="mpp-btn mpp-btn-ghost" id="mpp-mm-ok">Reset &amp; rescan everything</button>`
+          : `<button class="mpp-btn mpp-btn-primary" id="mpp-mm-ok">Reset &amp; rescan</button>`}
       </div>`;
     r.appendChild(modal);
     resolveUnexpectedRows(modal);   // swap raw barcodes for their item codes
-    document.getElementById('mpp-mm-ok')?.addEventListener('click', () => {
+
+    modal.querySelector('#mpp-mm-partial')?.addEventListener('click', () => {
+      // Re-derive both the gate and the mismatch set at tap time. The gate because
+      // `partial` was decided at paint; the set because the array closed over above is a
+      // snapshot, and clearing a SKU that has since been corrected would send the operator
+      // to re-count a line that is already right.
+      if (!partialRescanAvailable()) {
+        modal.remove();
+        toast('Canary7 already holds containers for this shipment — full reset only.');
+        renderScanScreen();
+        return;
+      }
+      const fresh = computeVerification();
+      if (fresh.verified) {
+        modal.remove();
+        renderScanScreen();
+        toast('Counts now match — tap Finish.');
+        return;
+      }
+      const res = Cache.resetMismatchedScans(fresh.mismatches.map(m => m.itemId));
+      modal.remove();
+      renderScanScreen();
+      // One message, covering everything that moved: the container badge may have shifted
+      // under the operator and a box weight may have been adjusted.
+      const parts = [`Re-scan ${res.itemIds.length} item${res.itemIds.length === 1 ? '' : 's'}`];
+      if (res.dropped.length) parts.push(`${res.dropped.length} box${res.dropped.length === 1 ? '' : 'es'} emptied`);
+      if (res.adjusted.length) parts.push(`${res.adjusted.length} box weight${res.adjusted.length === 1 ? '' : 's'} adjusted`);
+      toast(parts.join(' · '));
+    });
+
+    modal.querySelector('#mpp-mm-ok')?.addEventListener('click', () => {
       // Reachable after a partial commit (commit error → back to scan → scan → Finish),
       // and resetScans() drops Cache.containers along with the ledger.
       if (!confirmDiscardC7Work('Resetting and rescanning')) return;
@@ -2521,6 +2729,9 @@
     // scanning / verification
     onScan, computeVerification, unexpectedFactor, unexpectedUnits,
     inspectContainer, c7HoldsContainers,
+    // partial rescan (v1.8.0)
+    PARTIAL_RESCAN_COMPANY_IDS, partialRescanAvailable, unitsIn,
+    showMismatch, doFinish, onFinish, newContainer,
     updateScanScreenMeta, scheduleScanMetaUpdate,
     uomForReference, normRef, uomParts,
     // auth
