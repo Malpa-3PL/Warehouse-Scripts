@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Pallet Pack
 // @namespace    malpa
-// @version      1.8.0
+// @version      1.9.0
 // @match        https://*.canary7.com/*
 // @homepageURL  https://github.com/zaynnev/malpa3pl
 // @supportURL   https://github.com/zaynnev/malpa3pl/issues
@@ -40,6 +40,38 @@
  *
  *  v1.2.3 — Shell is a fixed overlay pinned to C7's content area. We never reparent or
  *  restyle C7's own chrome, so its tabs cannot break.
+ *
+ *  ------------------------------------------------------------------------------
+ *  v1.9.0 — two additions to View scanned. Nothing was removed: every v1.8.0 path,
+ *  function and screen is still present and still behaves the same.
+ *
+ *  (1) PER-CONTAINER TOTAL. Each container group in View scanned now carries its total
+ *      unit count on the header (known lines plus unexpected scans at their own factor,
+ *      via the existing unitsIn()). No new disclosure on a blind screen — it is the sum
+ *      of the per-item totals already printed underneath it.
+ *
+ *  (2) UNVERIFY FROM A CLOSED CONTAINER. Previously only the open box was correctable, so
+ *      an over-count that had already been boxed could only be fixed by resetting the
+ *      whole order. "Closed" here is a purely LOCAL boundary — the container does not
+ *      exist in Canary7, nothing has been moved into it and no weight has been sent, all
+ *      of which happens at Finish — so there is nothing remote to get out of step with.
+ *
+ *      `unverify` / `unverifyUnexpected` are untouched and still exported; the new
+ *      `unverifyIn` / `unverifyUnexpectedIn` take the container explicitly and are what
+ *      View scanned now calls. The row builders gained an optional trailing `box`
+ *      argument, so their old 4-argument shape still resolves to the open container.
+ *
+ *      Three things taking units out of a closed box has to keep straight:
+ *        • the shipment-wide item total drops by the same amount, so the box ledger still
+ *          sums to it — that is the invariant commit packs from;
+ *        • its keyed weight is reduced by the weight of what came out, so the figure sent
+ *          to close-to-container still describes the box. An estimate from item weights;
+ *          boxes with no weight keyed, or items with no weight on file, are left alone;
+ *        • a box emptied completely is dropped and the rest renumbered, or commit would
+ *          create and close an empty pallet in Canary7.
+ *
+ *      A container that DOES exist in Canary7 — a commit that part-failed — is refused:
+ *      that stock has really moved and cannot be un-moved from here (containerIsLocal).
  *
  *  ------------------------------------------------------------------------------
  *  v1.8.0 — PARTIAL RESCAN on a failed verification, for allow-listed companies only
@@ -179,7 +211,7 @@
   // malpa.canary7.com is a static Angular app (S3/CloudFront — calling index.php
   // there returns an XML AccessDenied 403); the Canary7 API itself is served from
   // stgauth.canary7.com, which is what both proven sibling scripts call.
-  const VERSION          = '1.8.0';   // keep in step with @version or the fleet won't update
+  const VERSION          = '1.9.0';   // keep in step with @version or the fleet won't update
   const API_BASE         = 'https://stgauth.canary7.com/index.php?r=';
   const WAREHOUSE_ID     = 10;      // guide §5 — HAR shows 10; CONFIRM for production
   const PACK_LOCATION_ID = 72037;   // guide §3 D5 / §5 — packing/close location (code WDD-02); per-station constant, CONFIRM
@@ -1641,21 +1673,30 @@
     const removals = [];
     const groups = [];
     boxes.forEach((box, idx) => {
-      const editable = box === Cache.current;   // only the open container is correctable
+      const editable = box === Cache.current;   // the open container
+      // v1.9.0 — a CLOSED container is correctable too. "Closed" is a local boundary only:
+      // the container does not exist in Canary7, nothing has been moved into it and no
+      // weight has been sent until Finish. A container that DOES exist in C7 (a commit
+      // that part-failed) is not editable, here or anywhere.
+      const correctable = editable || containerIsLocal(box);
       const rows = [];
       for (const [id, base] of box.lines) {
         if (base <= 0) continue;
-        rows.push(itemScanRow(id, base, editable, removals));
+        rows.push(itemScanRow(id, base, correctable, removals, box));
       }
       for (const [code, n] of (box.unexpected || new Map())) {
         if (n <= 0) continue;
-        rows.push(unexpectedScanRow(code, n, editable, removals));
+        rows.push(unexpectedScanRow(code, n, correctable, removals, box));
       }
       if (!rows.length) return;
       const label = `Container ${idx + 1}` +
         (box.containerNo ? ` — ${_esc(box.containerNo)}` : '') +
         (editable ? ' (open)' : '');
-      groups.push(`<div class="mpp-vs-group"><div class="mpp-vs-group-h">${label}</div>${rows.join('')}</div>`);
+      // v1.9.0 — total units in THIS container, on the group header. Discloses nothing new
+      // on a blind screen: it is the sum of the per-item totals already listed below it.
+      const boxTotal = unitsIn(box);
+      const totalPill = `<span class="mpp-vs-group-qty">${boxTotal} unit${boxTotal === 1 ? '' : 's'}</span>`;
+      groups.push(`<div class="mpp-vs-group"><div class="mpp-vs-group-h">${label}${totalPill}</div>${rows.join('')}</div>`);
     });
 
     const body = groups.length
@@ -1676,15 +1717,18 @@
       modal.remove();
       setTimeout(() => document.getElementById('mpp-scan-in')?.focus(), 40);
     });
-    // Remove (unverify) one of a UOM from the open container, then re-render.
+    // Remove (unverify) one of a UOM from the container that row belongs to, then
+    // re-render. v1.9.0: `rm.box` may be a CLOSED container; it falls back to the open one
+    // so a removal registered by the old 4-argument row shape still works.
     modal.addEventListener('click', (e) => {
       const btn = e.target.closest('.mpp-vs-rm');
       if (!btn) return;
       e.preventDefault();
       const rm = removals[Number(btn.dataset.idx)];
       if (!rm) return;
-      if (rm.unexpected) unverifyUnexpected(rm.unexpected);
-      else unverify(rm.itemId, rm.factor);
+      const box = rm.box || Cache.current;
+      if (rm.unexpected) unverifyUnexpectedIn(box, rm.unexpected);
+      else unverifyIn(box, rm.itemId, rm.factor);
       modal.remove(); showViewScanned();
     });
   }
@@ -1718,12 +1762,101 @@
     updateScanScreenMeta();
     vibrate([20]);
   }
+  // ===========================================================================
+  // 10b. UNVERIFY FROM ANY CONTAINER, INCLUDING A CLOSED ONE  (v1.9.0)
+  // ===========================================================================
+  //
+  // `unverify` / `unverifyUnexpected` above are kept exactly as they were: the open-box
+  // case, still exported, still what the scan screen uses. These are the general forms
+  // that take the container explicitly — keep the two in step if either is ever changed.
+  //
+  // Correcting a CLOSED box is safe here because "closed" is a purely local boundary: the
+  // container does not exist in Canary7 yet, no child has been moved into it and no weight
+  // has been sent. All of that happens at Finish. The one case where that stops being true
+  // is a commit that part-failed and left real containers behind, and `containerIsLocal`
+  // refuses those.
+
+  // A container is still ours to edit only while Canary7 knows nothing about it.
+  function containerIsLocal(box) {
+    return !!box && !box._c7Id && !box._c7Packed;
+  }
+
+  // Weight and emptiness upkeep after units leave a CLOSED box (v1.9.0).
+  //  • Its operator-keyed weight now describes contents it no longer holds, so reduce it by
+  //    the weight of what came out. An estimate from item weights, but strictly better than
+  //    a figure that includes units that are gone. Boxes with no weight keyed, or items
+  //    with no weight on file, are left alone rather than guessed at.
+  //  • A box emptied completely is dropped: commit walks Cache.containers and would
+  //    otherwise create and close an empty pallet in Canary7.
+  function reconcileClosedBox(box, removedWeight) {
+    if (box === Cache.current) return;
+    if (num(box.weight) > 0 && removedWeight > 0) {
+      const before = num(box.weight);
+      box.weight = Math.max(0, Math.round((before - removedWeight) * 100) / 100);
+      LOG('closed box', box.containerNo || box.seq, 'weight', before, '->', box.weight,
+          'after unverify');
+    }
+    if (unitsIn(box) > 0) return;
+    const i = Cache.containers.indexOf(box);
+    if (i < 0) return;
+    Cache.containers.splice(i, 1);
+    Cache.containers.forEach((c, n) => { c.seq = n + 1; });
+    if (Cache.current) Cache.current.seq = Cache.containers.length + 1;
+    LOG('closed box', box.containerNo || 'container', 'emptied by unverify — dropped');
+    toast(`${box.containerNo || 'Container'} is now empty — removed.`);
+  }
+
+  // Remove one UOM's worth (factor base units) of an item from ANY container, keeping the
+  // shipment-wide item total in step. Returns true if anything was actually removed.
+  function unverifyIn(box, itemId, factor) {
+    if (!box) return false;
+    if (!containerIsLocal(box)) {
+      toast('That container is already packed in Canary7 — it cannot be changed here.');
+      return false;
+    }
+    const have = box.lines.get(itemId) || 0;
+    const dec = Math.min(factor, have);
+    if (dec <= 0) return false;
+    if (have - dec <= 0) box.lines.delete(itemId);
+    else box.lines.set(itemId, have - dec);
+    const it = Cache.items.get(itemId);
+    if (it) it.scannedBase = Math.max(0, it.scannedBase - dec);
+    reconcileClosedBox(box, dec * ((it && it.unitWeight) || 0));
+    updateScanScreenMeta();
+    vibrate([20]);
+    return true;
+  }
+
+  // Same for one unexpected SCAN of a barcode. No weight adjustment: an unrecognised
+  // barcode has no item record, so there is no unit weight to subtract — the box keeps
+  // its keyed weight rather than being adjusted by a number we would have to invent.
+  function unverifyUnexpectedIn(box, code) {
+    if (!box) return false;
+    if (!containerIsLocal(box)) {
+      toast('That container is already packed in Canary7 — it cannot be changed here.');
+      return false;
+    }
+    const have = box.unexpected.get(code) || 0;
+    if (have <= 0) return false;
+    if (have - 1 <= 0) box.unexpected.delete(code);
+    else box.unexpected.set(code, have - 1);
+    const total = (Cache.unexpected.get(code) || 0) - 1;
+    if (total <= 0) Cache.unexpected.delete(code);
+    else Cache.unexpected.set(code, total);
+    reconcileClosedBox(box, 0);
+    updateScanScreenMeta();
+    vibrate([20]);
+    return true;
+  }
+
   // An unexpected scan card: resolved item code (via data-unex/resolveUnexpectedRows,
   // falling back to the raw barcode), the count, and — for the open box — Unverify.
-  function unexpectedScanRow(code, n, editable, removals) {
+  function unexpectedScanRow(code, n, editable, removals, box) {
     let rm = '';
     if (editable) {
-      const idx = removals.push({ unexpected: code }) - 1;
+      // `box` is optional and defaults to the open container, so the original 4-argument
+      // call shape still behaves exactly as it did (v1.9.0).
+      const idx = removals.push({ unexpected: code, box: box || Cache.current }) - 1;
       rm = `<button class="mpp-vs-rm" data-idx="${idx}" title="Unverify one">Unverify</button>`;
     }
     // Rendered with whatever factor is known now; resolveUnexpectedRows() corrects the
@@ -1738,14 +1871,15 @@
   }
   // One item = a small card: header (code + description, no qty), one row per UOM,
   // then a Total footer (guide §10).
-  function itemScanRow(id, base, editable, removals) {
+  function itemScanRow(id, base, editable, removals, box) {
     const it = Cache.items.get(id);
     const uomLines = uomParts(id, base).map(p => {
       const nm = _esc(_plural(p.name, p.count));
       const hint = p.factor > 1 ? ` <span class="mpp-vs-uom-f">(${p.factor} each)</span>` : '';
       let rm = '';
       if (editable) {
-        const idx = removals.push({ itemId: id, factor: p.factor }) - 1;
+        // `box` optional, defaults to the open container — see unexpectedScanRow (v1.9.0).
+        const idx = removals.push({ itemId: id, factor: p.factor, box: box || Cache.current }) - 1;
         rm = `<button class="mpp-vs-rm" data-idx="${idx}" title="Unverify one ${_esc(p.name)}">Unverify</button>`;
       }
       return `<div class="mpp-vs-uom"><span>${p.count} ${nm}${hint}</span>${rm}</div>`;
@@ -2687,7 +2821,14 @@
       /* View-scanned per-container grouping */
       .mpp-vs-group{display:flex;flex-direction:column;gap:5px}
       .mpp-vs-group-h{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;
-        color:var(--c7-muted2);margin-top:8px;padding:0 2px}
+        color:var(--c7-muted2);margin-top:8px;padding:0 2px;
+        /* v1.9.0 — row layout so the per-container total sits opposite the label */
+        display:flex;align-items:baseline;justify-content:space-between;gap:8px}
+      /* v1.9.0 — per-container total units. Deliberately louder than the label: on a
+         pallet this is the number the operator is actually checking. */
+      .mpp-vs-group-qty{flex:none;font-size:14px;font-weight:700;text-transform:none;
+        letter-spacing:0;color:var(--c7-text);background:var(--c7-surf2);
+        border:1px solid var(--c7-border);border-radius:12px;padding:3px 10px}
       .mpp-vs-group:first-child .mpp-vs-group-h{margin-top:0}
       /* ── success / error ── */
       .mpp-big-tick{font-size:64px;color:var(--c7-green);font-weight:700;line-height:1}
@@ -2731,6 +2872,12 @@
     inspectContainer, c7HoldsContainers,
     // partial rescan (v1.8.0)
     PARTIAL_RESCAN_COMPANY_IDS, partialRescanAvailable, unitsIn,
+    // unverify from any container + per-container totals (v1.9.0)
+    unverifyIn, unverifyUnexpectedIn, containerIsLocal, reconcileClosedBox,
+    showViewScanned, itemScanRow, unexpectedScanRow,
+    // the original open-box forms — never exported before, so nothing could assert that
+    // v1.9.0 left them behaving identically
+    unverify, unverifyUnexpected,
     showMismatch, doFinish, onFinish, newContainer,
     updateScanScreenMeta, scheduleScanMetaUpdate,
     uomForReference, normRef, uomParts,
