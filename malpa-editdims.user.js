@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Malpa Edit Dimensions
 // @namespace    https://malpa.canary7.com
-// @version      1.1
-// @description  Adds an "Edit Dimensions" button to the Canary7 consigning screen so a packer can correct a container's weight / length / width / height
+// @version      2.1.1
+// @description  Adds an "Edit Dimensions" button to the Canary7 consigning screen (#/workbenchv) so an operator can correct a container's weight / length / width / height
 // @author       Malpa 3PL
 // @homepageURL  https://github.com/zaynnev/malpa3pl
 // @supportURL   https://github.com/zaynnev/malpa3pl/issues
@@ -10,145 +10,173 @@
 // @downloadURL  https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-editdims.user.js
 // @match        https://*.canary7.com/*
 // @grant        none
-// @run-at       document-idle
+// @run-at       document-start
 // ==/UserScript==
 
 /* =============================================================================
- * malpa-editdims  -  Edit Dimensions button, Canary7 consigning screen
+ * malpa-editdims.user.js  -  v2.1.0
  *
- * WHAT THIS DOES
- *   Injects one button next to C7's own "Edit Weight" button on the consigning
- *   screen. It scrapes the location code, container number and shipment number
- *   off the screen, resolves them to ids through the legacy monolith, lists the
- *   containers on the shipment, and lets the operator correct weight / length /
- *   width / height on the one they pick.
- *
- * WHY @grant none
- *   Everything is on *.canary7.com - the UI on malpa.canary7.com and the
- *   monolith API on stgauth.canary7.com. No non-Canary7 host is touched, so no
- *   grant is needed, and staying out of Tampermonkey's sandbox is what lets a
- *   plain fetch() carry the app's own session.
- *
- * HOUSE RULES OBSERVED
- *   - Adds to C7's chrome only. The button is inserted as a SIBLING of the
- *     existing one (insertAdjacentElement('afterend')). No C7 node is moved,
- *     restyled, or given an inline display:none.
- *   - Every id and class is prefixed `edim`.
- *   - getToken() / mkHeaders() / API_ROOT / WAREHOUSE_ID are lifted verbatim
- *     from malpa-transfer.user.js v2.6.1. No auth scheme was invented here.
+ * v2 SUPERSEDES v1. v1 never appeared on screen at all: its route guard was a
+ * regex looking for the word "consign", and the consigning screen's URL contains
+ * no such word. v2 also deletes v1's entire DOM-scraping layer, which merged
+ * values across unrelated tables and could have fed the wrong container id into
+ * a production write.
  *
  * -----------------------------------------------------------------------------
- * CONFIRMED API BEHAVIOUR
- *   Probed read-only against the staging tenant on 2026-08-31, company 46
- *   (MA-TRL, the sandbox trial account), warehouse 10 (Darra - the only live
- *   warehouse; never target 9). Base for all four calls is the legacy monolith
- *   https://stgauth.canary7.com/index.php?r=<route>
+ * CONFIRMED  (source and date given for every item)
+ * -----------------------------------------------------------------------------
+ * [HAR]  HAR capture of the live consigning screen, malpa.canary7.com.har,
+ *        31 Aug 2026, staging tenant, company 46 (MA-TRL), warehouse 10.
+ * [MCP]  Read-only probe through the malpa-canary7 MCP.
  *
- *   (a) GET configuration/location?location_code=WDD-02&warehouse_id=10
- *         -> [{ id: 72037, location_code: "WDD-02", warehouse_id: 10,
- *               status: 1, location_type_id: 32, location_class_id: 6,
- *               enable_license_plate: 1 }]
- *       [0].id is close_to_location_id. An EMPTY ARRAY means the location is
- *       unknown - surface it, never guess an id.
+ * ROUTE                                                              [HAR]
+ *   The consigning screen is  https://malpa.canary7.com/#/workbenchv
+ *   "consign" appears nowhere in the URL. #/workbenchv is a GENERIC workbench
+ *   route, so it is necessary but NOT sufficient - see the three-part guard in
+ *   isConsignRoute() + hasConsigningEvidence() + findAnchor().
  *
- *   (b) GET shipment/shipment-header?shipment_number=LA_TEST_SHIPMENT_20250822.1%23%237
- *           &warehouse_id=10
- *         -> [{ id: 737834, warehouse_id: 10, company_id: 46,
- *               consignment_id: 1235000, no_of_containers: 1,
- *               leading_status_id: 7, trailing_status_id: 7 }]
- *       [0].id is shipment_header_id.
+ * THE DATA SOURCE                                                    [HAR]
+ *   The screen loads a container with, on the page's own fetch/XHR:
+ *     GET https://stgauth.canary7.com/index.php
+ *         ?r=shipment/shipment-container/get-consigning-container
+ *         &expand=status,stagingDock,consignment,containerType
+ *         &container_no=LA_TEST_SHIPMENT_20250822.1%23%237
+ *         &initiation_method_id=1
+ *         &item_code=null
+ *   200, a single-element array. That one payload carries EVERY value this
+ *   script needs, already resolved:
+ *     container_id           <- [0].id                       (1449741)
+ *     close_to_location_id   <- [0].staging_dock_id           (72037, WDD-02)
+ *     current w / l / w / h  <- [0].weight/.length/.width/.height (0.84, 6, 2, 5)
+ *     container list filter  <- [0].shipment_header_id        (737834)
+ *     screen confirmation    <- [0].status.description == "Consigning Pending"
+ *   So v2 intercepts that call instead of reading the screen. No scraping.
  *
- *       '#' MUST BE PERCENT-ENCODED. The test shipment number contains '##'.
- *       An unencoded '#' truncates the URL at the fragment and the call
- *       silently returns the wrong thing. Every query string here goes through
- *       buildQuery()/encodeURIComponent - never string concatenation.
+ * REQUEST HEADERS                                                    [HAR]
+ *   The API answers  access-control-allow-origin: *  with NO credentials, and
+ *   the preflight negotiates:
+ *     authorization, x-correlation-id, x-reference-id, x-session-id, x-warehouse-id
+ *   Observed live: x-warehouse-id: 10, x-session-id: 26,
+ *   x-correlation-id: <uuid v4>, x-reference-id: <8-char id>, plus authorization
+ *   (redacted by Chrome, but negotiated in the preflight). Auth is therefore a
+ *   BEARER HEADER, not a cookie - this script never sends credentials:'include'.
  *
- *   (c) GET shipment/shipment-container?shipment_header_id=737834
- *         -> [{ id: 1449741, container_no: "LA_TEST_SHIPMENT_20250822.1##7",
- *               status_id: 7, shipment_header_id: 737834,
- *               staging_dock_id: 72037, container_type_id: 39,
- *               consignment_id: 1235000, parent_id: null,
- *               weight: 0.84, length: 6, width: 2, height: 5,
- *               to_container: 1, job_instruction_id: 2592845 }]
+ *   An intercepted request's header set is mined for the TWO values this script
+ *   cannot derive - x-session-id and x-warehouse-id - and for nothing else. It is
+ *   NOT reused wholesale: x-correlation-id identifies ONE of the app's requests,
+ *   so pinning it to our list call, our write and our verifying re-read would
+ *   make three separate calls masquerade as that single app request, and a
+ *   captured Authorization may be stale by the time the operator submits.
+ *   Authorization therefore always comes from getToken(), and a fresh
+ *   x-correlation-id (uuid v4) and x-reference-id are generated PER CALL.
+ *   See reqHeaders().
  *
- *       TRAP: `shipment_header_id` is the working filter. `shipment_id` is
- *       SILENTLY IGNORED - it returns an unfiltered page of unrelated
- *       containers. Do not use it.
- *       `container_no` also filters and returns the same single row; it is used
- *       here only as a cross-check that the container on screen is in the list.
- *       `staging_dock_id` equals the location id from (a) - asserted, and a
- *       mismatch is warned about in the modal rather than silently accepted.
+ * THE CONTAINER LIST                                                 [MCP]
+ *   GET /index.php?r=shipment/shipment-container&shipment_header_id=737834
+ *   shipment_header_id is the working filter. shipment_id is SILENTLY IGNORED
+ *   and returns an unfiltered page of unrelated containers - never use it.
+ *   container_no also works as a direct filter and returns the same single row.
  *
- *   (d) THE WRITE (a GET, per the confirmed reference call):
- *       GET shipment/shipment-container/close-to-container
- *           &close_to_location_id=72037&container_id=1449741&profile_id=14
- *           &weight=0.84&length=6&width=2&height=5
+ * THE WRITE                                                          [HAR]
+ *   GET /index.php?r=shipment/shipment-container/close-to-container
+ *       &close_to_location_id=72037&container_id=1449741&profile_id=14
+ *       &weight=0.84&length=6&width=2&height=5
+ *   profile_id is hard-coded to 14 per the requirement. NOTE: the supplied
+ *   sample URL showed 7, so PROFILE_ID below is the single place to change it.
  *
- *   DO NOT TRUST THE RESPONSE. Several Canary7 writes echo pre-write state and
- *   business rejections arrive as HTTP 500 with a numeric code. After the write
- *   this script RE-READS (c) and compares the four fields against what was
- *   submitted; success is only shown when the re-read matches. On a mismatch it
- *   prints submitted values, re-read values and the raw body, and does NOT
- *   auto-retry.
+ * AUTH                                                        (lifted verbatim)
+ *   getToken(), mkHeaders() and API_ROOT / API_BASE / WAREHOUSE_ID are copied
+ *   verbatim from malpa-transfer.user.js v2.6.1. No auth scheme is invented here.
  *
  * -----------------------------------------------------------------------------
- * ASSUMED, NOT CONFIRMED (change here if the floor says otherwise)
- *   - profile_id is hard-coded 14 per the requirement. The sample URL supplied
- *     with the requirement showed 7. See PROFILE_ID below - one line to change.
- *   - The consigning route is matched on /consign/i against location.href +
- *     location.hash. The exact route was not observed live, so the first time
- *     the "Edit Weight" anchor is seen the real URL is logged (see
- *     logRouteOnce) so the guard can be tightened to an exact path later.
- *   - The consigning table's header text. Location / Container / Shipment are
- *     matched by normalised header text with aliases; column INDEX is never
- *     hard-coded. If the headers differ, the modal names the lookup that failed.
- *   - Which table on the screen is THE table. Only one was seen live. Because a
- *     second table would silently pair the right location with the wrong
- *     container, location + container are only accepted when they come from the
- *     SAME table and the SAME row; anything else is an error, never a merge.
- *     (Shipment number legitimately lives outside the table - see the <span>
- *     fallback, which is flagged low-confidence.)
- *   - Which row of that table the operator means. A row marked
- *     active/selected/highlight is preferred; falling back to the first row is
- *     recorded in `sources` and warned about in the modal.
- *   - UNITS. Nothing in the confirmed API says `weight` is kilograms, or that
- *     `length`/`width`/`height` are centimetres - the container record carries
- *     bare numbers. So the four inputs and the container option label carry NO
- *     unit at all. Add one here only once the floor or Canary7 confirms it;
- *     labelling weight "kg" on a guess is how a 0.84 becomes an 840.
+ * ASSUMED / NOT CONFIRMED  -  do not treat any of this as fact
+ * -----------------------------------------------------------------------------
+ *  1. UNITS. Nothing confirmed says what unit weight/length/width/height are in.
+ *     They are therefore never labelled "kg" or "cm" anywhere in this UI, and the
+ *     numbers are passed through exactly as typed.
+ *  2. x-session-id. Observed as 26 on the live request, but its origin (where
+ *     the app derives it) is unconfirmed. It is reused verbatim when captured
+ *     from an intercepted request, and is NOT synthesised when falling back to
+ *     mkHeaders() - a guessed session id is worse than an absent one.
+ *  3. Whether #/workbenchv hosts screens OTHER than consigning that also render
+ *     an "Edit Weight" button. This is exactly why the route alone is not the
+ *     guard: a get-consigning-container response must also have been seen.
+ *  4. Whether access_token in localStorage/sessionStorage is live on this
+ *     screen. hasToken() reports it; the header-capture path does not depend on it.
+ *  5. readContainerNoFromPage() - the fallback used only when the script loaded
+ *     AFTER the app's own call fired. The selectors it tries are NOT confirmed;
+ *     if it finds nothing the modal says so and stops. It never guesses, and it
+ *     is not a revival of v1's scraper: it reads ONE value and nothing else.
+ *  6. profile_id 14 (see above) - required, but its meaning is not confirmed.
+ *  7. THE FALLBACK IS UNREACHABLE FROM THE BUTTON BY DESIGN. tryInject() refuses
+ *     to inject unless State.row is set, and the fallback in loadContainers()
+ *     only runs when State.row is null - so no click can ever reach it. It is
+ *     kept solely as a CONSOLE ESCAPE HATCH: window.__editDims.open() in a
+ *     session where the row was captured and has since been lost. The tests
+ *     exercise it through that debug handle, never through a click. If the
+ *     three-part guard is ever relaxed, this path becomes live again - which is
+ *     why it still refuses to guess.
+ *  8. The staleness threshold in STALE_ROW_MS (60s) is a judgement call, not a
+ *     confirmed figure. Nothing establishes how long a captured consigning row
+ *     stays accurate; the warning never blocks.
+ *
+ * -----------------------------------------------------------------------------
+ * TEST DATA (staging, MA-TRL company 46, warehouse 10 Darra - never 9)
+ *   route      https://malpa.canary7.com/#/workbenchv
+ *   shipment   LA_TEST_SHIPMENT_20250822.1##7  -> shipment_header_id 737834
+ *   container  LA_TEST_SHIPMENT_20250822.1##7  -> id 1449741, 0.84 / 6 x 2 x 5
+ *   dock       WDD-02 -> 72037
+ *   type       39 "Lou Lou Carton", max 12 / 42 x 28 x 20
  * ========================================================================== */
 
 (function () {
   'use strict';
 
-  // ---------------------------------------------------------------------------
-  // 0. CONSTANTS
-  // ---------------------------------------------------------------------------
+  /* ===========================================================================
+   * CONFIG
+   * ======================================================================== */
+
   const TAG          = '[Edit Dims]';
-  const VERSION      = '1.1';                   // keep in step with @version
+  const VERSION      = '2.1.0';                      // keep in step with @version
+
+  // Lifted verbatim from malpa-transfer.user.js
   const API_ROOT     = 'https://stgauth.canary7.com';
   const API_BASE     = API_ROOT + '/index.php?r=';
-  const WAREHOUSE_ID = 10;                      // 10 = Darra (Malpa's only live WH)
+  const WAREHOUSE_ID = 10;
 
-  // Fixed at 14 per the requirement. The sample URL supplied with the
-  // requirement showed profile_id=7 - change this one line if 7 turns out right.
+  // Hard-coded per the requirement. The supplied sample URL showed 7; change
+  // this one constant if that turns out to be the operative profile.
   const PROFILE_ID   = 14;
 
-  const ROUTE_LOCATION  = 'configuration/location';
-  const ROUTE_SHIPMENT  = 'shipment/shipment-header';
-  const ROUTE_CONTAINER = 'shipment/shipment-container';
-  const ROUTE_WRITE     = 'shipment/shipment-container/close-to-container';
+  // The generic workbench route. Necessary, never sufficient - see the guard.
+  // ';' is tolerated alongside '/', '?' and '#' because Angular writes matrix
+  // params onto a route segment as #/workbenchv;id=1449741.
+  const ROUTE_RE     = /^#\/workbenchv(?:[/?#;].*)?$/i;
 
-  const ANCHOR_TEXT = 'Edit Weight';            // C7's own button, our anchor
-  const BTN_TEXT    = 'Edit Dimensions';
+  // How old a captured consigning row may be before the modal warns about it.
+  // A judgement call, not a confirmed figure - see the ASSUMED block. Warn only.
+  const STALE_ROW_MS = 60000;
 
-  // Every id/class this script owns. Unique prefix: edim.
-  const ID = {
+  // The substring that identifies the app's own consigning load.
+  const CONSIGN_MARKER = 'get-consigning-container';
+
+  // The expand list the app itself sends. Byte-for-byte, commas unencoded.
+  const CONSIGN_EXPAND = 'status,stagingDock,consignment,containerType';
+  const LIST_EXPAND    = 'status,stagingDock,containerType';
+
+  const ROUTES = {
+    consigning: 'shipment/shipment-container/get-consigning-container',
+    list:       'shipment/shipment-container',
+    write:      'shipment/shipment-container/close-to-container',
+  };
+
+  // Every id this script owns. Unique 'edim' prefix, no exceptions.
+  const IDS = {
     style:    'edim-style',
     btn:      'edim-btn',
     backdrop: 'edim-backdrop',
     modal:    'edim-modal',
-    ctx:      'edim-ctx',
+    title:    'edim-title',
     select:   'edim-select',
     fields:   'edim-fields',
     weight:   'edim-weight',
@@ -157,16 +185,86 @@
     height:   'edim-height',
     diff:     'edim-diff',
     msg:      'edim-msg',
+    actions:  'edim-actions',
     yes:      'edim-yes',
     no:       'edim-no',
+    spinner:  'edim-spinner',
     crash:    'edim-crash',
   };
 
-  console.log(TAG, 'script loaded v' + VERSION);
+  const CONFIG = {
+    version:     VERSION,
+    apiRoot:     API_ROOT,
+    apiBase:     API_BASE,
+    warehouseId: WAREHOUSE_ID,
+    profileId:   PROFILE_ID,
+    routes:      ROUTES,
+    ids:         IDS,
+    routeRe:     String(ROUTE_RE),
+    consignMarker: CONSIGN_MARKER,
+  };
 
-  // ---------------------------------------------------------------------------
-  // 1. AUTH  (lifted verbatim from malpa-transfer.user.js v2.6.1)
-  // ---------------------------------------------------------------------------
+  // One stylesheet, every selector prefixed. Kept as an array of single-quoted
+  // literals so an offline test can scan it for a leaked class name.
+  const CSS = [
+    '#edim-btn{margin-left:8px}',
+    '#edim-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:2147483646}',
+    '#edim-modal{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);',
+    'width:min(520px,94vw);max-height:90vh;overflow:auto;background:#fff;color:#111827;',
+    'border-radius:14px;box-shadow:0 24px 60px rgba(0,0,0,.28);padding:22px;',
+    'z-index:2147483647;font-family:Inter,Roboto,Arial,sans-serif;font-size:15px}',
+    '.edim-title{font-size:22px;font-weight:700;margin-bottom:14px}',
+    '.edim-row{margin-bottom:12px}',
+    '.edim-label{display:block;font-size:12px;font-weight:700;text-transform:uppercase;',
+    'letter-spacing:.5px;color:#6b7280;margin-bottom:5px}',
+    '.edim-select{width:100%;height:46px;border:1px solid #d1d5db;border-radius:10px;',
+    'padding:0 12px;font-size:15px;background:#fff;color:#111827}',
+    '.edim-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}',
+    '.edim-input{width:100%;height:46px;border:1px solid #d1d5db;border-radius:10px;',
+    'padding:0 12px;font-size:16px;background:#fff;color:#111827}',
+    '.edim-diff{background:#f9fafb;border:1px dashed #d1d5db;border-radius:10px;',
+    'padding:12px;margin:12px 0;font-size:14px;line-height:1.55;white-space:pre-wrap}',
+    '.edim-diff-head{font-weight:700;margin-bottom:6px}',
+    '.edim-diff-line{font-variant-numeric:tabular-nums}',
+    '.edim-msg{white-space:pre-wrap;font-size:13px;line-height:1.5;margin-top:10px;',
+    'max-height:220px;overflow:auto;font-family:ui-monospace,Menlo,Consolas,monospace}',
+    '.edim-warn{color:#b45309}',
+    '.edim-error{color:#dc2626}',
+    '.edim-good{color:#047857}',
+    '.edim-actions{display:flex;align-items:center;gap:10px;margin-top:16px}',
+    '.edim-spacer{flex:1}',
+    '.edim-action{height:44px;min-width:96px;border:none;border-radius:10px;font-size:15px;',
+    'font-weight:600;cursor:pointer}',
+    '.edim-no{background:#e5e7eb;color:#111827}',
+    '.edim-yes{background:#2563eb;color:#fff}',
+    '.edim-spinner{font-size:13px;color:#6b7280}',
+    '#edim-crash{position:fixed;left:12px;right:12px;bottom:12px;z-index:2147483647;',
+    'background:#fff5f5;border:2px solid #fecaca;border-radius:12px;padding:14px;',
+    'color:#991b1b;font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;',
+    'max-height:45vh;overflow:auto}',
+  ].join('');
+
+  /* ===========================================================================
+   * LOGGING
+   * ======================================================================== */
+
+  function log() {
+    try {
+      const args = [TAG].concat([].slice.call(arguments));
+      console.log.apply(console, args);
+    } catch (_) {}
+  }
+  function warn() {
+    try {
+      const args = [TAG].concat([].slice.call(arguments));
+      console.warn.apply(console, args);
+    } catch (_) {}
+  }
+
+  /* ===========================================================================
+   * AUTH  -  lifted verbatim from malpa-transfer.user.js
+   * ======================================================================== */
+
   function getToken() {
     for (const store of [localStorage, sessionStorage]) {
       try {
@@ -189,515 +287,107 @@
     };
   }
 
-  // ---------------------------------------------------------------------------
-  // 2. API LAYER
-  // ---------------------------------------------------------------------------
-
-  // Build a query string with encodeURIComponent on BOTH key and value.
-  // '#' -> %23 is the whole reason this exists; see the header comment.
-  function buildQuery(params) {
-    const parts = [];
-    const p = params || {};
-    for (const k of Object.keys(p)) {
-      const v = p[k];
-      if (v === undefined || v === null || v === '') continue;
-      parts.push(encodeURIComponent(k) + '=' + encodeURIComponent(String(v)));
-    }
-    return parts.join('&');
+  function hasToken() {
+    return !!getToken();
   }
 
-  // The route itself is NOT encoded - it is part of the ?r= value and Canary7
-  // wants the slashes raw (shipment/shipment-container/close-to-container).
+  function uuidv4() {
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+      const r = (Math.random() * 16) | 0;
+      const v = c === 'x' ? r : ((r & 0x3) | 0x8);
+      return v.toString(16);
+    });
+  }
+
+  /* Headers for our own calls.
+   *
+   * The captured header set is MINED, never replayed. It contributes exactly two
+   * values - x-session-id and x-warehouse-id - because those are the only two
+   * this script cannot derive for itself.
+   *
+   * Everything else is built fresh per call:
+   *   Authorization    - always from getToken(). A captured bearer may already
+   *                      be stale by the time the operator presses Yes.
+   *   x-correlation-id - a fresh uuid v4. The app's own correlation id belongs
+   *                      to ONE of the app's requests; pinning it to our list
+   *                      call, our write and our verifying re-read would make
+   *                      three separate calls masquerade as that single one and
+   *                      would make the write untraceable in Canary7's logs.
+   *   x-reference-id   - regenerated by mkHeaders() on every call.
+   *
+   * x-session-id is still never SYNTHESISED - when nothing was captured it is
+   * simply absent, because a guessed session id is worse than no session id.
+   * See the ASSUMED block. */
+  function reqHeaders() {
+    const h = mkHeaders();               // Content-Type, Accept, Authorization,
+                                         // x-warehouse-id, x-reference-id
+    h['x-correlation-id'] = uuidv4();
+
+    const cap = H.capturedHeaders;
+    if (cap) {
+      Object.keys(cap).forEach(function (k) {
+        const lk = String(k).toLowerCase();
+        if (lk === 'x-session-id' || lk === 'x-warehouse-id') h[lk] = cap[k];
+      });
+    }
+    return h;
+  }
+
+  /* ===========================================================================
+   * URL BUILDING
+   *
+   * Everything goes through encodeURIComponent. The test container number
+   * contains '##'; a raw '#' would truncate the URL at the fragment and the
+   * request would silently address the wrong thing.
+   * ======================================================================== */
+
+  function buildQuery(params) {
+    const out = [];
+    Object.keys(params || {}).forEach(function (k) {
+      const v = params[k];
+      if (v === null || v === undefined || v === '') return;
+      // Commas are left raw: the app's own expand= list sends them unencoded and
+      // this is the one character we match byte-for-byte against the HAR.
+      out.push(encodeURIComponent(k) + '=' + encodeURIComponent(String(v)).replace(/%2C/g, ','));
+    });
+    return out.join('&');
+  }
+
+  function apiBase() { return API_BASE; }
+  function warehouseId() { return String(WAREHOUSE_ID); }
+
   function apiUrl(route, params) {
     const q = buildQuery(params);
+    // The route's own slashes are part of the ?r= value and stay raw.
     return API_BASE + route + (q ? '&' + q : '');
   }
 
-  function classifyStatus(status) {
-    if (status === 401 || status === 403) return 'auth';
-    if (status >= 500) return 'server';
-    if (status >= 400) return 'client';
-    return 'ok';
-  }
-
-  // Every call goes through here so every URL and body lands in the console
-  // under the [Edit Dims] prefix, and in window.__editDims.lastResponse.
-  async function apiGet(route, params) {
-    const url = apiUrl(route, params);
-    console.log(TAG, 'GET', url);
-
-    let res;
-    try {
-      res = await fetch(url, { method: 'GET', headers: mkHeaders() });
-    } catch (e) {
-      const err = new Error('Network error - the request never reached Canary7. ' + (e && e.message ? e.message : e));
-      err.kind = 'network';
-      err.url = url;
-      R.lastResponse = { url, kind: 'network', error: String(e && e.message ? e.message : e) };
-      console.error(TAG, 'NETWORK FAIL', url, e);
-      throw err;
-    }
-
-    let raw = '';
-    try { raw = await res.text(); } catch (_) { raw = ''; }
-
-    let json = null;
-    if (raw) { try { json = JSON.parse(raw); } catch (_) { json = null; } }
-
-    const out = { url, status: res.status, ok: !!res.ok, raw, json, kind: classifyStatus(res.status) };
-    R.lastResponse = out;
-    console.log(TAG, 'RES', res.status, url, json !== null ? json : raw);
-
-    if (!res.ok) {
-      const code = json && (json.code || json.error_code);
-      const err = new Error(
-        (out.kind === 'auth' ? 'Session expired - log back into Canary7. ' : '') +
-        'HTTP ' + res.status + (code ? ' (code ' + code + ')' : '') +
-        ((json && (json.message || json.error)) ? ' - ' + (json.message || json.error) : '')
-      );
-      err.kind = out.kind;
-      err.status = res.status;
-      err.raw = raw;
-      err.url = url;
-      throw err;
-    }
-
-    return out;
-  }
-
-  // Confirmed responses are bare arrays; unwrap the usual envelopes defensively.
-  function asArray(json) {
-    if (!json) return [];
-    if (Array.isArray(json)) return json;
-    for (const k of ['data', 'items', 'rows', 'result', 'results']) {
-      if (Array.isArray(json[k])) return json[k];
-    }
-    return [];
-  }
-
-  // ---------------------------------------------------------------------------
-  // 3. STATE
-  // ---------------------------------------------------------------------------
-  const State = {
-    scraped: null,          // { location, container, shipment, errors[] }
-    locationId: null,       // (a) close_to_location_id
-    shipmentHeaderId: null, // (b)
-    containers: [],         // (c)
-    selectedId: null,
-    submitting: false,
-    lastSubmitted: null,
-    lastVerify: null,
-    lastError: null,
-    warnings: [],
-    reset() {
-      this.scraped = null;
-      this.locationId = null;
-      this.shipmentHeaderId = null;
-      this.containers = [];
-      this.selectedId = null;
-      this.submitting = false;
-      this.lastSubmitted = null;
-      this.lastVerify = null;
-      this.lastError = null;
-      this.warnings = [];
-    },
-  };
-
-  // Runtime handles - never persisted, never part of State.
-  const R = {
-    anchor: null,
-    backdrop: null,
-    modal: null,
-    escHandler: null,
-    lastFocus: null,
-    lastResponse: null,
-    lastWrite: null,
-    routeLogged: false,
-    watchTimer: null,
-    observer: null,
-  };
-
-  // ---------------------------------------------------------------------------
-  // 4. HELPERS
-  // ---------------------------------------------------------------------------
-  function toArr(x) {
-    if (!x) return [];
-    if (Array.isArray(x)) return x;
-    return Array.prototype.slice.call(x);
-  }
-
-  function txt(el) {
-    return el && el.textContent ? String(el.textContent).trim() : '';
-  }
-
-  function normHdr(s) {
-    return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-  }
-
-  function fmtNum(v) {
-    const n = Number(v);
-    if (!isFinite(n)) return String(v === null || v === undefined ? '' : v);
-    return String(n);
-  }
-
-  function doc() {
-    return typeof document !== 'undefined' ? document : null;
-  }
-
-  // ---------------------------------------------------------------------------
-  // 5. ROUTE + ANCHOR
-  // ---------------------------------------------------------------------------
-
-  // Guard 1 of 2. The exact consigning route was not observed live, so this is
-  // deliberately loose; logRouteOnce prints the real URL so it can be tightened.
-  function isConsignRoute(href, hash) {
-    return /consign/i.test(String(href || '') + ' ' + String(hash || ''));
-  }
-
-  function onConsignRoute() {
-    try {
-      return isConsignRoute(location.href, location.hash);
-    } catch (_) {
-      return false;
-    }
-  }
-
-  // Guard 2 of 2. NEVER match on the Angular _ngcontent-ng-cNNNNNNNNN attribute
-  // - that hash changes on every Canary7 build. Match the class C7 gives the
-  // button plus its text.
-  function findAnchor(d) {
-    d = d || doc();
-    if (!d || !d.querySelectorAll) return null;
-    const btns = toArr(d.querySelectorAll('button.btn-apply'));
-    for (const b of btns) {
-      if (txt(b) === ANCHOR_TEXT) return b;
-    }
-    return null;
-  }
-
-  function logRouteOnce() {
-    if (R.routeLogged) return;
-    R.routeLogged = true;
-    try {
-      console.log(TAG, 'consigning screen seen at href=' + location.href + ' hash=' + location.hash +
-                       ' - tighten isConsignRoute() to this path once confirmed');
-    } catch (_) {}
-  }
-
-  // ---------------------------------------------------------------------------
-  // 6. SCRAPING THE THREE VALUES
-  //    Resolved by COLUMN-HEADER TEXT, never by cell index.
-  // ---------------------------------------------------------------------------
-  // NOTE: 'order'/'orderno'/'ordernumber' are deliberately NOT shipment aliases.
-  // On a real consigning grid an "Order No" column is the customer's own
-  // reference, not the C7 shipment number, and feeding it to (b) resolves the
-  // wrong shipment header - or nothing at all.
-  const HEADER_ALIASES = {
-    location: ['location', 'locationcode', 'locationno', 'stagingdock', 'stagingdocklocation', 'dock'],
-    container: ['container', 'containerno', 'containernumber', 'containercode', 'licenceplate', 'licenseplate', 'lp'],
-    shipment: ['shipment', 'shipmentno', 'shipmentnumber', 'shipmentref'],
-  };
-
-  const FIELD_LABEL = {
-    location: 'Location code',
-    container: 'Container number',
-    shipment: 'Shipment number',
-  };
-
-  const ROW_NOTE = {
-    selected: 'selected row',
-    only: 'the only data row',
-    first: 'the FIRST of several data rows - not marked selected',
-  };
-
-  const ROW_WARNING =
-    'The row read from the table was not marked selected — verify the container before saving.';
-
-  function headerKeyFor(headerText) {
-    const n = normHdr(headerText);
-    if (!n) return null;
-    for (const key of Object.keys(HEADER_ALIASES)) {
-      if (HEADER_ALIASES[key].indexOf(n) !== -1) return key;
-    }
-    return null;
-  }
-
-  // Pick the row the operator is looking at: an active/selected row if the table
-  // marks one, otherwise the only data row, otherwise the first data row.
-  // The CONFIDENCE is returned with the row - falling back to row 0 of several
-  // is a guess about which container is on screen and is never silent.
-  function pickRow(table) {
-    const rows = toArr(table.querySelectorAll('tr')).filter(function (r) {
-      return toArr(r.querySelectorAll('td')).length > 0;
+  function consigningUrl(containerNo) {
+    return apiUrl(ROUTES.consigning, {
+      expand: CONSIGN_EXPAND,
+      container_no: containerNo,
+      initiation_method_id: 1,
+      item_code: 'null',
     });
-    if (!rows.length) return null;
-    for (const r of rows) {
-      const cls = String(r.className || '');
-      if (/(^|\s)(active|selected|highlight|table-active|row-selected)(\s|$)/.test(cls)) {
-        return { row: r, confidence: 'selected', rowCount: rows.length };
-      }
-      if (r.dataset && (r.dataset.selected === 'true' || r.dataset.active === 'true')) {
-        return { row: r, confidence: 'selected', rowCount: rows.length };
-      }
-    }
-    return { row: rows[0], confidence: rows.length === 1 ? 'only' : 'first', rowCount: rows.length };
   }
 
-  // Read ONE table's picked row. Returns null if the table has no usable header
-  // row, otherwise { index, values, sources, confidence }.
-  function readTable(table, index) {
-    const ths = toArr(table.querySelectorAll('th'));
-    if (!ths.length) return null;
-
-    const map = {};
-    ths.forEach(function (th, i) {
-      const key = headerKeyFor(txt(th));
-      if (key && map[key] === undefined) map[key] = i;
+  function listUrl(shipmentHeaderId) {
+    // shipment_header_id ONLY. shipment_id is silently ignored by Canary7.
+    return apiUrl(ROUTES.list, {
+      shipment_header_id: shipmentHeaderId,
+      expand: LIST_EXPAND,
     });
-    if (!Object.keys(map).length) return null;
-
-    const picked = pickRow(table);
-    if (!picked || !picked.row) return null;
-
-    const tds = toArr(picked.row.querySelectorAll('td'));
-    const values = {};
-    const sources = {};
-    for (const key of Object.keys(map)) {
-      const value = txt(tds[map[key]]);
-      if (!value) continue;
-      values[key] = value;
-      sources[key] = 'table ' + (index + 1) + ' <th>"' + txt(ths[map[key]]) + '" col ' + map[key] +
-                     ' [' + ROW_NOTE[picked.confidence] + ']';
-    }
-    return { index: index, values: values, sources: sources, confidence: picked.confidence };
   }
 
-  // Location + container MUST come from the SAME table and the SAME row.
-  // Taking the first non-empty value for each key across every table on the
-  // screen looks like a clean read (errors 0, warnings 0) while pairing table
-  // 1's location with table 2's container - which then feeds the wrong
-  // container id into a production write. So: one table wins, or none does.
-  function scrapeFromTables(d) {
-    const out = { location: '', container: '', shipment: '', source: {}, warnings: [], errors: [] };
-
-    const reads = [];
-    toArr(d.querySelectorAll('table')).forEach(function (t, i) {
-      const r = readTable(t, i);
-      if (r && Object.keys(r.values).length) reads.push(r);
+  /* The SECOND way to read one container, confirmed in section 5 of the build
+   * prompt: container_no is a working direct filter on shipment-container and
+   * returns the same row. Used only as the verifying re-read's fallback - see
+   * verifyRead(). */
+  function containerByNoUrl(containerNo) {
+    return apiUrl(ROUTES.list, {
+      container_no: containerNo,
+      expand: LIST_EXPAND,
     });
-    if (!reads.length) return out;
-
-    const complete = reads.filter(function (r) { return r.values.location && r.values.container; });
-    const partial  = reads.filter(function (r) { return !(r.values.location && r.values.container) &&
-                                                        (r.values.location || r.values.container); });
-
-    let winner = complete[0];
-
-    if (!winner) {
-      if (partial.length > 1) {
-        out.errors.push(
-          'Location code and Container number were found in DIFFERENT tables, so they may describe ' +
-          'different containers. Refusing to combine them. Found: ' +
-          partial.map(function (r) {
-            return ['location', 'container'].filter(function (k) { return r.values[k]; })
-              .map(function (k) { return FIELD_LABEL[k] + ' "' + r.values[k] + '" in ' + r.sources[k]; })
-              .join(' and ');
-          }).join('; ') +
-          '. Both must come from the same row of the same table.'
-        );
-        return out;
-      }
-      // One table (or none) had anything to say - no cross-table merge is possible.
-      winner = partial[0] || reads[0];
-    } else if (complete.length > 1) {
-      out.warnings.push('More than one table on screen has both a Location and a Container column — ' +
-                        'the first was used. Check the container number before saving.');
-    }
-
-    for (const key of ['location', 'container', 'shipment']) {
-      if (winner.values[key]) {
-        out[key] = winner.values[key];
-        out.source[key] = winner.sources[key];
-      }
-    }
-    if (winner.confidence !== 'selected') out.warnings.push(ROW_WARNING);
-
-    return out;
-  }
-
-  // Fallback when there is no <th>: find a label whose text names the field and
-  // read the value next to it.
-  // A neighbouring node whose own text is itself a column header ("Shipment
-  // Number" sitting next to "Container No") is another LABEL, not this label's
-  // value. Reading it would hand the API a header string.
-  function labelValue(node) {
-    if (!node) return '';
-    const v = txt(node);
-    return (v && !headerKeyFor(v)) ? v : '';
-  }
-
-  function scrapeByLabel(d, key) {
-    const aliases = HEADER_ALIASES[key];
-    const nodes = toArr(d.querySelectorAll('td, th, label, span, div, strong, b, dt'));
-    for (const n of nodes) {
-      const t = txt(n);
-      if (!t || t.length > 40) continue;
-      if (aliases.indexOf(normHdr(t)) === -1) continue;
-
-      // A <th> is a COLUMN header: its value lives in the <td> below it, and
-      // scrapeFromTables already owns that case. The only <th> worth reading
-      // here is the row-header of a vertical detail table (<th>Location</th>
-      // <td>WDD-02</td>), so a <th> may only hand us an adjacent <td> - never
-      // the header beside it, and never the next row wholesale.
-      const isTh = String(n.tagName || '').toUpperCase() === 'TH';
-      const sib = n.nextElementSibling;
-      if (isTh) {
-        if (sib && String(sib.tagName || '').toUpperCase() === 'TD') {
-          const tv = labelValue(sib);
-          if (tv) return { value: tv, source: 'row header "' + t + '" -> adjacent <td>' };
-        }
-        continue;
-      }
-
-      const v = labelValue(sib);
-      if (v) return { value: v, source: 'label "' + t + '" -> nextElementSibling' };
-      const p = n.parentElement;
-      const pv = labelValue(p && p.nextElementSibling);
-      if (pv) return { value: pv, source: 'label "' + t + '" -> parent nextElementSibling' };
-    }
-    return null;
-  }
-
-  // Last-resort, LOW CONFIDENCE and always logged: the consigning screen renders
-  // the shipment number in a bare <span class="ng-star-inserted"> which on the
-  // confirmed screen carries the same text as the container number.
-  function scrapeShipmentSpan(d, containerNo) {
-    if (!containerNo) return null;
-    const spans = toArr(d.querySelectorAll('span.ng-star-inserted'));
-    for (const s of spans) {
-      if (txt(s) === containerNo) {
-        return { value: txt(s), source: 'span.ng-star-inserted matching the container number (low confidence)' };
-      }
-    }
-    return null;
-  }
-
-  function scrapeConsign(d) {
-    d = d || doc();
-    const result = { location: '', container: '', shipment: '', errors: [], sources: {}, warnings: [] };
-    if (!d || !d.querySelectorAll) {
-      result.errors.push('No document to scrape.');
-      return result;
-    }
-
-    const fromTables = scrapeFromTables(d);
-    for (const key of ['location', 'container', 'shipment']) {
-      if (fromTables[key]) {
-        result[key] = fromTables[key];
-        result.sources[key] = fromTables.source[key];
-      }
-    }
-    for (const w of fromTables.warnings) {
-      result.warnings.push(w);
-      console.warn(TAG, w);
-    }
-    for (const e of fromTables.errors) {
-      result.errors.push(e);
-      console.error(TAG, e);
-    }
-
-    for (const key of ['location', 'container', 'shipment']) {
-      if (result[key]) continue;
-      const hit = scrapeByLabel(d, key);
-      if (hit) {
-        result[key] = hit.value;
-        result.sources[key] = hit.source;
-      }
-    }
-
-    if (!result.shipment) {
-      const hit = scrapeShipmentSpan(d, result.container);
-      if (hit) {
-        result.shipment = hit.value;
-        result.sources.shipment = hit.source;
-        result.warnings.push('Shipment number was inferred from a <span> matching the container number - check it before saving.');
-        console.warn(TAG, 'shipment number inferred from span matching container number');
-      }
-    }
-
-    // Trim everything: the shipment <span> has leading and trailing whitespace.
-    for (const key of ['location', 'container', 'shipment']) {
-      result[key] = String(result[key] || '').trim();
-    }
-
-    for (const key of ['location', 'container', 'shipment']) {
-      if (!result[key]) {
-        result.errors.push(
-          FIELD_LABEL[key] + ' not found on screen. Tried: <th> text matching ' +
-          HEADER_ALIASES[key].join('/') + ', then a labelled-row search' +
-          (key === 'shipment' ? ', then span.ng-star-inserted' : '') + '.'
-        );
-      }
-    }
-    return result;
-  }
-
-  // ---------------------------------------------------------------------------
-  // 7. LOOKUPS  (a) -> (b) -> (c)
-  // ---------------------------------------------------------------------------
-  async function lookupLocationId(locationCode) {
-    const res = await apiGet(ROUTE_LOCATION, { location_code: locationCode, warehouse_id: WAREHOUSE_ID });
-    const arr = asArray(res.json);
-    if (!arr.length) {
-      throw new Error('Location "' + locationCode + '" is not known in warehouse ' + WAREHOUSE_ID +
-                      ' (' + ROUTE_LOCATION + ' returned an empty array). Not guessing an id.');
-    }
-    return arr[0].id;
-  }
-
-  async function lookupShipmentHeaderId(shipmentNumber) {
-    const res = await apiGet(ROUTE_SHIPMENT, { shipment_number: shipmentNumber, warehouse_id: WAREHOUSE_ID });
-    const arr = asArray(res.json);
-    if (!arr.length) {
-      throw new Error('Shipment "' + shipmentNumber + '" not found in warehouse ' + WAREHOUSE_ID +
-                      ' (' + ROUTE_SHIPMENT + ' returned an empty array).');
-    }
-    return arr[0].id;
-  }
-
-  // shipment_header_id is the WORKING filter - shipment_id is silently ignored.
-  async function listContainers(shipmentHeaderId) {
-    const res = await apiGet(ROUTE_CONTAINER, { shipment_header_id: shipmentHeaderId });
-    return asArray(res.json);
-  }
-
-  // ---------------------------------------------------------------------------
-  // 8. VALUE HELPERS  (pure - covered by the offline harness)
-  // ---------------------------------------------------------------------------
-  // NO UNIT on the weight. The API returns a bare number and nothing confirms it
-  // is kilograms - see ASSUMED, NOT CONFIRMED in the header.
-  function optionLabel(c) {
-    return String(c.container_no || ('container ' + c.id)) +
-           ' — weight ' + fmtNum(c.weight) + ', ' +
-           fmtNum(c.length) + '×' + fmtNum(c.width) + '×' + fmtNum(c.height);
-  }
-
-  const DIM_FIELDS = ['weight', 'length', 'width', 'height'];
-
-  function validateDims(dims) {
-    const errs = [];
-    const LABEL = { weight: 'Weight', length: 'Length', width: 'Width', height: 'Height' };
-    for (const f of DIM_FIELDS) {
-      const rawv = dims ? dims[f] : undefined;
-      if (rawv === undefined || rawv === null || String(rawv).trim() === '') {
-        errs.push(LABEL[f] + ' is required.');
-        continue;
-      }
-      const n = Number(rawv);
-      if (!isFinite(n)) { errs.push(LABEL[f] + ' must be a number.'); continue; }
-      if (!(n > 0)) { errs.push(LABEL[f] + ' must be greater than 0.'); }
-    }
-    return errs;
   }
 
   function buildWriteParams(locationId, containerId, dims) {
@@ -712,663 +402,1164 @@
     };
   }
 
-  // Never trust the write's own response - this compares a RE-READ container
-  // against what was submitted.
-  function compareDims(container, submitted) {
-    const mismatches = [];
-    for (const f of DIM_FIELDS) {
-      const want = Number(submitted[f]);
-      const got = Number(container ? container[f] : NaN);
-      if (!isFinite(got) || Math.abs(got - want) > 1e-6) {
-        mismatches.push({ field: f, submitted: want, actual: container ? container[f] : undefined });
+  /* ===========================================================================
+   * SMALL PURE HELPERS
+   * ======================================================================== */
+
+  /* The CONFIRMED shape is a bare array - that is what the HAR shows on every
+   * one of these endpoints, and it is the only branch that has ever fired.
+   *
+   * The {data:[]} and {items:[]} branches are DEFENSIVE GUESSES, not confirmed
+   * envelopes: nothing observed has returned either. They are kept only so that
+   * a future Canary7 build which wraps its payload degrades into "no container
+   * found" instead of into a silent empty list. Nothing downstream may treat
+   * their presence as evidence that Canary7 uses them. */
+  function asArray(body) {
+    if (Array.isArray(body)) return body;
+    if (body && Array.isArray(body.data)) return body.data;      // GUESS
+    if (body && Array.isArray(body.items)) return body.items;    // GUESS
+    return [];
+  }
+
+  function classifyStatus(s) {
+    if (s >= 200 && s < 300) return 'ok';
+    if (s === 401 || s === 403) return 'auth';
+    if (s >= 400 && s < 500) return 'client';
+    if (s >= 500) return 'server';
+    return 'network';
+  }
+
+  function num(v) { return Number(v); }
+  function fmt(v) { return (v === null || v === undefined || v === '') ? '?' : String(v); }
+
+  const FIELDS = [
+    ['weight', 'Weight'],
+    ['length', 'Length'],
+    ['width',  'Width'],
+    ['height', 'Height'],
+  ];
+
+  function validateDims(d) {
+    const out = [];
+    FIELDS.forEach(function (p) {
+      const key = p[0];
+      const name = p[1];
+      const v = d ? d[key] : undefined;
+      if (v === null || v === undefined || String(v).trim() === '') {
+        out.push(name + ' is required.');
+        return;
       }
-    }
+      const n = num(v);
+      if (!isFinite(n)) { out.push(name + ' must be a number.'); return; }
+      if (!(n > 0)) out.push(name + ' must be greater than 0.');
+    });
+    return out;
+  }
+
+  /* Canary7 writes echo PRE-write state and business rejections arrive as HTTP
+   * 500 with a numeric code, so the write's own response proves nothing. This
+   * compares an independent re-read against what was submitted. */
+  function compareDims(actual, want) {
+    const mismatches = [];
+    FIELDS.forEach(function (p) {
+      const key = p[0];
+      const w = num(want[key]);
+      const a = actual ? num(actual[key]) : NaN;
+      if (!(isFinite(a) && Math.abs(a - w) < 1e-9)) {
+        mismatches.push({
+          field: key,
+          submitted: w,
+          actual: actual ? actual[key] : null,
+        });
+      }
+    });
     return { ok: mismatches.length === 0, mismatches: mismatches };
   }
 
-  // ---------------------------------------------------------------------------
-  // 9. CSS  (one <style>, all selectors edim-prefixed, nothing of C7's touched)
-  // ---------------------------------------------------------------------------
-  function injectCSS() {
-    const d = doc();
-    if (!d || d.getElementById(ID.style)) return;
-    const head = d.head || d.body;
-    if (!head) return;
-    const st = d.createElement('style');
-    st.id = ID.style;
-    st.textContent = [
-      '#' + ID.btn + '{margin-left:8px;}',
-      '#' + ID.backdrop + '{position:fixed;inset:0;top:0;left:0;right:0;bottom:0;background:rgba(17,24,39,.45);z-index:2147483000;}',
-      '#' + ID.modal + '{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:min(460px,94vw);max-height:90vh;overflow:auto;',
-      'background:#fff;color:#111827;border-radius:14px;box-shadow:0 24px 60px rgba(0,0,0,.28);z-index:2147483001;',
-      'font-family:Inter,Roboto,Helvetica,Arial,sans-serif;padding:20px;box-sizing:border-box;}',
-      '#' + ID.modal + ' *{box-sizing:border-box;}',
-      '.edim-title{font-size:20px;font-weight:700;margin-bottom:4px;}',
-      '.edim-sub{font-size:13px;color:#6b7280;margin-bottom:14px;}',
-      '#' + ID.ctx + '{font-size:13px;color:#374151;background:#f9fafb;border:1px solid #e5e7eb;border-radius:10px;padding:10px 12px;margin-bottom:14px;line-height:1.5;}',
-      '.edim-lab{display:block;font-size:12px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;color:#6b7280;margin-bottom:6px;}',
-      '#' + ID.select + '{width:100%;height:46px;border:1px solid #d1d5db;border-radius:10px;padding:0 12px;font-size:15px;background:#fff;margin-bottom:14px;}',
-      '#' + ID.fields + '{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px;}',
-      '.edim-inp{width:100%;height:46px;border:1px solid #d1d5db;border-radius:10px;padding:0 12px;font-size:16px;}',
-      '#' + ID.diff + '{font-size:13px;line-height:1.6;background:#eff6ff;border:1px solid #bfdbfe;color:#1e3a8a;border-radius:10px;padding:10px 12px;margin-bottom:14px;}',
-      '#' + ID.msg + '{font-size:13px;line-height:1.5;border-radius:10px;padding:10px 12px;margin-bottom:14px;white-space:pre-wrap;word-break:break-word;}',
-      '.edim-msg-err{background:#fef2f2;border:1px solid #fecaca;color:#b91c1c;}',
-      '.edim-msg-warn{background:#fffbeb;border:1px solid #fde68a;color:#92400e;}',
-      '.edim-msg-ok{background:#ecfdf5;border:1px solid #a7f3d0;color:#065f46;}',
-      '.edim-msg-info{background:#f3f4f6;border:1px solid #e5e7eb;color:#374151;}',
-      '.edim-foot{display:flex;gap:10px;justify-content:flex-end;}',
-      '.edim-act{min-width:96px;height:44px;border-radius:10px;border:1px solid #d1d5db;background:#fff;font-size:15px;font-weight:600;cursor:pointer;}',
-      '#' + ID.yes + '{background:#2563eb;border-color:#2563eb;color:#fff;}',
-      '.edim-act[disabled]{opacity:.55;cursor:not-allowed;}',
-      '#' + ID.crash + '{position:fixed;top:8px;left:8px;right:8px;z-index:2147483600;background:#450a0a;color:#fecaca;',
-      'font:12px/1.45 monospace;padding:12px;border-radius:10px;white-space:pre-wrap;max-height:60vh;overflow:auto;}',
-    ].join('\n');
-    head.appendChild(st);
+  /* No unit suffix anywhere: nothing confirmed establishes what these numbers
+   * are measured in. */
+  function optionLabel(c) {
+    return String(c.container_no) + ' — weight ' + fmt(c.weight) + ', ' +
+      fmt(c.length) + '×' + fmt(c.width) + '×' + fmt(c.height);
   }
 
-  // ---------------------------------------------------------------------------
-  // 10. TINY DOM BUILDERS  (createElement only - no innerHTML, nothing of C7's
-  //     is ever reparented or restyled)
-  // ---------------------------------------------------------------------------
-  function mk(tag, cls, text) {
-    const el = doc().createElement(tag);
-    if (cls) el.className = cls;
-    if (text !== undefined && text !== null) el.textContent = String(text);
-    return el;
+  function dockIdOf(c) {
+    if (!c) return null;
+    if (c.staging_dock_id !== null && c.staging_dock_id !== undefined) return c.staging_dock_id;
+    if (c.stagingDock && c.stagingDock.id !== undefined) return c.stagingDock.id;
+    return null;
   }
 
-  function paintCrash(err) {
-    try {
-      const d = doc();
-      if (!d) return;
-      let box = d.getElementById(ID.crash);
-      if (!box) {
-        box = d.createElement('div');
-        box.id = ID.crash;
-        (d.body || d.documentElement).appendChild(box);
+  /* Warn, never block. */
+  function maxWarnings(container, dims) {
+    const ct = container && container.containerType;
+    if (!ct) return [];
+    const out = [];
+    [
+      ['weight', 'container_max_weight', 'Weight'],
+      ['length', 'container_max_length', 'Length'],
+      ['width',  'container_max_width',  'Width'],
+      ['height', 'container_max_height', 'Height'],
+    ].forEach(function (p) {
+      const max = num(ct[p[1]]);
+      const v = num(dims[p[0]]);
+      if (isFinite(max) && isFinite(v) && v > max) {
+        out.push(p[2] + ' ' + fmt(dims[p[0]]) + ' exceeds the container type maximum ' +
+          fmt(ct[p[1]]) + ' (' + fmt(ct.name) + '). Submitting anyway.');
       }
-      box.textContent = TAG + ' v' + VERSION + ' CRASHED\n' +
-        (err && err.message ? err.message : String(err)) + '\n\n' +
-        (err && err.stack ? err.stack : '(no stack)');
-    } catch (_) {
-      console.error(TAG, 'could not paint crash', err);
-    }
+    });
+    return out;
   }
 
-  // ---------------------------------------------------------------------------
-  // 11. MODAL
-  // ---------------------------------------------------------------------------
-  // Called from catch and finally blocks - it must never be the thing that
-  // throws, or a handled failure turns into an unhandled rejection.
-  function byId(id) {
-    const d = doc();
-    return (d && d.getElementById) ? d.getElementById(id) : null;
+  /* ===========================================================================
+   * STATE
+   * ======================================================================== */
+
+  /* NOTE: there is deliberately NO State.locationId. It used to be stamped from
+   * the intercepted row and then never read - submit() has always taken
+   * dockIdOf() of the SELECTED container. A write-only field holding a
+   * plausible-looking location id is exactly the thing a future edit reaches
+   * for by mistake, so it is gone rather than merely unused. */
+  const State = {
+    row: null,               // the intercepted get-consigning-container row
+    rowAt: null,             // epoch ms when that row was captured (staleness)
+    containers: [],
+    selectedId: null,
+    shipmentHeaderId: null,
+    warnings: [],
+    loadingList: false,
+    submitting: false,
+    lastVerify: null,
+    usedFallback: false,
+    reset: function () {
+      // row / rowAt are NOT reset here: they belong to the route session, not to
+      // one modal. watch() clears them when the route is left.
+      this.containers = [];
+      this.selectedId = null;
+      this.shipmentHeaderId = null;
+      this.warnings = [];
+      this.loadingList = false;
+      this.submitting = false;
+      this.lastVerify = null;
+      this.usedFallback = false;
+    },
+  };
+
+  // The debug handle. Populated at the bottom; lastPayload / lastResponse are
+  // written through H so they are always visible from the console.
+  const H = {
+    VERSION: VERSION,
+    CONFIG: CONFIG,
+    state: State,
+    lastPayload: null,
+    lastResponse: null,
+    capturedHeaders: null,
+  };
+
+  /* ===========================================================================
+   * INTERCEPTION  -  the data source (replaces v1's DOM scraping entirely)
+   *
+   * Under @grant none we run in page context, so patching window.fetch AND
+   * XMLHttpRequest.prototype both work. @run-at document-start means this is
+   * installed before Angular makes its first call.
+   *
+   * The original response is never consumed: fetch is read through .clone().
+   * ======================================================================== */
+
+  function isConsigningUrl(u) {
+    return typeof u === 'string' && u.indexOf(CONSIGN_MARKER) !== -1;
   }
 
-  function msg(text, tone) {
-    const el = byId(ID.msg);
-    if (!el) return;
-    el.className = 'edim-msg-' + (tone || 'info');
-    el.textContent = String(text || '');
-  }
-
-  function buildModal() {
-    const d = doc();
-
-    const backdrop = d.createElement('div');
-    backdrop.id = ID.backdrop;
-    backdrop.addEventListener('click', function () { closeUI('backdrop'); });
-
-    const modal = d.createElement('div');
-    modal.id = ID.modal;
-    modal.setAttribute('role', 'dialog');
-    modal.setAttribute('aria-modal', 'true');
-
-    modal.appendChild(mk('div', 'edim-title', BTN_TEXT));
-    modal.appendChild(mk('div', 'edim-sub', 'Warehouse ' + WAREHOUSE_ID + ' · v' + VERSION));
-
-    const ctx = d.createElement('div');
-    ctx.id = ID.ctx;
-    ctx.textContent = 'Reading the screen…';
-    modal.appendChild(ctx);
-
-    const selLab = mk('label', 'edim-lab', 'Container');
-    selLab.setAttribute('for', ID.select);
-    modal.appendChild(selLab);
-
-    const sel = d.createElement('select');
-    sel.id = ID.select;                     // single-select: no `multiple`
-    sel.addEventListener('change', function () { onSelectChange(); });
-    modal.appendChild(sel);
-
-    const fields = d.createElement('div');
-    fields.id = ID.fields;
-    fields.style.display = 'none';          // revealed once a container is chosen
-    modal.appendChild(fields);
-
-    // Labels carry NO unit - none is confirmed. See the header block.
-    const SPEC = [
-      { id: ID.weight, label: 'Weight', step: '0.01' },
-      { id: ID.length, label: 'Length', step: '1' },
-      { id: ID.width,  label: 'Width',  step: '1' },
-      { id: ID.height, label: 'Height', step: '1' },
-    ];
-    for (const s of SPEC) {
-      const wrap = mk('div', 'edim-field');
-      const lab = mk('label', 'edim-lab', s.label);
-      lab.setAttribute('for', s.id);
-      const inp = d.createElement('input');
-      inp.id = s.id;
-      inp.className = 'edim-inp';
-      // type=number, step/min set. NO inputmode="none" - the operator types here.
-      inp.setAttribute('type', 'number');
-      inp.setAttribute('step', s.step);
-      inp.setAttribute('min', '0');
-      inp.addEventListener('input', function () { renderDiff(); });
-      wrap.appendChild(lab);
-      wrap.appendChild(inp);
-      fields.appendChild(wrap);
-    }
-
-    const diff = d.createElement('div');
-    diff.id = ID.diff;
-    diff.style.display = 'none';
-    modal.appendChild(diff);
-
-    const m = d.createElement('div');
-    m.id = ID.msg;
-    m.className = 'edim-msg-info';
-    m.textContent = 'Loading container list…';
-    modal.appendChild(m);
-
-    const foot = mk('div', 'edim-foot');
-    const no = mk('button', 'edim-act', 'No');
-    no.id = ID.no;
-    no.setAttribute('type', 'button');
-    no.addEventListener('click', function () { closeUI('no'); });
-    const yes = mk('button', 'edim-act', 'Yes');
-    yes.id = ID.yes;
-    yes.setAttribute('type', 'button');
-    yes.addEventListener('click', function () { submit(); });
-    foot.appendChild(no);
-    foot.appendChild(yes);
-    modal.appendChild(foot);
-
-    (d.body || d.documentElement).appendChild(backdrop);
-    (d.body || d.documentElement).appendChild(modal);
-
-    R.backdrop = backdrop;
-    R.modal = modal;
-
-    // Focus the select on open; closeUI() hands focus back to the button.
-    try { sel.focus(); } catch (_) {}
-
-    R.escHandler = function (e) {
-      if (e && (e.key === 'Escape' || e.key === 'Esc' || e.keyCode === 27)) {
-        if (e.stopPropagation) e.stopPropagation();
-        if (e.preventDefault) e.preventDefault();
-        closeUI('esc');
+  function headersFrom(init) {
+    try {
+      const h = init && init.headers;
+      if (!h) return null;
+      if (typeof h.forEach === 'function' && typeof h.get === 'function') {
+        const o = {};
+        h.forEach(function (v, k) { o[k] = v; });
+        return o;
       }
-    };
-    // Capture phase: Angular swallows plenty of key events on its own screens.
-    d.addEventListener('keydown', R.escHandler, true);
-
-    setBusy(true);
-    return modal;
-  }
-
-  // setBusy governs YES only. "No" means cancel, and cancelling has to stay
-  // available while the three lookups run - an operator who opened the modal by
-  // mistake should not be held there by a slow location lookup. The one moment
-  // No is disabled is a write actually in flight (see submit()), and closeUI()
-  // refuses mid-write anyway.
-  function setBusy(busy) {
-    const yes = byId(ID.yes);
-    if (yes) { if (busy) yes.setAttribute('disabled', 'disabled'); else yes.removeAttribute('disabled'); }
-  }
-
-  function setCancelEnabled(enabled) {
-    const no = byId(ID.no);
-    if (!no) return;
-    if (enabled) no.removeAttribute('disabled'); else no.setAttribute('disabled', 'disabled');
-  }
-
-  function closeUI(reason) {
-    // A submit in flight must not be orphaned by an accidental Esc.
-    if (State.submitting) {
-      msg('Submitting — wait for the result.', 'warn');
-      return false;
-    }
-    const d = doc();
-    try {
-      if (R.escHandler && d) d.removeEventListener('keydown', R.escHandler, true);
+      if (typeof h === 'object') return Object.assign({}, h);
     } catch (_) {}
-    R.escHandler = null;
-    if (R.modal && R.modal.remove) R.modal.remove();
-    if (R.backdrop && R.backdrop.remove) R.backdrop.remove();
-    R.modal = null;
-    R.backdrop = null;
-    console.log(TAG, 'closed (' + (reason || 'unknown') + ') - no request fired');
-    // Focus back to the button that opened us.
-    try {
-      const btn = R.lastFocus || (d && d.getElementById(ID.btn));
-      if (btn && btn.focus) btn.focus();
-    } catch (_) {}
-    R.lastFocus = null;
+    return null;
+  }
+
+  function noteRow(payload, url, headers) {
+    const row = asArray(payload)[0];
+    if (!row || typeof row !== 'object') return false;
+    State.row = row;
+    // Stamp the capture. Nothing else invalidates the row within #/workbenchv -
+    // the operator can consign a dozen containers without a route change - so
+    // the modal warns on age instead of pretending the row is always current.
+    State.rowAt = Date.now();
+    if (headers) H.capturedHeaders = headers;
+    H.lastPayload = { url: String(url || ''), row: row, at: new Date().toISOString() };
+    log('captured', CONSIGN_MARKER, 'container', row.container_no, 'id', row.id,
+      'status', row.status && row.status.description);
+    // A payload is the positive proof of consigning, so this is also the moment
+    // the button becomes legal.
+    try { tryInject(); } catch (err) { warn('inject after capture failed', err); }
     return true;
   }
 
-  function currentContainer() {
-    const id = State.selectedId;
-    if (id === null || id === undefined) return null;
-    for (const c of State.containers) {
-      if (String(c.id) === String(id)) return c;
+  // The page's real fetch, captured BEFORE the patch so our own calls are never
+  // fed back through the interceptor.
+  let origFetch = null;
+
+  function installIntercept(win) {
+    win = win || window;
+    if (win.__edimPatched) return false;
+
+    const of = win.fetch;
+    if (typeof of === 'function') {
+      origFetch = of;
+      win.fetch = function (input, init) {
+        const p = of.apply(this, arguments);
+        return Promise.resolve(p).then(function (res) {
+          try {
+            const url = (input && input.url) ? input.url : String(input);
+            if (isConsigningUrl(url) && res && typeof res.clone === 'function') {
+              res.clone().json().then(function (j) {
+                noteRow(j, url, headersFrom(init));
+              }).catch(function () {});
+            }
+          } catch (err) { warn('fetch intercept error', err); }
+          return res;
+        });
+      };
+    }
+
+    const XHR = win.XMLHttpRequest;
+    if (XHR && XHR.prototype && !XHR.prototype.__edimPatched) {
+      const oOpen = XHR.prototype.open;
+      const oSetHeader = XHR.prototype.setRequestHeader;
+
+      if (typeof oSetHeader === 'function') {
+        XHR.prototype.setRequestHeader = function (name, value) {
+          try {
+            // ONLY the consigning call's headers are ever mined, so only bag
+            // those. Unnarrowed, this allocated a header object for every XHR on
+            // every canary7 page - Angular fires a great many - to hold values
+            // nothing would ever read. open() runs before setRequestHeader, so
+            // __edimUrl is already set by the time we get here.
+            if (isConsigningUrl(String(this.__edimUrl || ''))) {
+              this.__edimHeaders = this.__edimHeaders || {};
+              this.__edimHeaders[name] = value;
+            }
+          } catch (_) {}
+          return oSetHeader.apply(this, arguments);
+        };
+      }
+
+      XHR.prototype.open = function (method, url) {
+        try { this.__edimUrl = url; } catch (_) {}
+        const self = this;
+        this.addEventListener('load', function () {
+          try {
+            if (!isConsigningUrl(String(self.__edimUrl || ''))) return;
+            const raw = self.responseText;
+            if (!raw) return;
+            noteRow(JSON.parse(raw), self.__edimUrl, self.__edimHeaders || null);
+          } catch (_) {
+            // Non-JSON responses are expected on other endpoints; stay quiet.
+          }
+        });
+        return oOpen.apply(this, arguments);
+      };
+      XHR.prototype.__edimPatched = true;
+    }
+
+    win.__edimPatched = true;
+    log('interception installed, v' + VERSION);
+    return true;
+  }
+
+  /* ===========================================================================
+   * API  -  every request and response logged
+   * ======================================================================== */
+
+  async function apiGet(url) {
+    const doFetch = origFetch || (typeof fetch === 'function' ? fetch : null);
+    if (!doFetch) {
+      const out = { ok: false, kind: 'network', status: 0, raw: 'no fetch available', body: null, url: url };
+      H.lastResponse = out;
+      return out;
+    }
+    log('GET', url);
+    let res;
+    try {
+      res = await doFetch(url, { method: 'GET', headers: reqHeaders() });
+    } catch (err) {
+      const out = {
+        ok: false, kind: 'network', status: 0,
+        raw: String((err && err.message) || err), body: null, url: url,
+      };
+      H.lastResponse = out;
+      warn('network error', url, out.raw);
+      return out;
+    }
+    let raw = '';
+    try { raw = await res.text(); } catch (_) { raw = ''; }
+    let body = null;
+    try { body = JSON.parse(raw); } catch (_) {}
+    const out = {
+      ok: !!res.ok, status: res.status, kind: classifyStatus(res.status),
+      raw: raw, body: body, url: url,
+    };
+    H.lastResponse = out;
+    log('<-', res.status, String(raw).slice(0, 400));
+    return out;
+  }
+
+  function describeFailure(r) {
+    const lines = [];
+    if (r.kind === 'network') {
+      lines.push('Network error - the request never reached Canary7.');
+      lines.push('Failure type: network');
+      lines.push('Detail: ' + r.raw);
+      return lines.join('\n');
+    }
+    lines.push('HTTP ' + r.status + ' (' + r.kind + ')');
+    const b = r.body || {};
+    if (b.code !== undefined && b.code !== null) lines.push('Business code ' + b.code);
+    if (b.message) lines.push(b.message);
+    lines.push('Failure type: ' + r.kind);
+    lines.push('Raw response: ' + r.raw);
+    return lines.join('\n');
+  }
+
+  /* ===========================================================================
+   * ROUTE GUARD  -  three parts, all must hold
+   *
+   *   1. location.hash is #/workbenchv (tolerating a trailing sub-path)
+   *   2. a get-consigning-container response has been seen this route session
+   *   3. the C7 "Edit Weight" anchor is in the DOM
+   *
+   * v1 guarded on a regex looking for the word "consign", which the real URL can
+   * never satisfy. That is a REGRESSION to guard against, not a fallback to keep.
+   * ======================================================================== */
+
+  function isConsignRoute(href, hash) {
+    let h = String(hash || '').trim();
+    if (!h) {
+      const s = String(href || '');
+      const i = s.indexOf('#');
+      h = i === -1 ? '' : s.slice(i);
+    }
+    if (!h) return false;
+    if (h.charAt(0) !== '#') h = '#' + h;
+    return ROUTE_RE.test(h.trim());
+  }
+
+  function onRoute() {
+    try { return isConsignRoute(location.href, location.hash); } catch (_) { return false; }
+  }
+
+  function hasConsigningEvidence() {
+    return !!State.row;
+  }
+
+  /* ===========================================================================
+   * THE BUTTON
+   * ======================================================================== */
+
+  // Match on text, never on C7's build-specific Angular content attribute -
+  // that hash changes on every Canary7 build.
+  function findAnchor(doc) {
+    const d = doc || document;
+    let list;
+    try { list = d.querySelectorAll('button.btn-apply'); } catch (_) { return null; }
+    for (let i = 0; i < list.length; i++) {
+      if (String(list[i].textContent || '').trim() === 'Edit Weight') return list[i];
     }
     return null;
   }
 
-  function readInputs() {
-    const d = doc();
-    const out = {};
-    const map = { weight: ID.weight, length: ID.length, width: ID.width, height: ID.height };
-    for (const f of DIM_FIELDS) {
-      const el = d.getElementById(map[f]);
-      out[f] = el ? el.value : '';
-    }
-    return out;
+  function tryInject() {
+    if (!onRoute()) return false;
+    if (!hasConsigningEvidence()) return false;
+
+    const doc = document;
+    const anchor = findAnchor(doc);
+    if (!anchor) return false;
+
+    // Idempotency is read from the DOM ONLY. A dataset flag on the C7 anchor
+    // would wedge the button out permanently if Angular ever dropped ours.
+    if (doc.getElementById(IDS.btn)) return false;
+    if (anchor.nextElementSibling && anchor.nextElementSibling.id === IDS.btn) return false;
+
+    const btn = doc.createElement('button');
+    btn.id = IDS.btn;
+    btn.setAttribute('type', 'button');
+    btn.className = 'btn btn-primary btn-apply edim-btn';
+    btn.textContent = 'Edit Dimensions';
+    btn.addEventListener('click', function () { open(); });
+
+    // A SIBLING. C7's node is not moved, not restyled, not reparented.
+    anchor.insertAdjacentElement('afterend', btn);
+    log('button injected after the Edit Weight anchor');
+    return true;
   }
 
-  function fillInputs(c) {
-    const d = doc();
-    const map = { weight: ID.weight, length: ID.length, width: ID.width, height: ID.height };
-    for (const f of DIM_FIELDS) {
-      const el = d.getElementById(map[f]);
-      if (el) el.value = (c && c[f] !== undefined && c[f] !== null) ? String(c[f]) : '';
+  function removeButton() {
+    const b = document.getElementById(IDS.btn);
+    if (b && b.remove) b.remove();
+  }
+
+  /* ---------------------------------------------------------------------------
+   * OBSERVER LIFECYCLE
+   *
+   * The observer exists only to catch the consigning screen re-rendering. Off
+   * route it has nothing to catch, so leaving it attached means every mutation
+   * of whatever screen the operator moved to still schedules a scan for the rest
+   * of the session. It is disconnected on the way out and re-attached on the way
+   * back in.
+   *
+   * appRoot() and scheduleScan() are function declarations further down and are
+   * hoisted, so calling them from here is safe.
+   * ------------------------------------------------------------------------ */
+  let observer = null;
+
+  function startObserver() {
+    if (observer) return false;
+    if (typeof MutationObserver !== 'function') return false;
+    const root = appRoot();
+    if (!root) return false;
+    try {
+      observer = new MutationObserver(scheduleScan);
+      observer.observe(root, { childList: true, subtree: true });
+      return true;
+    } catch (err) {
+      warn('observer failed', err);
+      observer = null;
+      return false;
     }
   }
 
-  function renderDiff() {
-    const d = doc();
-    const el = d.getElementById(ID.diff);
-    const c = currentContainer();
+  function stopObserver() {
+    if (!observer) return false;
+    try { observer.disconnect(); } catch (_) {}
+    observer = null;
+    return true;
+  }
+
+  /* Called on every route poll / hashchange / debounced mutation. */
+  function watch() {
+    if (!onRoute()) {
+      removeButton();
+      close({ force: true });
+      // Clear the intercepted payload: it belonged to the route we just left.
+      State.row = null;
+      State.rowAt = null;
+      H.capturedHeaders = null;
+      stopObserver();
+      return false;
+    }
+    startObserver();
+    return tryInject();
+  }
+
+  /* ===========================================================================
+   * UI PRIMITIVES  -  createElement + textContent only, never innerHTML
+   * ======================================================================== */
+
+  function mk(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = String(text);
+    return e;
+  }
+
+  function injectCss() {
+    if (document.getElementById(IDS.style)) return;
+    const s = document.createElement('style');
+    s.id = IDS.style;
+    s.textContent = CSS;
+    const head = document.head || document.documentElement || document.body;
+    if (head) head.appendChild(s);
+  }
+
+  function paintCrash(err) {
+    try {
+      const box = document.getElementById(IDS.crash) || document.createElement('div');
+      box.id = IDS.crash;
+      box.className = 'edim-crash';
+      box.textContent = TAG + ' crashed\n\n' +
+        String((err && err.message) || err) + '\n\n' +
+        String((err && err.stack) || '(no stack)');
+      if (!box.parentElement && document.body) document.body.appendChild(box);
+      warn('crash', err);
+    } catch (_) {}
+  }
+
+  /* A route change force-closes the modal (see watch()), which detaches it even
+   * mid-write. The write itself is NOT cancelled - it is already with Canary7 -
+   * so its verify result has to land somewhere the operator can still see, or a
+   * production write silently loses its outcome. That somewhere is the
+   * body-level #edim-crash box, which is not part of the modal and survives. */
+  function paintOrphanBox(text) {
+    try {
+      const box = document.getElementById(IDS.crash) || document.createElement('div');
+      box.id = IDS.crash;
+      box.className = 'edim-crash';
+      box.textContent = TAG + ' the consigning screen was left while a write to Canary7 ' +
+        'was still in flight.\nThe write finished after the dialog was gone. Its result:\n\n' +
+        String(text || '');
+      if (!box.parentElement && document.body) document.body.appendChild(box);
+      warn('write outcome painted outside a detached modal', text);
+    } catch (_) {}
+  }
+
+  /* Report a write outcome into the modal it started in - or, if that modal has
+   * since been torn out (route change, force-close), into the crash box. The
+   * identity check matters as much as the null check: if the operator left the
+   * route and came back, a NEW modal is on screen and a stale result must not be
+   * painted into it as though it were that modal's own. */
+  function reportResult(modalAtStart, text, tone) {
+    const now = document.getElementById(IDS.modal);
+    if (now && now === modalAtStart) { setMsg(text, tone); return false; }
+    paintOrphanBox(text);
+    return true;
+  }
+
+  function setMsg(text, tone) {
+    const el = document.getElementById(IDS.msg);
     if (!el) return;
-    if (!c) { el.style.display = 'none'; return; }
-    const now = readInputs();
-    const lines = ['Container ' + (c.container_no || c.id)];
-    for (const f of DIM_FIELDS) {
-      const before = fmtNum(c[f]);
-      const after = String(now[f]);
-      lines.push('  ' + f + ': ' + before + (String(before) === after ? ' (unchanged)' : ' → ' + after));
-    }
-    el.style.display = '';
-    el.textContent = lines.join('\n');
+    el.className = 'edim-msg' + (tone ? ' edim-' + tone : '');
+    el.textContent = String(text || '');
   }
 
-  function onSelectChange() {
-    const d = doc();
-    const sel = d.getElementById(ID.select);
-    const fields = d.getElementById(ID.fields);
-    if (!sel) return;
-    State.selectedId = sel.value === '' ? null : sel.value;
-    const c = currentContainer();
-    if (!c) {
-      if (fields) fields.style.display = 'none';
-      const diff = d.getElementById(ID.diff);
-      if (diff) diff.style.display = 'none';
-      setBusy(true);
-      msg('Pick a container.', 'info');
-      return;
-    }
-    if (fields) fields.style.display = '';
-    fillInputs(c);
-    renderDiff();
-    setBusy(false);
-
-    // staging_dock_id on the container must equal the location id from (a).
-    if (State.locationId !== null && c.staging_dock_id !== undefined &&
-        String(c.staging_dock_id) !== String(State.locationId)) {
-      msg('Warning: this container’s staging_dock_id (' + c.staging_dock_id +
-          ') does not match the location on screen (' + State.locationId +
-          '). Check you are on the right container before saving.', 'warn');
-    } else if (State.warnings.length) {
-      msg(State.warnings.join('\n'), 'warn');
-    } else {
-      msg('Check the values, then press Yes to write them to Canary7.', 'info');
-    }
-  }
-
-  function renderContext() {
-    const d = doc();
-    const el = d.getElementById(ID.ctx);
+  function appendMsg(text) {
+    const el = document.getElementById(IDS.msg);
     if (!el) return;
-    const s = State.scraped || {};
-    el.textContent = [
-      'Location: ' + (s.location || '?') + (State.locationId ? ' (id ' + State.locationId + ')' : ''),
-      'Shipment: ' + (s.shipment || '?') + (State.shipmentHeaderId ? ' (id ' + State.shipmentHeaderId + ')' : ''),
-      'Container on screen: ' + (s.container || '?'),
-    ].join('\n');
+    el.textContent = (el.textContent ? el.textContent + '\n' : '') + String(text);
   }
 
-  function renderContainers() {
-    const d = doc();
-    const sel = d.getElementById(ID.select);
-    if (!sel) return;
-    while (sel.firstChild) sel.removeChild(sel.firstChild);
-
-    const ph = d.createElement('option');
-    ph.value = '';
-    ph.textContent = 'Select a container…';
-    sel.appendChild(ph);
-
-    for (const c of State.containers) {
-      const o = d.createElement('option');
-      o.value = String(c.id);
-      o.textContent = optionLabel(c);
-      sel.appendChild(o);
-    }
-
-    // Preselect the container whose container_no matches the screen.
-    const wanted = (State.scraped && State.scraped.container) || '';
-    let match = null;
-    for (const c of State.containers) {
-      if (String(c.container_no || '').trim() === wanted) { match = c; break; }
-    }
-    if (match) {
-      sel.value = String(match.id);
-      State.selectedId = String(match.id);
-    } else if (State.containers.length === 1) {
-      sel.value = String(State.containers[0].id);
-      State.selectedId = String(State.containers[0].id);
-      State.warnings.push('The container on screen (' + wanted + ') was not in the list for this shipment - the only container on the shipment has been preselected.');
-    } else {
-      sel.value = '';
-      State.selectedId = null;
-      if (wanted) {
-        State.warnings.push('The container on screen (' + wanted + ') was not in the list for this shipment - pick one manually.');
-      }
-    }
-    onSelectChange();
+  function setDisabled(id, off) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (off) el.setAttribute('disabled', 'disabled');
+    else el.removeAttribute('disabled');
   }
 
-  // ---------------------------------------------------------------------------
-  // 12. OPEN
-  // ---------------------------------------------------------------------------
+  function setBusy(on) {
+    setDisabled(IDS.yes, on);
+    setDisabled(IDS.no, on);
+    const sp = document.getElementById(IDS.spinner);
+    if (sp) {
+      sp.style.display = on ? '' : 'none';
+      sp.textContent = on ? 'Writing to Canary7…' : '';
+    }
+  }
+
+  /* ===========================================================================
+   * THE MODAL
+   * ======================================================================== */
+
+  let escHandler = null;
+
+  function buildModal() {
+    const backdrop = mk('div', 'edim-backdrop');
+    backdrop.id = IDS.backdrop;
+    backdrop.addEventListener('click', function () { close(); });
+
+    const modal = mk('div', 'edim-modal');
+    modal.id = IDS.modal;
+
+    const title = mk('div', 'edim-title', 'Edit Dimensions');
+    title.id = IDS.title;
+    modal.appendChild(title);
+
+    const selRow = mk('div', 'edim-row');
+    selRow.appendChild(mk('label', 'edim-label', 'Container'));
+    const sel = mk('select', 'edim-select');
+    sel.id = IDS.select;
+    sel.addEventListener('change', function () { onSelectChange(); });
+    selRow.appendChild(sel);
+    modal.appendChild(selRow);
+
+    const fields = mk('div', 'edim-row edim-grid');
+    fields.id = IDS.fields;
+    fields.style.display = 'none';
+    [
+      [IDS.weight, 'Weight', '0.01'],
+      [IDS.length, 'Length', '1'],
+      [IDS.width,  'Width',  '1'],
+      [IDS.height, 'Height', '1'],
+    ].forEach(function (p) {
+      const cell = mk('div', 'edim-cell');
+      cell.appendChild(mk('label', 'edim-label', p[1]));
+      const inp = mk('input', 'edim-input');
+      inp.id = p[0];
+      inp.setAttribute('type', 'number');
+      inp.setAttribute('min', '0');
+      inp.setAttribute('step', p[2]);
+      // Deliberately NO inputmode="none" - the operator types in these.
+      inp.addEventListener('input', function () { renderDiff(); });
+      cell.appendChild(inp);
+      fields.appendChild(cell);
+    });
+    modal.appendChild(fields);
+
+    const diff = mk('div', 'edim-diff', 'Loading containers…');
+    diff.id = IDS.diff;
+    modal.appendChild(diff);
+
+    const msg = mk('div', 'edim-msg');
+    msg.id = IDS.msg;
+    modal.appendChild(msg);
+
+    const actions = mk('div', 'edim-actions');
+    actions.id = IDS.actions;
+
+    const spinner = mk('span', 'edim-spinner');
+    spinner.id = IDS.spinner;
+    spinner.style.display = 'none';
+    actions.appendChild(spinner);
+    actions.appendChild(mk('span', 'edim-spacer'));
+
+    const no = mk('button', 'edim-action edim-no', 'No');
+    no.id = IDS.no;
+    no.setAttribute('type', 'button');
+    // No stays ENABLED while the container list loads - an operator who
+    // mis-clicked must always be able to leave.
+    no.addEventListener('click', function () { close(); });
+    actions.appendChild(no);
+
+    const yes = mk('button', 'edim-action edim-yes', 'Yes');
+    yes.id = IDS.yes;
+    yes.setAttribute('type', 'button');
+    yes.setAttribute('disabled', 'disabled');
+    yes.addEventListener('click', function () { submit(); });
+    actions.appendChild(yes);
+
+    modal.appendChild(actions);
+
+    document.body.appendChild(backdrop);
+    document.body.appendChild(modal);
+
+    escHandler = function (e) {
+      if (!e || e.key !== 'Escape') return;
+      // Esc must not orphan an in-flight write.
+      if (State.submitting) return;
+      close();
+    };
+    document.addEventListener('keydown', escHandler);
+
+    if (sel.focus) sel.focus();
+  }
+
   function open() {
     try {
-      const d = doc();
-      if (d.getElementById(ID.modal)) return;   // already open
+      if (document.getElementById(IDS.modal)) return;
       State.reset();
-      injectCSS();
-      R.lastFocus = d.getElementById(ID.btn);
+      injectCss();
       buildModal();
-
-      const scraped = scrapeConsign(d);
-      State.scraped = scraped;
-      State.warnings = scraped.warnings.slice();
-      renderContext();
-      console.log(TAG, 'scraped', scraped);
-
-      if (scraped.errors.length) {
-        setBusy(true);                            // No stays enabled - see setBusy
-        msg('Could not read the screen:\n\n' + scraped.errors.join('\n\n'), 'err');
-        return;
-      }
-
-      loadContext(scraped).catch(function (e) {
-        console.error(TAG, 'load failed', e);
-        State.lastError = e;
-        setBusy(true);
-        msg(describeError(e), 'err');
-      });
+      // Fire and forget: the modal is already usable (No works) while this runs.
+      loadContainers().catch(function (err) { paintCrash(err); });
     } catch (err) {
-      console.error(TAG, 'open() crashed', err);
       paintCrash(err);
     }
   }
 
-  function describeError(e) {
-    const bits = [];
-    bits.push(e && e.message ? e.message : String(e));
-    if (e && e.kind) bits.push('Failure type: ' + e.kind);
-    if (e && e.url) bits.push('URL: ' + e.url);
-    if (e && e.raw) bits.push('Raw response:\n' + String(e.raw).slice(0, 1200));
-    if (e && e.stack) bits.push('Stack:\n' + e.stack);
-    return bits.join('\n\n');
-  }
-
-  async function loadContext(scraped) {
-    msg('Resolving location “' + scraped.location + '”…', 'info');
-    State.locationId = await lookupLocationId(scraped.location);
-    renderContext();
-
-    msg('Resolving shipment “' + scraped.shipment + '”…', 'info');
-    State.shipmentHeaderId = await lookupShipmentHeaderId(scraped.shipment);
-    renderContext();
-
-    msg('Loading containers…', 'info');
-    State.containers = await listContainers(State.shipmentHeaderId);
-    if (!State.containers.length) {
-      throw new Error('No containers returned for shipment_header_id ' + State.shipmentHeaderId + '.');
+  function close(opts) {
+    // Never tear the modal down from under an in-flight write.
+    if (State.submitting && !(opts && opts.force)) return;
+    const m = document.getElementById(IDS.modal);
+    const b = document.getElementById(IDS.backdrop);
+    if (m && m.remove) m.remove();
+    if (b && b.remove) b.remove();
+    if (escHandler) {
+      try { document.removeEventListener('keydown', escHandler); } catch (_) {}
+      escHandler = null;
     }
-    renderContainers();
+    State.reset();
+    const btn = document.getElementById(IDS.btn);
+    if (btn && btn.focus) btn.focus();
   }
 
-  // ---------------------------------------------------------------------------
-  // 13. SUBMIT  (production write - re-read and verify, never trust the echo)
-  // ---------------------------------------------------------------------------
-  async function submit() {
-    if (State.submitting) return;               // double-submit guard
+  /* ---------------------------------------------------------------------------
+   * FALLBACK container-number reader.
+   *
+   * Used ONLY when the script loaded after the app's own call already fired.
+   * It reads ONE value - the container number - and nothing else. These
+   * selectors are NOT confirmed; if nothing matches, we say so and stop.
+   * ------------------------------------------------------------------------ */
+  function readContainerNoFromPage(doc) {
+    const d = doc || document;
+    const sels = [
+      'input[name="container_no"]',
+      'input#container_no',
+      '[formcontrolname="container_no"]',
+      '[data-container-no]',
+    ];
+    for (let i = 0; i < sels.length; i++) {
+      let el = null;
+      try { el = d.querySelector(sels[i]); } catch (_) { el = null; }
+      if (!el) continue;
+      const v = (el.value !== undefined && el.value !== null && String(el.value).trim())
+        ? String(el.value)
+        : (el.getAttribute ? el.getAttribute('data-container-no') : null);
+      if (v && String(v).trim()) return String(v).trim();
+    }
+    return null;
+  }
 
-    // EVERYTHING below lives inside the try. submit() is async, so a throw out
-    // here - a DOM the app tore down under us, a missing input - would be an
-    // unhandled rejection: no message in the modal, no crash box, and a Yes
-    // button left disabled forever.
-    let started = false;                        // did we get as far as the write?
-    let numeric = null;
-
+  async function loadContainers() {
+    State.loadingList = true;
     try {
+      let row = State.row;
+
+      if (!row) {
+        // Nothing intercepted - the script loaded after the app's call.
+        const cno = readContainerNoFromPage(document);
+        if (!cno) {
+          setMsg(
+            'No get-consigning-container response was intercepted, and the container ' +
+            'number could not be read from the page.\n' +
+            'Reload the consigning screen so the script can see the call, then try again.\n' +
+            'Nothing was sent to Canary7.', 'error');
+          setDiffText('Nothing loaded.');
+          return;
+        }
+        State.usedFallback = true;
+        State.warnings.push('Container number "' + cno + '" was read from the page, not intercepted - verify it before saving.');
+        const r = await apiGet(consigningUrl(cno));
+        if (!r.ok) {
+          setMsg('Fallback lookup for container "' + cno + '" failed.\n' + describeFailure(r), 'error');
+          setDiffText('Nothing loaded.');
+          return;
+        }
+        row = asArray(r.body)[0] || null;
+        if (!row) {
+          setMsg('Fallback lookup for container "' + cno + '" returned no container.\n' +
+            'Not guessing an id.\nRaw response: ' + r.raw, 'error');
+          setDiffText('Nothing loaded.');
+          return;
+        }
+        State.row = row;
+        State.rowAt = Date.now();
+      }
+
+      // NOTE: no State.locationId. submit() takes dockIdOf() of the SELECTED
+      // container, which is the only correct source once a list is on screen.
+      State.shipmentHeaderId = row.shipment_header_id;
+
+      // Nothing invalidates a captured row while the operator stays inside
+      // #/workbenchv - they can consign container after container without a
+      // single route change - so an old capture may describe a container that
+      // has since moved on. Warn, never block.
+      if (!State.usedFallback && State.rowAt) {
+        const ageMs = Date.now() - State.rowAt;
+        if (ageMs > STALE_ROW_MS) {
+          State.warnings.push('The container on screen was captured ' +
+            Math.round(ageMs / 1000) + 's ago and may be out of date - ' +
+            'check the values against Canary7 before saving.');
+        }
+      }
+
+      if (row.status && row.status.description &&
+          String(row.status.description) !== 'Consigning Pending') {
+        State.warnings.push('Container status is "' + row.status.description +
+          '", not "Consigning Pending".');
+      }
+
+      if (!State.shipmentHeaderId) {
+        setMsg('The intercepted container has no shipment_header_id, so the container ' +
+          'list cannot be filtered.\nNot falling back to shipment_id - Canary7 ignores it ' +
+          'and returns unrelated containers.\nNothing was sent to Canary7.', 'error');
+        setDiffText('Nothing loaded.');
+        return;
+      }
+
+      const lr = await apiGet(listUrl(State.shipmentHeaderId));
+      if (!lr.ok) {
+        setMsg('Could not load the container list.\n' + describeFailure(lr), 'error');
+        setDiffText('Nothing loaded.');
+        return;
+      }
+      State.containers = asArray(lr.body);
+      if (!State.containers.length) {
+        setMsg('The container list for shipment_header_id ' + State.shipmentHeaderId +
+          ' came back empty.\nRaw response: ' + lr.raw, 'error');
+        setDiffText('Nothing loaded.');
+        return;
+      }
+      renderSelect();
+    } finally {
+      State.loadingList = false;
+    }
+  }
+
+  function setDiffText(t) {
+    const el = document.getElementById(IDS.diff);
+    if (el) el.textContent = String(t);
+  }
+
+  function renderSelect() {
+    const sel = document.getElementById(IDS.select);
+    if (!sel) return;
+
+    while (sel.firstChild) sel.removeChild(sel.firstChild);
+
+    const ph = mk('option', 'edim-option', 'Select a container…');
+    ph.value = '';
+    ph.setAttribute('value', '');
+    sel.appendChild(ph);
+
+    State.containers.forEach(function (c) {
+      const o = mk('option', 'edim-option', optionLabel(c));
+      o.value = String(c.id);
+      o.setAttribute('value', String(c.id));
+      sel.appendChild(o);
+    });
+
+    const wanted = State.row ? String(State.row.id) : '';
+    const found = State.containers.some(function (c) { return String(c.id) === wanted; });
+    if (wanted && found) {
+      sel.value = wanted;
+      State.selectedId = wanted;
+    } else {
+      sel.value = '';
+      State.selectedId = null;
+      State.warnings.push('The container on screen (' + (State.row ? State.row.container_no : '?') +
+        ') is not in the list for this shipment - pick one manually.');
+    }
+
+    onSelectChange();
+  }
+
+  function currentContainer() {
+    const sel = document.getElementById(IDS.select);
+    const id = sel ? String(sel.value || '') : '';
+    if (!id) return null;
+    for (let i = 0; i < State.containers.length; i++) {
+      if (String(State.containers[i].id) === id) return State.containers[i];
+    }
+    return null;
+  }
+
+  function onSelectChange() {
+    const c = currentContainer();
+    const fields = document.getElementById(IDS.fields);
+    State.selectedId = c ? String(c.id) : null;
+
+    if (!c) {
+      if (fields) fields.style.display = 'none';
+      setDisabled(IDS.yes, true);
+      setDiffText('Pick a container to edit.');
+      renderWarnings();
+      return;
+    }
+
+    if (fields) fields.style.display = '';
+    FIELDS.forEach(function (p) {
+      const inp = document.getElementById(IDS['' + p[0]]);
+      if (inp) inp.value = (c[p[0]] === null || c[p[0]] === undefined) ? '' : String(c[p[0]]);
+    });
+    setDisabled(IDS.yes, false);
+    renderDiff();
+    renderWarnings();
+  }
+
+  /* Normalise HERE - at the single point where operator text becomes data -
+   * so validateDims() and buildWriteParams() can never disagree about a value.
+   *
+   * The case that forced this: '1e3'. validateDims() coerced it with Number()
+   * and saw a valid 1000, but buildWriteParams() received the untouched STRING
+   * and the URL went out as weight=1e3. What was validated was not what was
+   * sent. Anything Number() cannot resolve is passed through UNCHANGED so that
+   * validateDims() can still name the offending field ('abc' -> "must be a
+   * number"), and blank stays blank so it can still say "is required". */
+  function readInputs() {
+    const out = {};
+    FIELDS.forEach(function (p) {
+      const inp = document.getElementById(IDS['' + p[0]]);
+      const raw = inp ? inp.value : '';
+      if (raw === null || raw === undefined || String(raw).trim() === '') {
+        out[p[0]] = '';
+        return;
+      }
+      const n = Number(raw);
+      out[p[0]] = isFinite(n) ? n : raw;
+    });
+    return out;
+  }
+
+  function renderDiff() {
+    const el = document.getElementById(IDS.diff);
+    if (!el) return;
+    const c = currentContainer();
+    el.textContent = '';
+    if (!c) { el.textContent = 'Pick a container to edit.'; return; }
+    const dims = readInputs();
+    el.appendChild(mk('div', 'edim-diff-head', 'Container ' + String(c.container_no)));
+    FIELDS.forEach(function (p) {
+      el.appendChild(mk('div', 'edim-diff-line',
+        p[1] + ': ' + fmt(c[p[0]]) + ' → ' + fmt(dims[p[0]])));
+    });
+  }
+
+  /* An error already on screen OUTRANKS a warning. onSelectChange() calls this
+   * on every select change, so without the guard an operator who hit a
+   * validation error ("Weight must be greater than 0. Nothing was sent to
+   * Canary7.") and then changed container would watch that error be replaced by
+   * a stale warning from load time - reading as though the problem had gone
+   * away. The tone class is the record of what is currently displayed. */
+  function renderWarnings() {
+    if (!State.warnings.length) return;
+    const el = document.getElementById(IDS.msg);
+    if (el && String(el.className || '').split(/\s+/).indexOf('edim-error') !== -1) return;
+    setMsg(State.warnings.join('\n'), 'warn');
+  }
+
+  /* ===========================================================================
+   * THE WRITE  -  production, against live stock
+   * ======================================================================== */
+
+  async function submit() {
+    // Everything - guards and validation included - lives inside this try.
+    // submit() is async, so a throw outside it would be an unhandled rejection
+    // with no crash paint at all.
+    let sent = false;
+    // Only the invocation that actually CLAIMED the in-flight slot may release
+    // it. Without this, a blocked double-submit would fall straight through to
+    // finally{} and clear the flag out from under the live write - which is
+    // exactly how the second of three rapid clicks got a write away.
+    let owned = false;
+    // The modal this write started in. A route change force-closes and detaches
+    // it (watch() -> close({force:true})); the write is already with Canary7 and
+    // is NOT cancelled, so the result is reported against THIS node or, if it is
+    // gone, into the body-level crash box. See reportResult().
+    let myModal = null;
+    try {
+      if (State.submitting) { log('double-submit ignored'); return; }
+
       const c = currentContainer();
-      if (!c) { msg('Pick a container first.', 'err'); return; }
+      if (!c) { setMsg('Pick a container first. Nothing was sent to Canary7.', 'error'); return; }
 
       const dims = readInputs();
       const errs = validateDims(dims);
-      if (errs.length) { msg(errs.join('\n'), 'err'); return; }
+      if (errs.length) {
+        setMsg(errs.join('\n') + '\nNothing was sent to Canary7.', 'error');
+        return;
+      }
 
-      numeric = {};
-      for (const f of DIM_FIELDS) numeric[f] = Number(dims[f]);
+      const locId = dockIdOf(c);
+      if (locId === null || locId === undefined || locId === '') {
+        setMsg('Container ' + c.container_no + ' has no staging_dock_id, so close_to_location_id ' +
+          'cannot be built.\nNot guessing a location id.\nNothing was sent to Canary7.', 'error');
+        return;
+      }
+
+      const warns = maxWarnings(c, dims);
+      const params = buildWriteParams(locId, c.id, dims);
+      const url = apiUrl(ROUTES.write, params);
 
       State.submitting = true;
-      started = true;
-      State.lastSubmitted = { containerId: c.id, containerNo: c.container_no, dims: numeric };
+      owned = true;
+      myModal = document.getElementById(IDS.modal);
       setBusy(true);
-      setCancelEnabled(false);                  // the one moment No is disabled
-      msg('Writing to Canary7… do not close this window.', 'info');
+      renderDiff();
+      setMsg((warns.length ? warns.join('\n') + '\n' : '') + 'Writing…', warns.length ? 'warn' : null);
 
-      const params = buildWriteParams(State.locationId, c.id, numeric);
-      const wrote = await apiGet(ROUTE_WRITE, params);
-      R.lastWrite = wrote;
+      sent = true;
+      const wr = await apiGet(url);
 
-      // DO NOT TRUST THE RESPONSE - re-read and compare.
-      msg('Written. Re-reading to verify…', 'info');
-      const after = await listContainers(State.shipmentHeaderId);
-      State.containers = after;
-      let fresh = null;
-      for (const x of after) { if (String(x.id) === String(c.id)) { fresh = x; break; } }
+      // DO NOT TRUST THE RESPONSE. Canary7 writes echo pre-write state and
+      // business rejections arrive as HTTP 500 with a numeric code. Re-read.
+      //
+      // The re-read is of the SELECTED container - c.container_no - never of the
+      // intercepted row. Those differ the moment the operator picks a sibling.
+      const rr = await apiGet(consigningUrl(c.container_no));
+      let fresh = rr.ok ? (asArray(rr.body)[0] || null) : null;
 
-      const cmp = compareDims(fresh, numeric);
-      State.lastVerify = { fresh: fresh, cmp: cmp };
-
+      // get-consigning-container is the consigning screen's OWN lookup: it
+      // answers "which container is being consigned", not "give me container
+      // X". For a SIBLING container on the same shipment - which the select
+      // legitimately offers - it can come back empty even though the write
+      // landed perfectly, and reporting that as VERIFY FAILED would send an
+      // operator to re-check a container that is already correct.
+      //
+      // shipment-container&container_no=<n> is confirmed (prompt section 5) to
+      // return the same row, so try it before concluding anything.
+      let rr2 = null;
       if (!fresh) {
-        msg('VERIFY FAILED - container ' + c.id + ' was not in the re-read of ' + ROUTE_CONTAINER +
-            '.\n\nSubmitted: ' + JSON.stringify(numeric) +
-            '\n\nRaw write response:\n' + String(wrote.raw).slice(0, 1200) +
-            '\n\nNot retrying. Check the container in Canary7 before doing anything else.', 'err');
-      } else if (cmp.ok) {
-        // Bare numbers, no unit - see ASSUMED, NOT CONFIRMED in the header.
-        msg('Saved and verified.\n\n' + (fresh.container_no || fresh.id) + ' is now weight ' +
-            fmtNum(fresh.weight) + ', ' + fmtNum(fresh.length) + '×' +
-            fmtNum(fresh.width) + '×' + fmtNum(fresh.height) + '.', 'ok');
-        fillInputs(fresh);
+        rr2 = await apiGet(containerByNoUrl(c.container_no));
+        if (rr2.ok) {
+          const rows = asArray(rr2.body);
+          // Filter: the list endpoint answers with an array, and only the row
+          // that actually IS this container may be used to verify it.
+          for (let i = 0; i < rows.length; i++) {
+            if (rows[i] && String(rows[i].container_no) === String(c.container_no)) {
+              fresh = rows[i];
+              break;
+            }
+          }
+        }
+      }
+
+      const cmp = compareDims(fresh, dims);
+      State.lastVerify = {
+        submitted: dims, reread: fresh, cmp: cmp,
+        write: wr, verify: rr, verifyFallback: rr2,
+      };
+
+      if (cmp.ok) {
+        const lines = ['Saved and verified.'];
+        lines.push('Container ' + c.container_no);
+        FIELDS.forEach(function (p) {
+          lines.push(p[1] + ': ' + fmt(c[p[0]]) + ' → ' + fmt(dims[p[0]]));
+        });
+        if (warns.length) lines.push('', 'Warnings:', warns.join('\n'));
+        reportResult(myModal, lines.join('\n'), 'good');
+        // Keep the in-memory row in step with what Canary7 now holds - but ONLY
+        // when the container just written is the one on screen. Overwriting the
+        // intercepted row with a sibling's would leave the screen and the state
+        // describing two different containers.
+        if (fresh && State.row && String(State.row.id) === String(c.id)) {
+          State.row = fresh;
+          State.rowAt = Date.now();
+        }
+        FIELDS.forEach(function (p) { c[p[0]] = fresh ? fresh[p[0]] : dims[p[0]]; });
         renderDiff();
       } else {
-        msg('VERIFY FAILED - Canary7 did not store what was submitted.\n\n' +
-            cmp.mismatches.map(function (m) {
-              return '  ' + m.field + ': submitted ' + m.submitted + ', re-read ' + m.actual;
-            }).join('\n') +
-            '\n\nRaw write response:\n' + String(wrote.raw).slice(0, 1200) +
-            '\n\nNot retrying automatically.', 'err');
+        const lines = ['VERIFY FAILED - the re-read does not match what was submitted.'];
+        lines.push('Container ' + c.container_no);
+        cmp.mismatches.forEach(function (m) {
+          lines.push(m.field + ': submitted ' + fmt(m.submitted) + ', re-read ' + fmt(m.actual));
+        });
+        lines.push('');
+        lines.push('Write HTTP ' + wr.status + ' (' + wr.kind + ')');
+        lines.push('Raw write response: ' + wr.raw);
+        lines.push('Re-read HTTP ' + rr.status + ' (' + rr.kind + ')');
+        lines.push('Raw re-read response: ' + rr.raw);
+        if (rr2) {
+          lines.push('Fallback re-read (shipment-container&container_no) HTTP ' +
+            rr2.status + ' (' + rr2.kind + ')');
+          lines.push('Raw fallback response: ' + rr2.raw);
+        }
+        lines.push('');
+        lines.push('Not retrying automatically. Check the container in Canary7 before trying again.');
+        reportResult(myModal, lines.join('\n'), 'error');
       }
-    } catch (e) {
-      console.error(TAG, started ? 'write failed' : 'submit() crashed before the write', e);
-      State.lastError = e;
-      if (!started) paintCrash(e);              // it never reached Canary7 - show the stack
-      msg((started ? 'WRITE FAILED' : 'SUBMIT FAILED - nothing was sent to Canary7') + '\n\n' +
-          describeError(e) +
-          (numeric ? '\n\nSubmitted: ' + JSON.stringify(numeric) : '') +
-          '\n\nNot retrying automatically - re-check the container in Canary7.', 'err');
+    } catch (err) {
+      if (!sent) {
+        setMsg('Crashed before the request was built - NOTHING WAS SENT TO CANARY7.\n' +
+          String((err && err.message) || err) + '\n' +
+          String((err && err.stack) || '(no stack)'), 'error');
+      } else {
+        reportResult(myModal,
+          'The write was SENT to Canary7 and then failed while being handled.\n' +
+          'Check the container in Canary7 before retrying.\n' +
+          String((err && err.message) || err) + '\n' +
+          String((err && err.stack) || '(no stack)'), 'error');
+      }
+      paintCrash(err);
     } finally {
-      if (started) {
+      if (owned) {
         State.submitting = false;
-        setCancelEnabled(true);
         setBusy(false);
       }
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // 14. INJECTION  (sibling of C7's own button - nothing of C7's is moved)
-  // ---------------------------------------------------------------------------
-  function tryInject() {
-    const d = doc();
-    if (!d) return false;
-    if (!onConsignRoute()) return false;
+  /* ===========================================================================
+   * BOOT
+   * ======================================================================== */
 
-    if (d.getElementById(ID.btn)) return false;             // idempotent
+  installIntercept(typeof window !== 'undefined' ? window : null);
 
-    const anchor = findAnchor(d);
-    if (!anchor) return false;
-
-    // Idempotency is decided by what is ACTUALLY in the DOM, never by a sticky
-    // flag on C7's node. A `dataset.edimDone` marker wedges the button gone for
-    // good: Angular re-renders the button row, our button goes with it, the
-    // anchor node survives carrying the flag, and every later tryInject() bails
-    // on a button that no longer exists.
-    if (anchor.nextElementSibling && anchor.nextElementSibling.id === ID.btn) return false;
-
-    logRouteOnce();
-    injectCSS();
-
-    const btn = d.createElement('button');
-    btn.id = ID.btn;
-    btn.setAttribute('type', 'button');
-    // Same C7 classes so it matches the house look, plus our own for margin.
-    btn.className = 'btn btn-primary btn-apply edim-btn';
-    btn.textContent = BTN_TEXT;
-    btn.addEventListener('click', function (e) {
-      if (e && e.preventDefault) e.preventDefault();
-      if (e && e.stopPropagation) e.stopPropagation();
-      open();
-    });
-
-    anchor.insertAdjacentElement('afterend', btn);
-    R.anchor = anchor;
-    console.log(TAG, 'button injected next to "' + ANCHOR_TEXT + '"');
-    return true;
-  }
-
-  // Angular routes away without unmounting our button - take it down ourselves.
-  function removeButton() {
-    const d = doc();
-    if (!d) return false;
-    const btn = d.getElementById(ID.btn);
-    R.anchor = null;
-    if (!btn) return false;
-    btn.remove();
-    console.log(TAG, 'button removed - left the consigning screen');
-    return true;
-  }
-
-  function watch() {
+  function appRoot() {
     try {
-      if (!onConsignRoute()) {
-        if (doc() && doc().getElementById(ID.btn)) {
-          removeButton();
-          if (R.modal) closeUI('route-change');
-        }
-        return;
-      }
-      tryInject();
-    } catch (err) {
-      console.error(TAG, 'watch() failed', err);
+      return document.querySelector('app-dashboard') ||
+             document.querySelector('div.app-body') ||
+             document.body || null;
+    } catch (_) { return null; }
+  }
+
+  // `observer` and its start/stop pair live up with watch(), which owns the
+  // route-change lifecycle.
+  let rafPending = false;
+
+  // A MutationObserver on a busy Angular screen fires constantly; without this
+  // debounce every mutation would run a full querySelectorAll.
+  function scheduleScan() {
+    if (rafPending) return;
+    rafPending = true;
+    const raf = (typeof requestAnimationFrame === 'function')
+      ? requestAnimationFrame
+      : function (f) { return setTimeout(f, 16); };
+    raf(function () {
+      rafPending = false;
+      try { watch(); } catch (err) { warn('scan failed', err); }
+    });
+  }
+
+  function boot(attempt) {
+    const root = appRoot();
+    if (!root) {
+      if ((attempt || 0) < 200) setTimeout(function () { boot((attempt || 0) + 1); }, 300);
+      return;
     }
+    // watch() attaches the observer when on-route and disconnects it when off,
+    // so booting off-route correctly leaves nothing observing.
+    try { watch(); } catch (err) { warn('initial watch failed', err); }
+
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      window.addEventListener('hashchange', function () {
+        try { watch(); } catch (_) {}
+      });
+    }
+    try { setInterval(function () { try { watch(); } catch (_) {} }, 1500); } catch (_) {}
   }
 
-  // ---------------------------------------------------------------------------
-  // 15. DEBUG HANDLE
-  // ---------------------------------------------------------------------------
-  window.__editDims = {
-    VERSION,
-    State,
-    get state() { return State; },
-    get runtime() { return R; },
-    get lastResponse() { return R.lastResponse; },
-    get lastWrite() { return R.lastWrite; },
-    open, close: closeUI, submit,
-    tryInject, removeButton, watch, findAnchor, isConsignRoute,
-    scrapeConsign, scrapeFromTables, scrapeByLabel, headerKeyFor, pickRow,
-    apiUrl, buildQuery, apiGet, asArray, classifyStatus,
-    lookupLocationId, lookupShipmentHeaderId, listContainers,
-    optionLabel, validateDims, buildWriteParams, compareDims,
-    readInputs, fillInputs, renderContainers, onSelectChange,
-    getToken, mkHeaders,
-    apiBase: () => API_BASE,
-    warehouseId: () => String(WAREHOUSE_ID),
-    hasToken: () => !!getToken(),
-    CONFIG: {
-      profileId: PROFILE_ID,
-      routes: {
-        location: ROUTE_LOCATION,
-        shipment: ROUTE_SHIPMENT,
-        container: ROUTE_CONTAINER,
-        write: ROUTE_WRITE,
-      },
-      ids: ID,
-    },
-  };
-
-  // ---------------------------------------------------------------------------
-  // 16. BOOT  (tryInject retry + MutationObserver, house pattern)
-  // ---------------------------------------------------------------------------
-  let _attempts = 0;
-  function boot() {
-    watch();
-    if (doc() && doc().getElementById(ID.btn)) return;
-    if (++_attempts < 80) setTimeout(boot, 500);
+  try {
+    if (document.readyState === 'loading' && typeof document.addEventListener === 'function') {
+      document.addEventListener('DOMContentLoaded', function () { boot(0); });
+    } else {
+      boot(0);
+    }
+  } catch (err) {
+    warn('boot failed', err);
   }
 
-  // The observer fires on every mutation Angular makes - hundreds per render on
-  // a busy consigning grid - and watch() does a full querySelectorAll. Coalesce
-  // a burst of mutations into ONE watch() on the next frame.
-  let _watchQueued = false;
-  function queueWatch() {
-    if (_watchQueued) return;
-    _watchQueued = true;
-    const run = function () { _watchQueued = false; watch(); };
-    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(run);
-    else if (typeof setTimeout === 'function') setTimeout(run, 16);
-    else run();
-  }
+  /* ===========================================================================
+   * DEBUG HANDLE
+   * ======================================================================== */
 
-  if (typeof MutationObserver === 'function' && doc() && doc().body) {
-    R.observer = new MutationObserver(queueWatch);
-    R.observer.observe(doc().body, { childList: true, subtree: true });
-  }
+  H.open = open;
+  H.close = close;
+  H.tryInject = tryInject;
+  H.watch = watch;
+  H.findAnchor = findAnchor;
+  H.isConsignRoute = isConsignRoute;
+  H.hasConsigningEvidence = hasConsigningEvidence;
+  H.installIntercept = installIntercept;
+  H.isConsigningUrl = isConsigningUrl;
+  H.noteRow = noteRow;
+  H.apiBase = apiBase;
+  H.warehouseId = warehouseId;
+  H.apiUrl = apiUrl;
+  H.buildQuery = buildQuery;
+  H.consigningUrl = consigningUrl;
+  H.listUrl = listUrl;
+  H.containerByNoUrl = containerByNoUrl;
+  H.buildWriteParams = buildWriteParams;
+  H.validateDims = validateDims;
+  H.compareDims = compareDims;
+  H.optionLabel = optionLabel;
+  H.maxWarnings = maxWarnings;
+  H.asArray = asArray;
+  H.classifyStatus = classifyStatus;
+  H.dockIdOf = dockIdOf;
+  H.hasToken = hasToken;
+  H.reqHeaders = reqHeaders;
+  H.mkHeaders = mkHeaders;
+  H.readContainerNoFromPage = readContainerNoFromPage;
+  H.submit = submit;
 
-  // Angular can change route without touching <body>'s subtree in a way the
-  // observer sees, so a slow heartbeat also removes the button when we leave.
-  if (typeof setInterval === 'function') {
-    R.watchTimer = setInterval(watch, 1500);
-  }
+  try { window.__editDims = H; } catch (_) {}
 
-  boot();
+  log('booted v' + VERSION);
 })();
