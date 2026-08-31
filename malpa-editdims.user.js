@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         Malpa Edit Dimensions
 // @namespace    https://malpa.canary7.com
-// @version      2.3.0
-// @description  Adds an "Edit Dimensions" button to the Canary7 consigning screen (#/workbench) so an operator can correct a container's weight / length / width / height
+// @version      2.4.0
+// @description  Adds an "Edit Dimensions" button to the Canary7 consigning screen (#/workbench) so an operator can correct a container's length / width / height
 // @author       Malpa 3PL
-// @homepageURL  https://github.com/zaynnev/malpa3pl
-// @supportURL   https://github.com/zaynnev/malpa3pl/issues
+// @homepageURL  https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-editdims.user.js
+// @supportURL   https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-editdims.user.js
 // @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-editdims.user.js
 // @downloadURL  https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-editdims.user.js
 // @match        https://*.canary7.com/*
@@ -14,7 +14,55 @@
 // ==/UserScript==
 
 /* =============================================================================
- * malpa-editdims.user.js  -  v2.3.0
+ * malpa-editdims.user.js  -  v2.4.0
+ *
+ * v2.4.0 IS THREE UX CHANGES. Nothing about the route, the interception, the
+ * anchor, the write URL or the verification strategy moved.
+ *
+ *   1. THE WEIGHT INPUT IS GONE. The consigning screen already carries its own
+ *      "Edit Weight" button - the very element this script anchors to - so
+ *      weight was editable in two places at once. This modal now edits LENGTH,
+ *      WIDTH and HEIGHT only: no weight input, no weight label, no weight row in
+ *      the old->new diff, no weight in validateDims(), and no
+ *      container_max_weight check in the over-maximum warning.
+ *
+ *      THE WRITE STILL SENDS weight, AND MUST. close-to-container takes
+ *      weight/length/width/height together; buildQuery() drops empty params, so
+ *      omitting weight would send the write without it and risk Canary7 storing
+ *      0 against a container whose real weight nobody touched. What goes out is
+ *      the SELECTED CONTAINER'S CURRENT weight, read straight off its container
+ *      record and passed through unchanged - never a literal, never anything the
+ *      operator typed. See submit(), which also refuses rather than sending a
+ *      write whose weight it cannot read.
+ *
+ *      WEIGHT REMAINS IN THE VERIFYING RE-READ. It is not edited, so it must
+ *      come back EXACTLY as it went out; a re-read whose weight has moved means
+ *      the write disturbed a value it was only meant to carry, and that is a
+ *      genuine verification failure. Hence two field lists: FIELDS (the three
+ *      editable dimensions) and VERIFY_FIELDS (those three plus weight).
+ *
+ *   2. A VERIFIED SUCCESS NOW CLOSES THE MODAL. The write and the independent
+ *      verifying re-read run exactly as before - the close is the LAST step of
+ *      the success path, never a substitute for verifying. ANY failure (network,
+ *      HTTP 4xx, HTTP 500-with-a-code, or a re-read that does not match) leaves
+ *      the modal open and reports itself exactly as it did in v2.3.0.
+ *      Because the modal is gone on success, the outcome is also written to the
+ *      console as a "[Edit Dims] Saved and verified…" line - the operator's only
+ *      remaining record. No floating toast was invented for this, and the
+ *      #edim-crash box is NOT reused: it is a red crash/orphan box and a routine
+ *      success has no business in it.
+ *
+ *      THE ORPHAN PATH IS UNCHANGED. If the modal was already torn out (route
+ *      change mid-write), reportResult() still routes the outcome to the
+ *      body-level #edim-crash box - and in that case there is nothing of ours
+ *      left to close, so nothing is closed. A modal the operator has since
+ *      re-opened is never closed by an older write's result.
+ *
+ *   3. CONTAINER OPTION LABELS ARE THE BARE container_no. The
+ *      "— weight 0.84, 6×2×5" suffix is gone; container numbers are unique, so
+ *      the suffix disambiguated nothing and the numbers read as clutter next to
+ *      a container number that already ends in digits. optionLabel() is deleted
+ *      rather than left dormant.
  *
  * v2.3.0 RETRACTS TWO CLAIMS v2.2.0's header stated as CONFIRMED. Both were
  * derived from a BINARY OpenReplay stream, and both were wrong. A console probe
@@ -309,7 +357,7 @@
    * ======================================================================== */
 
   const TAG          = '[Edit Dims]';
-  const VERSION      = '2.3.0';                      // keep in step with @version
+  const VERSION      = '2.4.0';                      // keep in step with @version
 
   // Lifted verbatim from malpa-transfer.user.js
   const API_ROOT     = 'https://stgauth.canary7.com';
@@ -364,7 +412,8 @@
     title:    'edim-title',
     select:   'edim-select',
     fields:   'edim-fields',
-    weight:   'edim-weight',
+    // NO weight id. Weight is not editable here - the consigning screen's own
+    // "Edit Weight" button owns it. See the v2.4.0 note in the header.
     length:   'edim-length',
     width:    'edim-width',
     height:   'edim-height',
@@ -620,12 +669,25 @@
   function num(v) { return Number(v); }
   function fmt(v) { return (v === null || v === undefined || v === '') ? '?' : String(v); }
 
+  /* THE THREE EDITABLE DIMENSIONS. Weight is deliberately absent: the consigning
+   * screen has its own "Edit Weight" button, so this modal must not offer a
+   * second way to change it. Everything the operator touches - the inputs, the
+   * prefill, readInputs(), validateDims(), the old->new diff - is driven from
+   * this list, so weight cannot leak back into any of them. */
   const FIELDS = [
-    ['weight', 'Weight'],
     ['length', 'Length'],
     ['width',  'Width'],
     ['height', 'Height'],
   ];
+
+  /* WHAT THE VERIFYING RE-READ COMPARES - the three dimensions PLUS weight.
+   *
+   * Weight is not edited, which is exactly why it is verified: the write carries
+   * the container's own current weight back to Canary7 unchanged, so the re-read
+   * must return that same value. If it does not, the write disturbed a field it
+   * was only meant to pass through, and that is a real failure the operator has
+   * to be told about - not something to quietly exclude from the comparison. */
+  const VERIFY_FIELDS = [['weight', 'Weight']].concat(FIELDS);
 
   function validateDims(d) {
     const out = [];
@@ -649,7 +711,7 @@
    * compares an independent re-read against what was submitted. */
   function compareDims(actual, want) {
     const mismatches = [];
-    FIELDS.forEach(function (p) {
+    VERIFY_FIELDS.forEach(function (p) {
       const key = p[0];
       const w = num(want[key]);
       const a = actual ? num(actual[key]) : NaN;
@@ -664,12 +726,13 @@
     return { ok: mismatches.length === 0, mismatches: mismatches };
   }
 
-  /* No unit suffix anywhere: nothing confirmed establishes what these numbers
-   * are measured in. */
-  function optionLabel(c) {
-    return String(c.container_no) + ' — weight ' + fmt(c.weight) + ', ' +
-      fmt(c.length) + '×' + fmt(c.width) + '×' + fmt(c.height);
-  }
+  /* optionLabel() IS GONE (v2.4.0). It built
+   *   "<container_no> — weight 0.84, 6×2×5"
+   * and the suffix has been dropped: container numbers are unique, so it
+   * disambiguated nothing, and a run of unlabelled numbers hanging off a
+   * container number that already ends in digits read as confusion rather than
+   * as help. renderSelect() now uses String(c.container_no) directly, and the
+   * helper is deleted rather than left dormant for something to pick up again. */
 
   function dockIdOf(c) {
     if (!c) return null;
@@ -678,13 +741,17 @@
     return null;
   }
 
-  /* Warn, never block. */
+  /* Warn, never block.
+   *
+   * THREE CHECKS, NOT FOUR. container_max_weight is not tested here any more:
+   * this modal cannot change the weight, so warning about a weight the operator
+   * has no way to correct from this dialog would be noise attached to the one
+   * value they are not editing. The three dimension maxima stay. */
   function maxWarnings(container, dims) {
     const ct = container && container.containerType;
     if (!ct) return [];
     const out = [];
     [
-      ['weight', 'container_max_weight', 'Weight'],
       ['length', 'container_max_length', 'Length'],
       ['width',  'container_max_width',  'Width'],
       ['height', 'container_max_height', 'Height'],
@@ -1227,8 +1294,9 @@
     const fields = mk('div', 'edim-row edim-grid');
     fields.id = IDS.fields;
     fields.style.display = 'none';
+    // THREE INPUTS. There is no Weight input and no Weight label: the consigning
+    // screen's own "Edit Weight" button is the one place weight is edited.
     [
-      [IDS.weight, 'Weight', '0.01'],
       [IDS.length, 'Length', '1'],
       [IDS.width,  'Width',  '1'],
       [IDS.height, 'Height', '1'],
@@ -1454,7 +1522,10 @@
     sel.appendChild(ph);
 
     State.containers.forEach(function (c) {
-      const o = mk('option', 'edim-option', optionLabel(c));
+      // THE LABEL IS THE CONTAINER NUMBER, AND NOTHING ELSE (v2.4.0). Container
+      // numbers are unique, so the old "— weight 0.84, 6×2×5" suffix added no
+      // information and read as clutter.
+      const o = mk('option', 'edim-option', String(c.container_no));
       o.value = String(c.id);
       o.setAttribute('value', String(c.id));
       sel.appendChild(o);
@@ -1513,10 +1584,13 @@
    *
    * The case that forced this: '1e3'. validateDims() coerced it with Number()
    * and saw a valid 1000, but buildWriteParams() received the untouched STRING
-   * and the URL went out as weight=1e3. What was validated was not what was
+   * and the URL went out as length=1e3. What was validated was not what was
    * sent. Anything Number() cannot resolve is passed through UNCHANGED so that
    * validateDims() can still name the offending field ('abc' -> "must be a
-   * number"), and blank stays blank so it can still say "is required". */
+   * number"), and blank stays blank so it can still say "is required".
+   *
+   * READS THE THREE DIMENSIONS ONLY. There is no weight input to read; the
+   * weight that goes out is taken from the container record in submit(). */
   function readInputs() {
     const out = {};
     FIELDS.forEach(function (p) {
@@ -1548,7 +1622,7 @@
 
   /* An error already on screen OUTRANKS a warning. onSelectChange() calls this
    * on every select change, so without the guard an operator who hit a
-   * validation error ("Weight must be greater than 0. Nothing was sent to
+   * validation error ("Length must be greater than 0. Nothing was sent to
    * Canary7.") and then changed container would watch that error be replaced by
    * a stale warning from load time - reading as though the problem had gone
    * away. The tone class is the record of what is currently displayed. */
@@ -1598,8 +1672,41 @@
         return;
       }
 
+      /* THE WEIGHT THAT GOES OUT IS THE SELECTED CONTAINER'S CURRENT WEIGHT,
+       * UNCHANGED, STRAIGHT OFF ITS CONTAINER RECORD.
+       *
+       * WHY IT IS SENT AT ALL, given that this modal no longer edits it:
+       * close-to-container takes weight/length/width/height as one set, and
+       * buildQuery() drops params that are null/undefined/'' - so leaving weight
+       * out would put a write on the wire with no weight at all and risk Canary7
+       * storing 0 against a container whose weight nobody asked to change.
+       * Echoing the stored value back is the only way to change the three
+       * dimensions while provably leaving the fourth alone.
+       *
+       * c is the SELECTED container, so this is that container's weight - not
+       * the intercepted row's, which is a different container the moment the
+       * operator picks a sibling. It is never a literal and never typed. */
+      const currentWeight = c.weight;
+      if (currentWeight === null || currentWeight === undefined || currentWeight === '') {
+        setMsg('Container ' + c.container_no + ' has no weight on record, and ' +
+          'close-to-container must be given one.\nSending the write without it could zero ' +
+          'the stored weight, and this dialog does not edit weight - use the screen\'s own ' +
+          'Edit Weight button first.\nNothing was sent to Canary7.', 'error');
+        return;
+      }
+
+      // What goes ON THE WIRE: the three edited dimensions plus the untouched
+      // weight. This is also what the re-read is verified against, so a weight
+      // that comes back changed is reported as a failure.
+      const submitted = {
+        weight: currentWeight,
+        length: dims.length,
+        width:  dims.width,
+        height: dims.height,
+      };
+
       const warns = maxWarnings(c, dims);
-      const params = buildWriteParams(locId, c.id, dims);
+      const params = buildWriteParams(locId, c.id, submitted);
       const url = apiUrl(ROUTES.write, params);
 
       State.submitting = true;
@@ -1645,9 +1752,13 @@
         }
       }
 
-      const cmp = compareDims(fresh, dims);
+      // VERIFY_FIELDS, so the untouched weight is compared too: it was sent back
+      // exactly as Canary7 gave it to us, so it must return exactly as sent. A
+      // weight that has moved means the write disturbed a field it was only
+      // carrying, and that is a genuine failure - reported, never excused.
+      const cmp = compareDims(fresh, submitted);
       State.lastVerify = {
-        submitted: dims, reread: fresh, cmp: cmp,
+        submitted: submitted, reread: fresh, cmp: cmp,
         write: wr, verify: rr, verifyFallback: rr2,
       };
 
@@ -1658,7 +1769,8 @@
           lines.push(p[1] + ': ' + fmt(c[p[0]]) + ' → ' + fmt(dims[p[0]]));
         });
         if (warns.length) lines.push('', 'Warnings:', warns.join('\n'));
-        reportResult(myModal, lines.join('\n'), 'good');
+        const text = lines.join('\n');
+
         // Keep the in-memory row in step with what Canary7 now holds - but ONLY
         // when the container just written is the one on screen. Overwriting the
         // intercepted row with a sibling's would leave the screen and the state
@@ -1667,8 +1779,43 @@
           State.row = fresh;
           State.rowAt = Date.now();
         }
-        FIELDS.forEach(function (p) { c[p[0]] = fresh ? fresh[p[0]] : dims[p[0]]; });
+        // Weight included: the record must stay in step with the value the next
+        // write will echo back to Canary7.
+        VERIFY_FIELDS.forEach(function (p) { c[p[0]] = fresh ? fresh[p[0]] : submitted[p[0]]; });
         renderDiff();
+
+        /* THE MODAL CLOSES HERE - AND ONLY HERE (v2.4.0).
+         *
+         * This is the last statement of the success path. The write went out and
+         * an INDEPENDENT re-read agreed with it; nothing about that verification
+         * was weakened or skipped to get here. Every failure branch - network,
+         * 4xx, 500-with-a-code, a re-read that does not match, or a throw - ends
+         * up somewhere else and leaves the modal standing.
+         *
+         * The console line is not decoration. With the dialog gone it is the
+         * operator's only record that the write landed, so it is emitted whether
+         * or not there is still a modal to close. No floating toast was invented
+         * for this, and #edim-crash is not reused: that box means "something went
+         * wrong", and a routine success in it would train people to ignore it. */
+        log(text.replace(/\n/g, ' | '));
+
+        const orphaned = reportResult(myModal, text, 'good');
+        if (!orphaned) {
+          // close() refuses to tear a modal down while State.submitting is set.
+          // That guard protects an IN-FLIGHT write; this one has landed and been
+          // verified, so release the flag and close normally rather than forcing
+          // past a guard that is still doing its job elsewhere.
+          State.submitting = false;
+          setBusy(false);
+          owned = false;                    // finally{} must not clear it twice
+          const verified = State.lastVerify; // close() -> State.reset() drops it,
+          close();                           // and the debug handle still needs
+          State.lastVerify = verified;       // the outcome of the write just done
+        }
+        // If it WAS orphaned there is nothing of ours left to close: the result
+        // has gone to the crash box, and any modal now on screen is a FRESH one
+        // the operator opened after the route change. Closing that would tear
+        // down a dialog this write has nothing to do with.
       } else {
         const lines = ['VERIFY FAILED - the re-read does not match what was submitted.'];
         lines.push('Container ' + c.container_no);
@@ -1795,7 +1942,7 @@
   H.buildWriteParams = buildWriteParams;
   H.validateDims = validateDims;
   H.compareDims = compareDims;
-  H.optionLabel = optionLabel;
+  // H.optionLabel is gone with optionLabel() itself - see v2.4.0 change 3.
   H.maxWarnings = maxWarnings;
   H.asArray = asArray;
   H.classifyStatus = classifyStatus;
