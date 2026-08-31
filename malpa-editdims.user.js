@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Edit Dimensions
 // @namespace    https://malpa.canary7.com
-// @version      2.1.1
+// @version      2.2.0
 // @description  Adds an "Edit Dimensions" button to the Canary7 consigning screen (#/workbenchv) so an operator can correct a container's weight / length / width / height
 // @author       Malpa 3PL
 // @homepageURL  https://github.com/zaynnev/malpa3pl
@@ -14,7 +14,10 @@
 // ==/UserScript==
 
 /* =============================================================================
- * malpa-editdims.user.js  -  v2.1.0
+ * malpa-editdims.user.js  -  v2.2.0
+ *
+ * v2.2.0 fixes the reason v2.1.0 still never appeared on screen: it looked for
+ * the anchor by CLASS, and the anchor has no such class. See THE ANCHOR below.
  *
  * v2 SUPERSEDES v1. v1 never appeared on screen at all: its route guard was a
  * regex looking for the word "consign", and the consigning screen's URL contains
@@ -27,6 +30,9 @@
  * -----------------------------------------------------------------------------
  * [HAR]  HAR capture of the live consigning screen, malpa.canary7.com.har,
  *        31 Aug 2026, staging tenant, company 46 (MA-TRL), warehouse 10.
+ * [HAR2] A SECOND HAR of the live consigning screen, 31 Aug 2026, captured with
+ *        v2.1.0 installed. Its OpenReplay stream carries the page's own console
+ *        output and a serialised DOM.
  * [MCP]  Read-only probe through the malpa-canary7 MCP.
  *
  * ROUTE                                                              [HAR]
@@ -77,12 +83,54 @@
  *   and returns an unfiltered page of unrelated containers - never use it.
  *   container_no also works as a direct filter and returns the same single row.
  *
+ * THE ANCHOR  -  why v2.1.0 never appeared                           [HAR2]
+ *
+ *   FACT 1. THE SCRIPT WORKS ALL THE WAY UP TO INJECTION. The replay stream
+ *   carries this script's OWN console line, emitted on the live screen:
+ *     [Edit Dims] captured get-consigning-container container
+ *     LA_TEST_SHIPMENT_20250822.1##7 id 1449741 status Consigning Pending
+ *   So the route guard, @run-at document-start and the fetch/XHR interception
+ *   are all confirmed working on the real screen. Finding the anchor was the
+ *   ONLY thing that ever failed.
+ *
+ *   FACT 2. THE ANCHOR CARRIES NO "btn" CLASS OF ANY KIND. The string "btn"
+ *   appears ZERO times in the entire replay stream, while other class values DO
+ *   appear in it as literals - ng-star-inserted, and
+ *   "ag-header-cell ag-header-cell-sortable ag-focus-managed ag-header-active" -
+ *   alongside the screen's Angular content attributes. The requirement's HTML
+ *   snippet simply does not describe this element, so v2.1.0's class-based
+ *   selector could never match anything.
+ *
+ *   WHAT THE DOM ACTUALLY IS:
+ *     .table-responsive > TABLE > TBODY > TR >
+ *        TD container_no | TD location | TD container type | TD weight |
+ *        TD > BUTTON "Edit Weight"
+ *   a single-row table whose <thead> reads
+ *     Container No | Location | Container Type | Weight
+ *   The screen's own CSS carries, on its Angular content attribute:
+ *     td … button … { margin-left: 10px }
+ *     .table-responsive … { max-height: 720px; overflow-y: scroll }
+ *
+ *   There is ALSO an <h5>Edit Weight</h5> elsewhere in the DOM - the hidden
+ *   Edit Weight modal's title. A text match not also anchored to
+ *   BUTTON-inside-TD would select that instead.
+ *
+ *   findAnchor() therefore matches on TAG + TEXT, scoped to the container
+ *   table, and never on class or on the build-specific Angular content
+ *   attribute (that hash changes with every Canary7 build). tryInject() CLONES
+ *   the anchor's own className onto our button rather than naming any class of
+ *   C7's, so whatever C7 styles its button with, ours matches.
+ *
  * THE WRITE                                                          [HAR]
  *   GET /index.php?r=shipment/shipment-container/close-to-container
- *       &close_to_location_id=72037&container_id=1449741&profile_id=14
+ *       &close_to_location_id=72037&container_id=1449741&profile_id=7
  *       &weight=0.84&length=6&width=2&height=5
- *   profile_id is hard-coded to 14 per the requirement. NOTE: the supplied
- *   sample URL showed 7, so PROFILE_ID below is the single place to change it.
+ *   profile_id is 7. The original requirement said 14; THERE IS NO PROFILE 14.
+ *   The tenant's configuration/consigning-profile list, read from the HAR of
+ *   31 Aug 2026, contains only 6 (Supervisor Fixing), 7 (Default Consigning),
+ *   8 (Wholesale Consigning) and 10 (TEST). Profile 7's initiation_method_id is
+ *   1, matching the initiation_method_id=1 the consigning screen itself sends.
+ *   PROFILE_ID below is the single place it is defined.
  *
  * AUTH                                                        (lifted verbatim)
  *   getToken(), mkHeaders() and API_ROOT / API_BASE / WAREHOUSE_ID are copied
@@ -107,7 +155,19 @@
  *     AFTER the app's own call fired. The selectors it tries are NOT confirmed;
  *     if it finds nothing the modal says so and stops. It never guesses, and it
  *     is not a revival of v1's scraper: it reads ONE value and nothing else.
- *  6. profile_id 14 (see above) - required, but its meaning is not confirmed.
+ *  6. profile_id 7 (see THE WRITE). The profile EXISTS and its
+ *     initiation_method_id matches the screen's, but nothing confirms that
+ *     close-to-container actually consumes it the way this script assumes.
+ *  9. THE ANCHOR'S EXACT CLASS LIST IS STILL UNKNOWN. The replay dictionary
+ *     never surfaced it - all it establishes is that no "btn" token is in it.
+ *     That unknown is PRECISELY why findAnchor() matches on tag + text and why
+ *     tryInject() clones the anchor's className instead of naming any class of
+ *     C7's. Nothing here may be rewritten to select on a class name until a
+ *     capture actually shows one.
+ * 10. That the container table is the only table on the screen carrying both a
+ *     "Container No" and a "Weight" <th>. findAnchor() prefers that table but
+ *     falls back to every td button in the document, so a second such table
+ *     degrades into the text match rather than into no button at all.
  *  7. THE FALLBACK IS UNREACHABLE FROM THE BUTTON BY DESIGN. tryInject() refuses
  *     to inject unless State.row is set, and the fallback in loadContainers()
  *     only runs when State.row is null - so no click can ever reach it. It is
@@ -137,16 +197,20 @@
    * ======================================================================== */
 
   const TAG          = '[Edit Dims]';
-  const VERSION      = '2.1.0';                      // keep in step with @version
+  const VERSION      = '2.2.0';                      // keep in step with @version
 
   // Lifted verbatim from malpa-transfer.user.js
   const API_ROOT     = 'https://stgauth.canary7.com';
   const API_BASE     = API_ROOT + '/index.php?r=';
   const WAREHOUSE_ID = 10;
 
-  // Hard-coded per the requirement. The supplied sample URL showed 7; change
-  // this one constant if that turns out to be the operative profile.
-  const PROFILE_ID   = 14;
+  // 7 = "Default Consigning". The build requirement said 14 - THERE IS NO
+  // PROFILE 14. The tenant's configuration/consigning-profile list, read from
+  // the HAR of 31 Aug 2026, holds only 6 (Supervisor Fixing), 7 (Default
+  // Consigning), 8 (Wholesale Consigning) and 10 (TEST). Profile 7's
+  // initiation_method_id is 1, matching the initiation_method_id=1 the
+  // consigning screen itself sends.
+  const PROFILE_ID   = 7;
 
   // The generic workbench route. Necessary, never sufficient - see the guard.
   // ';' is tolerated alongside '/', '?' and '#' because Angular writes matrix
@@ -206,8 +270,11 @@
 
   // One stylesheet, every selector prefixed. Kept as an array of single-quoted
   // literals so an offline test can scan it for a leaked class name.
+  // NOTE: no margin rule for #edim-btn. The consigning screen's own stylesheet
+  // already carries  td … button … { margin-left: 10px }  [HAR2], which spaces
+  // every button in that cell including ours. A competing margin here would
+  // only fight it. edim-btn stays as a hook for when it genuinely needs one.
   const CSS = [
-    '#edim-btn{margin-left:8px}',
     '#edim-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:2147483646}',
     '#edim-modal{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);',
     'width:min(520px,94vw);max-height:90vh;overflow:auto;background:#fff;color:#111827;',
@@ -763,14 +830,51 @@
    * THE BUTTON
    * ======================================================================== */
 
-  // Match on text, never on C7's build-specific Angular content attribute -
-  // that hash changes on every Canary7 build.
+  const ANCHOR_TEXT = 'Edit Weight';
+
+  /* The single-row container table: a <table> whose <th> texts include both
+   * "Container No" and "Weight" [HAR2]. Used only to SCOPE the anchor search -
+   * findAnchor() falls back to the whole document if no such table is found, so
+   * a header wording change degrades the search rather than killing the button. */
+  function findContainerTable(d) {
+    let tables;
+    try { tables = d.querySelectorAll('table'); } catch (_) { return null; }
+    for (let i = 0; i < tables.length; i++) {
+      let ths;
+      try { ths = tables[i].querySelectorAll('th'); } catch (_) { continue; }
+      let hasNo = false;
+      let hasWeight = false;
+      for (let j = 0; j < ths.length; j++) {
+        const t = String(ths[j].textContent || '').trim().toLowerCase();
+        if (t.indexOf('container no') !== -1) hasNo = true;
+        else if (t.indexOf('weight') !== -1) hasWeight = true;
+      }
+      if (hasNo && hasWeight) return tables[i];
+    }
+    return null;
+  }
+
+  /* MATCH ON TAG + TEXT, NEVER ON CLASS.
+   *
+   * v2.1.0 looked for a button by class and the button has no such class: the
+   * string "btn" appears ZERO times in the whole replay stream [HAR2]. That one
+   * selector is the entire reason the button never appeared on screen. The
+   * anchor's real class list is still unknown, so nothing here may select on
+   * one - nor on C7's build-specific Angular content attribute, whose hash
+   * changes on every Canary7 build.
+   *
+   * The BUTTON-inside-TD requirement is not decoration: the same "Edit Weight"
+   * text also sits in an <h5> elsewhere in the DOM - the hidden Edit Weight
+   * modal's title - and a bare text search would find that instead. A td button
+   * carrying DIFFERENT text (a "Print Label" sibling) must not be chosen
+   * either, which is why the text is compared exactly. */
   function findAnchor(doc) {
     const d = doc || document;
+    const scope = findContainerTable(d) || d;
     let list;
-    try { list = d.querySelectorAll('button.btn-apply'); } catch (_) { return null; }
+    try { list = scope.querySelectorAll('td button'); } catch (_) { return null; }
     for (let i = 0; i < list.length; i++) {
-      if (String(list[i].textContent || '').trim() === 'Edit Weight') return list[i];
+      if (String(list[i].textContent || '').trim() === ANCHOR_TEXT) return list[i];
     }
     return null;
   }
@@ -791,7 +895,13 @@
     const btn = doc.createElement('button');
     btn.id = IDS.btn;
     btn.setAttribute('type', 'button');
-    btn.className = 'btn btn-primary btn-apply edim-btn';
+    // CLONE the anchor's own classes rather than naming any of C7's. Whatever
+    // the consigning screen styles its Edit Weight button with, ours matches -
+    // and since that class list is still unknown [HAR2], guessing at one is how
+    // v2.1.0 ended up invisible. 'edim-btn' is only our own hook; the screen's
+    // own  td … button … { margin-left: 10px }  already spaces siblings, so no
+    // competing margin is set for it (see the CSS block).
+    btn.className = (anchor.className ? anchor.className + ' ' : '') + 'edim-btn';
     btn.textContent = 'Edit Dimensions';
     btn.addEventListener('click', function () { open(); });
 
@@ -1533,6 +1643,7 @@
   H.tryInject = tryInject;
   H.watch = watch;
   H.findAnchor = findAnchor;
+  H.findContainerTable = findContainerTable;
   H.isConsignRoute = isConsignRoute;
   H.hasConsigningEvidence = hasConsigningEvidence;
   H.installIntercept = installIntercept;
