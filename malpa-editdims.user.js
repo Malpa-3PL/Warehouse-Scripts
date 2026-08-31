@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         Malpa Edit Dimensions
 // @namespace    https://malpa.canary7.com
-// @version      2.4.0
+// @version      2.5.0
 // @description  Adds an "Edit Dimensions" button to the Canary7 consigning screen (#/workbench) so an operator can correct a container's length / width / height
 // @author       Malpa 3PL
-// @homepageURL  https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-editdims.user.js
-// @supportURL   https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-editdims.user.js
+// @homepageURL  https://github.com/zaynnev/malpa3pl
+// @supportURL   https://github.com/zaynnev/malpa3pl/issues
 // @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-editdims.user.js
 // @downloadURL  https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-editdims.user.js
 // @match        https://*.canary7.com/*
@@ -14,7 +14,64 @@
 // ==/UserScript==
 
 /* =============================================================================
- * malpa-editdims.user.js  -  v2.4.0
+ * malpa-editdims.user.js  -  v2.5.0
+ *
+ * v2.5.0 IS ONE UX ADDITION: A SUCCESS TOAST. Nothing about the route, the
+ * interception, the anchor, the write URL or the verification strategy moved,
+ * and no failure path changed by a single character.
+ *
+ *   THE PROBLEM v2.4.0 LEFT. A verified success closes the modal, so the only
+ *   thing the operator was left with was a console line they will never open.
+ *   The write landed and the screen said nothing.
+ *
+ *   WHAT FIRES, AND ONLY THERE. showToast() is called from exactly ONE place:
+ *   the last statement of the success path in submit(), AFTER close() has taken
+ *   the modal down. It is reachable only when the independent verifying re-read
+ *   agreed with what was submitted (cmp.ok) AND the modal that write started in
+ *   was still on screen. Every failure - network, HTTP 4xx, HTTP 500-with-a-
+ *   code, a re-read that does not match, or a throw - leaves the modal standing
+ *   and reports itself there, exactly as in v2.4.0, and never reaches the toast.
+ *
+ *   WHAT IT SAYS. The house shape is malpa-transfer.user.js's Status module
+ *   (v2.6.1, section "4b. STATUS BANNER") - a '✓' glyph, a headline, and N
+ *   detail lines, on transfer's own ok palette (#eaf7ee on #12833f with a 5px
+ *   left border). There is NO transient/auto-dismissing notification anywhere
+ *   in the fleet to copy - replen's #malpa-qty-error, transfer's Status and
+ *   packguide's .tm-error are all persistent-until-replaced - so the TIMER is
+ *   the only genuinely new element here, and the visual language is lifted
+ *   rather than invented. Content is the container number plus one line per
+ *   dimension that ACTUALLY CHANGED ("Length 6 → 10"); a dimension resubmitted
+ *   at its existing value is not a change and is not listed. Weight is never
+ *   listed as edited - it is passed through unchanged, not edited.
+ *
+ *   HOW IT BEHAVES. Body-level, #edim-toast, fixed top-right, auto-dismissing
+ *   after TOAST_MS and dismissible by click. It has NO backdrop, never calls
+ *   focus() and never captures keys, so it cannot trap focus or block the page
+ *   underneath; the only pointer events it takes are the ones inside its own
+ *   small box, which is what makes click-to-dismiss work. TOP-RIGHT is chosen
+ *   because the bottom of the viewport is already #edim-crash's (left/right 12,
+ *   bottom 12), and the container table with its Edit Weight / Edit Dimensions
+ *   buttons sits in the page's own flow below the header - so the top-right
+ *   corner is the one region that is neither.
+ *
+ *   IDEMPOTENT. showToast() removes any toast already up and CLEARS ITS PENDING
+ *   TIMER before building the new one, so a second success replaces the first
+ *   rather than stacking, and the replacement gets its full duration instead of
+ *   inheriting the old one's remaining time.
+ *
+ *   IT GOES WITH THE ROUTE. watch()'s off-route branch already tears down the
+ *   button, the modal and the observer; removeToast() joins them, timer and all.
+ *
+ *   THE CONSOLE LINE STAYS. "[Edit Dims] Saved and verified…" is still emitted,
+ *   unchanged, on every success including the orphaned one. The toast is a
+ *   second, transient surface, not a replacement for the permanent record.
+ *
+ *   NO TOAST ON THE ORPHAN PATH, DELIBERATELY. If the modal was already gone
+ *   when the result landed (route change mid-write), the outcome still goes to
+ *   the body-level #edim-crash box and NOTHING is toasted: the operator is no
+ *   longer on the consigning screen, the crash box is a persistent report they
+ *   can read whenever they notice it, and a 6-second toast on some unrelated
+ *   screen would be a weaker duplicate that can expire before it is seen.
  *
  * v2.4.0 IS THREE UX CHANGES. Nothing about the route, the interception, the
  * anchor, the write URL or the verification strategy moved.
@@ -357,7 +414,7 @@
    * ======================================================================== */
 
   const TAG          = '[Edit Dims]';
-  const VERSION      = '2.4.0';                      // keep in step with @version
+  const VERSION      = '2.5.0';                      // keep in step with @version
 
   // Lifted verbatim from malpa-transfer.user.js
   const API_ROOT     = 'https://stgauth.canary7.com';
@@ -389,6 +446,14 @@
   // How old a captured consigning row may be before the modal warns about it.
   // A judgement call, not a confirmed figure - see the ASSUMED block. Warn only.
   const STALE_ROW_MS = 60000;
+
+  // How long the success toast stays up before dismissing itself. A judgement
+  // call - there is NO transient-notification precedent in the fleet to copy a
+  // duration from (see the v2.5.0 header note). Long enough to read a container
+  // number and up to three change lines on a handheld, short enough that it is
+  // gone by the time the operator has consigned the next container. A click
+  // dismisses it sooner; nothing ever waits on it.
+  const TOAST_MS     = 6000;
 
   // The substring that identifies the app's own consigning load.
   const CONSIGN_MARKER = 'get-consigning-container';
@@ -424,6 +489,9 @@
     no:       'edim-no',
     spinner:  'edim-spinner',
     crash:    'edim-crash',
+    // The success toast. Body-level like the crash box, and just as much ours -
+    // it is never attached to, or styled onto, a node of C7's.
+    toast:    'edim-toast',
   };
 
   const CONFIG = {
@@ -475,6 +543,23 @@
     '.edim-no{background:#e5e7eb;color:#111827}',
     '.edim-yes{background:#2563eb;color:#fff}',
     '.edim-spinner{font-size:13px;color:#6b7280}',
+    // THE SUCCESS TOAST. Palette and shape lifted from malpa-transfer's Status
+    // module ('ok' state): #eaf7ee on #12833f behind a 5px left border, a bold
+    // title line and a smaller detail block. TOP-RIGHT because the bottom strip
+    // belongs to #edim-crash and the container table with its Edit Weight /
+    // Edit Dimensions buttons sits in the page flow below the header. No
+    // backdrop and no overlay: it covers only its own box, so the screen
+    // underneath stays clickable.
+    '#edim-toast{position:fixed;top:16px;right:16px;z-index:2147483647;',
+    'width:min(420px,calc(100vw - 32px));box-sizing:border-box;cursor:pointer;',
+    'background:#eaf7ee;border:1px solid #12833f;border-left:5px solid #12833f;',
+    'border-radius:10px;padding:12px 14px;color:#12833f;',
+    'box-shadow:0 14px 34px rgba(0,0,0,.18);',
+    'font-family:Inter,Roboto,Arial,sans-serif}',
+    '.edim-toast-title{font-size:15px;font-weight:600;line-height:1.3}',
+    '.edim-toast-lines{margin-top:5px;font-size:12px;line-height:1.5;opacity:.9;',
+    'overflow-wrap:anywhere}',
+    '.edim-toast-line{font-variant-numeric:tabular-nums}',
     '#edim-crash{position:fixed;left:12px;right:12px;bottom:12px;z-index:2147483647;',
     'background:#fff5f5;border:2px solid #fecaca;border-radius:12px;padding:14px;',
     'color:#991b1b;font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;',
@@ -668,6 +753,18 @@
 
   function num(v) { return Number(v); }
   function fmt(v) { return (v === null || v === undefined || v === '') ? '?' : String(v); }
+
+  /* Did this value actually move? Compared NUMERICALLY where both sides resolve,
+   * so the stored 6 and a typed "6" are the same value and not a change - the
+   * success toast lists only what really moved. Anything Number() cannot resolve
+   * falls back to a string comparison rather than collapsing into NaN !== NaN
+   * and reporting a change that did not happen. */
+  function changed(before, after) {
+    const a = num(before);
+    const b = num(after);
+    if (isFinite(a) && isFinite(b)) return Math.abs(a - b) >= 1e-9;
+    return String(before) !== String(after);
+  }
 
   /* THE THREE EDITABLE DIMENSIONS. Weight is deliberately absent: the consigning
    * screen has its own "Edit Weight" button, so this modal must not offer a
@@ -1161,6 +1258,11 @@
     if (!onRoute()) {
       removeButton();
       close({ force: true });
+      // The success toast belongs to the screen it was raised on, so it goes
+      // with the route - and removeToast() takes its pending auto-dismiss with
+      // it, rather than leaving a timer to fire into a document that has moved
+      // on. This joins the button, modal and observer teardown already here.
+      removeToast();
       // Clear the intercepted payload: it belonged to the route we just left.
       State.row = null;
       State.rowAt = null;
@@ -1221,6 +1323,97 @@
       if (!box.parentElement && document.body) document.body.appendChild(box);
       warn('write outcome painted outside a detached modal', text);
     } catch (_) {}
+  }
+
+  /* ---------------------------------------------------------------------------
+   * THE SUCCESS TOAST  (v2.5.0)
+   *
+   * The only thing on this screen that says a write landed. v2.4.0 closes the
+   * modal on a verified success, which left the operator with nothing but a
+   * console line; this is what replaced that silence.
+   *
+   * IT IS FIRED FROM EXACTLY ONE PLACE - the last statement of the success path
+   * in submit(), after close(). Nothing else may call it. Every failure keeps
+   * the modal open and reports itself in the modal, which is where an operator
+   * who has to DO something about it is already looking.
+   *
+   * SHAPE LIFTED FROM malpa-transfer's Status module: '✓' + a headline + N
+   * detail lines, on its 'ok' palette. No script in the fleet has a transient
+   * notification to copy, so the timer is the new part; the look is not.
+   *
+   * createElement + textContent ONLY. The container number is API-supplied data
+   * and there is no innerHTML anywhere in this file - see the metadata test.
+   *
+   * IT DOES NOT TRAP FOCUS OR BLOCK THE PAGE. No backdrop, no focus() call, no
+   * key listener - only a click handler on its own box, so the screen
+   * underneath stays fully usable while it is up.
+   * ------------------------------------------------------------------------ */
+
+  // The pending auto-dismiss. Held so a REPLACEMENT toast can cancel it: an
+  // uncancelled timer from the previous success would fire against the new
+  // toast and cut its life short.
+  let toastTimer = null;
+
+  function clearToastTimer() {
+    if (toastTimer === null) return;
+    try { clearTimeout(toastTimer); } catch (_) {}
+    toastTimer = null;
+  }
+
+  /* Removes the toast AND its pending timer. Called by the auto-dismiss, by the
+   * click handler, by a replacement toast, and by watch() on the way off-route -
+   * a timer left running past a route change would fire into a document that
+   * has moved on. */
+  function removeToast() {
+    clearToastTimer();
+    const t = document.getElementById(IDS.toast);
+    if (t && t.remove) t.remove();
+    return !!t;
+  }
+
+  function showToast(containerNo, changes) {
+    try {
+      if (!document.body) return null;
+      injectCss();
+
+      // IDEMPOTENT. Any toast already up is removed and ITS TIMER CLEARED before
+      // the new one is built, so two successes in a row leave exactly one node
+      // and the second gets its full TOAST_MS rather than the first's remainder.
+      removeToast();
+
+      const box = mk('div', 'edim-toast');
+      box.id = IDS.toast;
+      // A live region, not a dialog: announced without stealing focus.
+      box.setAttribute('role', 'status');
+
+      box.appendChild(mk('div', 'edim-toast-title', '✓ Saved and verified'));
+
+      const lines = mk('div', 'edim-toast-lines');
+      // The container number is API-supplied text. textContent, never markup.
+      lines.appendChild(mk('div', 'edim-toast-line', String(containerNo)));
+      // Only what actually MOVED. A dimension resubmitted at its existing value
+      // is not a change, and weight is never listed at all - this dialog does
+      // not edit it, it only carries it through untouched.
+      const list = (changes && changes.length) ? changes : ['No dimension changed.'];
+      list.forEach(function (t) {
+        lines.appendChild(mk('div', 'edim-toast-line', String(t)));
+      });
+      box.appendChild(lines);
+
+      box.addEventListener('click', function () { removeToast(); });
+
+      document.body.appendChild(box);
+      toastTimer = setTimeout(function () {
+        toastTimer = null;
+        removeToast();
+      }, TOAST_MS);
+      return box;
+    } catch (err) {
+      // A toast that fails to paint must never turn a landed, verified write
+      // into a crash report. The console line is still the permanent record.
+      warn('success toast failed', err);
+      return null;
+    }
   }
 
   /* Report a write outcome into the modal it started in - or, if that modal has
@@ -1771,6 +1964,23 @@
         if (warns.length) lines.push('', 'Warnings:', warns.join('\n'));
         const text = lines.join('\n');
 
+        /* THE TOAST'S CHANGE LINES, BUILT HERE AND NOT LATER.
+         *
+         * c[...] still holds the container's PRE-write values at this point;
+         * the VERIFY_FIELDS loop a few lines below overwrites them with what
+         * Canary7 now returns. Read them after that and every line would say
+         * "10 → 10". Unlike the console line above, only dimensions that
+         * actually MOVED are listed - resubmitting 6 as 6 is not a change - and
+         * weight is never listed, because this dialog carries it through
+         * unchanged rather than editing it. */
+        const toastChanges = [];
+        FIELDS.forEach(function (p) {
+          if (changed(c[p[0]], dims[p[0]])) {
+            toastChanges.push(p[1] + ' ' + fmt(c[p[0]]) + ' → ' + fmt(dims[p[0]]));
+          }
+        });
+        const toastContainerNo = c.container_no;
+
         // Keep the in-memory row in step with what Canary7 now holds - but ONLY
         // when the container just written is the one on screen. Overwriting the
         // intercepted row with a sibling's would leave the screen and the state
@@ -1811,11 +2021,28 @@
           const verified = State.lastVerify; // close() -> State.reset() drops it,
           close();                           // and the debug handle still needs
           State.lastVerify = verified;       // the outcome of the write just done
+
+          /* AND THE TOAST - THE LAST STATEMENT OF THE SUCCESS PATH (v2.5.0).
+           *
+           * AFTER close(), deliberately: the operator sees the dialog go and
+           * the confirmation arrive, rather than a notification appearing over
+           * a modal that is about to vanish. This line is unreachable unless
+           * cmp.ok held AND the modal this write started in was still on
+           * screen, which is exactly the definition of a verified success on
+           * the screen the operator is still standing on. */
+          showToast(toastContainerNo, toastChanges);
         }
         // If it WAS orphaned there is nothing of ours left to close: the result
         // has gone to the crash box, and any modal now on screen is a FRESH one
         // the operator opened after the route change. Closing that would tear
         // down a dialog this write has nothing to do with.
+        //
+        // AND NOTHING IS TOASTED THERE EITHER. The operator has left the
+        // consigning screen; #edim-crash is a PERSISTENT report they can read
+        // whenever they notice it, whereas a toast that expires in TOAST_MS on
+        // whatever screen they moved to is a weaker duplicate that can be gone
+        // before it is seen. One surface per outcome, and for the orphan that
+        // surface is the crash box.
       } else {
         const lines = ['VERIFY FAILED - the re-read does not match what was submitted.'];
         lines.push('Container ' + c.container_no);
@@ -1952,6 +2179,16 @@
   H.mkHeaders = mkHeaders;
   H.readContainerNoFromPage = readContainerNoFromPage;
   H.submit = submit;
+  H.changed = changed;
+  H.removeToast = removeToast;
+  // The pending auto-dismiss, read through a getter because it is a `let` that
+  // is reassigned - a plain reference would freeze at null. The harness uses it
+  // to prove a replacement toast really cancels the previous timer rather than
+  // inheriting its deadline. showToast() is NOT exposed: the toast has exactly
+  // one legitimate caller, the success path in submit(), and a console handle
+  // for raising a "Saved and verified" notice with no write behind it is the
+  // one debugging convenience this script should not offer.
+  H.toastTimer = function () { return toastTimer; };
 
   try { window.__editDims = H; } catch (_) {}
 
