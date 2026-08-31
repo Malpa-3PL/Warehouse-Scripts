@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Malpa Edit Dimensions
 // @namespace    https://malpa.canary7.com
-// @version      2.2.0
-// @description  Adds an "Edit Dimensions" button to the Canary7 consigning screen (#/workbenchv) so an operator can correct a container's weight / length / width / height
+// @version      2.3.0
+// @description  Adds an "Edit Dimensions" button to the Canary7 consigning screen (#/workbench) so an operator can correct a container's weight / length / width / height
 // @author       Malpa 3PL
 // @homepageURL  https://github.com/zaynnev/malpa3pl
 // @supportURL   https://github.com/zaynnev/malpa3pl/issues
@@ -14,10 +14,46 @@
 // ==/UserScript==
 
 /* =============================================================================
- * malpa-editdims.user.js  -  v2.2.0
+ * malpa-editdims.user.js  -  v2.3.0
  *
- * v2.2.0 fixes the reason v2.1.0 still never appeared on screen: it looked for
- * the anchor by CLASS, and the anchor has no such class. See THE ANCHOR below.
+ * v2.3.0 RETRACTS TWO CLAIMS v2.2.0's header stated as CONFIRMED. Both were
+ * derived from a BINARY OpenReplay stream, and both were wrong. A console probe
+ * run on the LIVE consigning screen on 31 Aug 2026 [PROBE] is the ground truth
+ * and supersedes every inference drawn from that stream:
+ *
+ *   RETRACTION 1 - THE ROUTE IS #/workbench, NOT #/workbenchv.
+ *   v2.2.0 shipped ROUTE_RE = /^#\/workbenchv…/ which can NEVER match, so the
+ *   script was dead on the real screen. The phantom "v" was a framing error: the
+ *   byte immediately before the URL in the replay stream was '%' = 0x25 = 37,
+ *   which is the LENGTH of "https://malpa.canary7.com/#/workbench" (37 chars) -
+ *   a length prefix, not text - and the trailing "v" was the first byte of the
+ *   NEXT field. One character of mis-framing.
+ *
+ *   That single character also explains the second live symptom, "row captured:
+ *   false". watch() clears State.row whenever the route does not match, and the
+ *   route never matched, so every 1500 ms tick wiped the payload the interceptor
+ *   had just captured. Fixing ROUTE_RE fixes BOTH symptoms; there was never a
+ *   second bug in the interception.
+ *
+ *   RETRACTION 2 - THE ANCHOR DOES CARRY "btn btn-primary btn-apply".
+ *   v2.2.0's "FACT 2" asserted the anchor has no btn class of any kind, on the
+ *   grounds that the string "btn" appears zero times in the replay stream. That
+ *   was ABSENCE OF EVIDENCE in a stream that does not serialise the attribute at
+ *   all, presented as evidence of absence. The build requirement's HTML snippet
+ *   was accurate the whole time. See THE ANCHOR below for the probe's verbatim
+ *   outerHTML.
+ *
+ *   NOTHING IN THE MATCHING CODE CHANGED FOR RETRACTION 2, and nothing should.
+ *   findAnchor() matches on TAG + TEXT scoped to the container table, which is
+ *   strictly more robust than a class selector: it matches this button today and
+ *   keeps matching it after any Canary7 restyle. tryInject() cloning the
+ *   anchor's className is likewise still right - it now clones
+ *   btn btn-primary btn-apply, which is exactly what we want on our button.
+ *
+ * v2.2.0 fixed the reason v2.1.0 never appeared: it looked for the anchor by
+ * CLASS. The DIAGNOSIS was wrong (the class does exist) but the FIX was right
+ * for the right underlying reason - a build-coupled selector had no business
+ * being the thing the button depended on. See THE ANCHOR below.
  *
  * v2 SUPERSEDES v1. v1 never appeared on screen at all: its route guard was a
  * regex looking for the word "consign", and the consigning screen's URL contains
@@ -34,12 +70,45 @@
  *        v2.1.0 installed. Its OpenReplay stream carries the page's own console
  *        output and a serialised DOM.
  * [MCP]  Read-only probe through the malpa-canary7 MCP.
+ * [PROBE] A CONSOLE PROBE run on the LIVE consigning screen, 31 Aug 2026, with
+ *        v2.2.0 installed. It read location.hash, the live button set and the
+ *        live table headers directly out of the DOM. THIS IS GROUND TRUTH AND
+ *        SUPERSEDES EVERY INFERENCE DRAWN FROM THE [HAR2] REPLAY STREAM. Where
+ *        the two disagree, [HAR2] is wrong: it is a binary format that neither
+ *        serialises every attribute nor frames its fields the way v2.2.0's
+ *        header assumed. Verbatim output:
  *
- * ROUTE                                                              [HAR]
- *   The consigning screen is  https://malpa.canary7.com/#/workbenchv
- *   "consign" appears nowhere in the URL. #/workbenchv is a GENERIC workbench
+ *          version: 2.2.0
+ *          row captured: false | hash: #/workbench
+ *          our button present: false
+ *          Edit Weight buttons: 1
+ *          0 inTD: true class: "btn btn-primary btn-apply"
+ *            <button _ngcontent-ng-c233464439="" type="button"
+ *                    class="btn btn-primary btn-apply">Edit Weight</button>
+ *          tables: [["Item","Item Description","Total Quantity","","","",""],
+ *                   [],
+ *                   ["Container No","Location","Container Type","Weight"],
+ *                   ["Shift User","Shift Name","Completed","Abandoned"]]
+ *          after manual tryInject: false
+ *
+ * ROUTE                                                            [PROBE]
+ *   The consigning screen is  https://malpa.canary7.com/#/workbench
+ *   "consign" appears nowhere in the URL. #/workbench is a GENERIC workbench
  *   route, so it is necessary but NOT sufficient - see the three-part guard in
  *   isConsignRoute() + hasConsigningEvidence() + findAnchor().
+ *
+ *   CORRECTION - v2.2.0's header said #/workbenchv AND SHIPPED A REGEX THAT
+ *   REQUIRED IT, so the script could never run on the real screen. There is no
+ *   trailing "v". The probe read location.hash straight off the live page:
+ *   "#/workbench". The "v" was the leading byte of the next field in the replay
+ *   stream, sitting behind a '%' (0x25 = 37) length prefix that happens to be
+ *   the exact character count of the URL. Do not re-derive the "v" from any
+ *   replay capture; read location.hash.
+ *
+ *   The same character explains "row captured: false" in the probe. watch()
+ *   clears State.row off-route, and the route never matched, so the polling tick
+ *   destroyed each captured payload moments after it arrived. One fix, two
+ *   symptoms - do not go looking for a separate interception bug.
  *
  * THE DATA SOURCE                                                    [HAR]
  *   The screen loads a container with, on the page's own fetch/XHR:
@@ -83,23 +152,45 @@
  *   and returns an unfiltered page of unrelated containers - never use it.
  *   container_no also works as a direct filter and returns the same single row.
  *
- * THE ANCHOR  -  why v2.1.0 never appeared                           [HAR2]
+ * THE ANCHOR                                              [PROBE], [HAR2]
  *
- *   FACT 1. THE SCRIPT WORKS ALL THE WAY UP TO INJECTION. The replay stream
- *   carries this script's OWN console line, emitted on the live screen:
+ *   FACT 1. THE SCRIPT WORKS ALL THE WAY UP TO INJECTION.            [HAR2]
+ *   The replay stream carries this script's OWN console line, emitted on the
+ *   live screen:
  *     [Edit Dims] captured get-consigning-container container
  *     LA_TEST_SHIPMENT_20250822.1##7 id 1449741 status Consigning Pending
- *   So the route guard, @run-at document-start and the fetch/XHR interception
- *   are all confirmed working on the real screen. Finding the anchor was the
- *   ONLY thing that ever failed.
+ *   So @run-at document-start and the fetch/XHR interception are confirmed
+ *   working on the real screen. (The ROUTE GUARD is NOT confirmed by this line:
+ *   noteRow() captures regardless of route, and v2.2.0's broken ROUTE_RE then
+ *   let watch() throw the capture away on the next tick. See RETRACTION 1.)
  *
- *   FACT 2. THE ANCHOR CARRIES NO "btn" CLASS OF ANY KIND. The string "btn"
- *   appears ZERO times in the entire replay stream, while other class values DO
- *   appear in it as literals - ng-star-inserted, and
- *   "ag-header-cell ag-header-cell-sortable ag-focus-managed ag-header-active" -
- *   alongside the screen's Angular content attributes. The requirement's HTML
- *   snippet simply does not describe this element, so v2.1.0's class-based
- *   selector could never match anything.
+ *   FACT 2. THE ANCHOR CARRIES  btn btn-primary btn-apply.          [PROBE]
+ *   Read off the live DOM, verbatim:
+ *
+ *     class list:  btn btn-primary btn-apply
+ *     outerHTML:   <button _ngcontent-ng-c233464439="" type="button"
+ *                          class="btn btn-primary btn-apply">Edit Weight</button>
+ *
+ *   RETRACTED: v2.2.0's header stated as CONFIRMED that "THE ANCHOR CARRIES NO
+ *   'btn' CLASS OF ANY KIND", reasoning that the string "btn" appears zero times
+ *   in the replay stream. THAT CLAIM WAS FALSE. It was absence of evidence in a
+ *   stream that never serialises this attribute, written up as evidence of
+ *   absence. The build requirement's class="btn btn-primary btn-apply" snippet
+ *   described this element accurately all along. Do not repeat the inference:
+ *   a class missing from an OpenReplay capture says nothing about the live DOM.
+ *
+ *   THE MATCHING CODE IS UNCHANGED BY THAT RETRACTION, DELIBERATELY.
+ *   findAnchor() still matches on TAG + TEXT scoped to the container table and
+ *   still never names a class, because tag+text is STRICTLY MORE ROBUST than the
+ *   class selector it replaced: it matches this button as it stands today, and a
+ *   Canary7 restyle that renames btn-apply cannot break it. Reverting to
+ *   'button.btn-apply' would buy nothing and re-couple the button to a build.
+ *   The Angular content attribute (_ngcontent-ng-c233464439) is never matched on
+ *   either - that hash changes with every Canary7 build.
+ *
+ *   Class cloning in tryInject() also still does exactly the right thing: it now
+ *   clones btn btn-primary btn-apply onto our button, which is precisely the
+ *   styling we want, obtained without naming one class of C7's in this source.
  *
  *   WHAT THE DOM ACTUALLY IS:
  *     .table-responsive > TABLE > TBODY > TR >
@@ -113,13 +204,25 @@
  *
  *   There is ALSO an <h5>Edit Weight</h5> elsewhere in the DOM - the hidden
  *   Edit Weight modal's title. A text match not also anchored to
- *   BUTTON-inside-TD would select that instead.
+ *   BUTTON-inside-TD would select that instead. The probe counts exactly ONE
+ *   element whose text is "Edit Weight" and which is a button in a td, so the
+ *   tag+text match is unambiguous on the live screen.
  *
- *   findAnchor() therefore matches on TAG + TEXT, scoped to the container
- *   table, and never on class or on the build-specific Angular content
- *   attribute (that hash changes with every Canary7 build). tryInject() CLONES
- *   the anchor's own className onto our button rather than naming any class of
- *   C7's, so whatever C7 styles its button with, ours matches.
+ * THE CONTAINER TABLE  -  and why the search is scoped              [PROBE]
+ *   THERE ARE FOUR TABLES ON THE CONSIGNING SCREEN, not one. Their header rows,
+ *   in document order:
+ *     0  ["Item","Item Description","Total Quantity","","","",""]
+ *     1  []                                    (an empty table, no <th> at all)
+ *     2  ["Container No","Location","Container Type","Weight"]   <- ours
+ *     3  ["Shift User","Shift Name","Completed","Abandoned"]
+ *   findContainerTable() picks index 2 by requiring a <th> containing
+ *   "container no" AND a <th> containing "weight", which is satisfied by that
+ *   table and by none of the other three. That is what justifies scoping the
+ *   anchor search at all: an unscoped document-wide "td button" sweep would be
+ *   free to pick a button out of the Item or Shift table. The scope is a
+ *   preference, not a requirement - findAnchor() falls back to the whole
+ *   document when no table matches, so a header re-wording degrades the search
+ *   instead of killing the button.
  *
  * THE WRITE                                                          [HAR]
  *   GET /index.php?r=shipment/shipment-container/close-to-container
@@ -146,9 +249,12 @@
  *     the app derives it) is unconfirmed. It is reused verbatim when captured
  *     from an intercepted request, and is NOT synthesised when falling back to
  *     mkHeaders() - a guessed session id is worse than an absent one.
- *  3. Whether #/workbenchv hosts screens OTHER than consigning that also render
+ *  3. Whether #/workbench hosts screens OTHER than consigning that also render
  *     an "Edit Weight" button. This is exactly why the route alone is not the
- *     guard: a get-consigning-container response must also have been seen.
+ *     guard: a get-consigning-container response must also have been seen. The
+ *     probe makes this MORE likely, not less - #/workbench renders an Item
+ *     table and a Shift table alongside the container table, so it is plainly a
+ *     composite workbench rather than a dedicated consigning URL.
  *  4. Whether access_token in localStorage/sessionStorage is live on this
  *     screen. hasToken() reports it; the header-capture path does not depend on it.
  *  5. readContainerNoFromPage() - the fallback used only when the script loaded
@@ -158,16 +264,22 @@
  *  6. profile_id 7 (see THE WRITE). The profile EXISTS and its
  *     initiation_method_id matches the screen's, but nothing confirms that
  *     close-to-container actually consumes it the way this script assumes.
- *  9. THE ANCHOR'S EXACT CLASS LIST IS STILL UNKNOWN. The replay dictionary
- *     never surfaced it - all it establishes is that no "btn" token is in it.
- *     That unknown is PRECISELY why findAnchor() matches on tag + text and why
- *     tryInject() clones the anchor's className instead of naming any class of
- *     C7's. Nothing here may be rewritten to select on a class name until a
- *     capture actually shows one.
- * 10. That the container table is the only table on the screen carrying both a
- *     "Container No" and a "Weight" <th>. findAnchor() prefers that table but
- *     falls back to every td button in the document, so a second such table
- *     degrades into the text match rather than into no button at all.
+ *  9. RESOLVED - NO LONGER AN ASSUMPTION. v2.2.0 listed the anchor's class list
+ *     here as UNKNOWN. It is now KNOWN: the live probe reads it as exactly
+ *     "btn btn-primary btn-apply" (see FACT 2, which carries the outerHTML).
+ *     This entry is kept, rather than deleted, so that nobody re-opens the
+ *     question. What has NOT changed is the matching strategy: findAnchor()
+ *     still matches on tag + text and tryInject() still clones the className,
+ *     because knowing today's class list is not a reason to hard-code it -
+ *     tag + text survives a restyle and a class selector does not.
+ * 10. RESOLVED FOR THE LIVE SCREEN. v2.2.0 listed as unconfirmed that the
+ *     container table is the only table carrying both a "Container No" and a
+ *     "Weight" <th>. The probe confirms it: FOUR tables are present (Item /
+ *     an empty one / Container / Shift) and only the Container table satisfies
+ *     both header tests - see THE CONTAINER TABLE above. The fallback behaviour
+ *     is unchanged and still wanted: findAnchor() prefers that table but falls
+ *     back to every td button in the document, so a fifth table or a re-worded
+ *     header degrades into the text match rather than into no button at all.
  *  7. THE FALLBACK IS UNREACHABLE FROM THE BUTTON BY DESIGN. tryInject() refuses
  *     to inject unless State.row is set, and the fallback in loadContainers()
  *     only runs when State.row is null - so no click can ever reach it. It is
@@ -182,7 +294,7 @@
  *
  * -----------------------------------------------------------------------------
  * TEST DATA (staging, MA-TRL company 46, warehouse 10 Darra - never 9)
- *   route      https://malpa.canary7.com/#/workbenchv
+ *   route      https://malpa.canary7.com/#/workbench      (NOT #/workbenchv)
  *   shipment   LA_TEST_SHIPMENT_20250822.1##7  -> shipment_header_id 737834
  *   container  LA_TEST_SHIPMENT_20250822.1##7  -> id 1449741, 0.84 / 6 x 2 x 5
  *   dock       WDD-02 -> 72037
@@ -197,7 +309,7 @@
    * ======================================================================== */
 
   const TAG          = '[Edit Dims]';
-  const VERSION      = '2.2.0';                      // keep in step with @version
+  const VERSION      = '2.3.0';                      // keep in step with @version
 
   // Lifted verbatim from malpa-transfer.user.js
   const API_ROOT     = 'https://stgauth.canary7.com';
@@ -214,8 +326,17 @@
 
   // The generic workbench route. Necessary, never sufficient - see the guard.
   // ';' is tolerated alongside '/', '?' and '#' because Angular writes matrix
-  // params onto a route segment as #/workbenchv;id=1449741.
-  const ROUTE_RE     = /^#\/workbenchv(?:[/?#;].*)?$/i;
+  // params onto a route segment as #/workbench;id=1449741.
+  //
+  // THE SEGMENT IS "workbench". v2.2.0 required "workbenchv" and therefore never
+  // matched anything, which killed the script twice over: the button could not
+  // inject, and watch() wiped every captured payload on the next 1500 ms tick.
+  // The phantom "v" came from mis-framing a binary OpenReplay stream - the byte
+  // before the URL was a '%' (0x25 = 37) LENGTH prefix, 37 being the length of
+  // "https://malpa.canary7.com/#/workbench", and the "v" was the next field's
+  // first byte. The live console probe of 31 Aug 2026 read location.hash as
+  // "#/workbench". Do not restore the "v".
+  const ROUTE_RE     = /^#\/workbench(?:[/?#;].*)?$/i;
 
   // How old a captured consigning row may be before the modal warns about it.
   // A judgement call, not a confirmed figure - see the ASSUMED block. Warn only.
@@ -655,7 +776,7 @@
     const row = asArray(payload)[0];
     if (!row || typeof row !== 'object') return false;
     State.row = row;
-    // Stamp the capture. Nothing else invalidates the row within #/workbenchv -
+    // Stamp the capture. Nothing else invalidates the row within #/workbench -
     // the operator can consign a dozen containers without a route change - so
     // the modal warns on age instead of pretending the row is always current.
     State.rowAt = Date.now();
@@ -798,7 +919,7 @@
   /* ===========================================================================
    * ROUTE GUARD  -  three parts, all must hold
    *
-   *   1. location.hash is #/workbenchv (tolerating a trailing sub-path)
+   *   1. location.hash is #/workbench (tolerating a trailing sub-path)
    *   2. a get-consigning-container response has been seen this route session
    *   3. the C7 "Edit Weight" anchor is in the DOM
    *
@@ -833,9 +954,18 @@
   const ANCHOR_TEXT = 'Edit Weight';
 
   /* The single-row container table: a <table> whose <th> texts include both
-   * "Container No" and "Weight" [HAR2]. Used only to SCOPE the anchor search -
-   * findAnchor() falls back to the whole document if no such table is found, so
-   * a header wording change degrades the search rather than killing the button. */
+   * "Container No" and "Weight" [PROBE].
+   *
+   * THE SCREEN CARRIES FOUR TABLES, not one - Item / an empty one / Container /
+   * Shift - so this is a real discriminator rather than a formality. Only the
+   * container table has both a "container no" and a "weight" header; the Item
+   * table ("Item","Item Description","Total Quantity",…) and the Shift table
+   * ("Shift User","Shift Name","Completed","Abandoned") satisfy neither test,
+   * and the empty one has no <th> at all.
+   *
+   * Used only to SCOPE the anchor search - findAnchor() falls back to the whole
+   * document if no such table is found, so a header wording change degrades the
+   * search rather than killing the button. */
   function findContainerTable(d) {
     let tables;
     try { tables = d.querySelectorAll('table'); } catch (_) { return null; }
@@ -856,12 +986,17 @@
 
   /* MATCH ON TAG + TEXT, NEVER ON CLASS.
    *
-   * v2.1.0 looked for a button by class and the button has no such class: the
-   * string "btn" appears ZERO times in the whole replay stream [HAR2]. That one
-   * selector is the entire reason the button never appeared on screen. The
-   * anchor's real class list is still unknown, so nothing here may select on
-   * one - nor on C7's build-specific Angular content attribute, whose hash
-   * changes on every Canary7 build.
+   * The anchor's live class list IS known - "btn btn-primary btn-apply", read
+   * straight off the DOM by the console probe of 31 Aug 2026. v2.2.0's header
+   * claimed the opposite ("no btn class of any kind") on the strength of the
+   * string being absent from an OpenReplay stream that never serialises the
+   * attribute; that claim is RETRACTED.
+   *
+   * Knowing the class list is NOT a reason to select on it. Tag + text is
+   * strictly more robust: it matches the live button today, and it keeps
+   * matching after any Canary7 restyle that renames btn-apply. So nothing here
+   * selects on a class - nor on C7's build-specific Angular content attribute,
+   * whose hash changes on every Canary7 build.
    *
    * The BUTTON-inside-TD requirement is not decoration: the same "Edit Weight"
    * text also sits in an <h5> elsewhere in the DOM - the hidden Edit Weight
@@ -897,8 +1032,9 @@
     btn.setAttribute('type', 'button');
     // CLONE the anchor's own classes rather than naming any of C7's. Whatever
     // the consigning screen styles its Edit Weight button with, ours matches -
-    // and since that class list is still unknown [HAR2], guessing at one is how
-    // v2.1.0 ended up invisible. 'edim-btn' is only our own hook; the screen's
+    // on the live screen that resolves to "btn btn-primary btn-apply" [PROBE],
+    // which is exactly the styling we want, obtained without hard-coding one
+    // class of C7's here. 'edim-btn' is only our own hook; the screen's
     // own  td … button … { margin-left: 10px }  already spaces siblings, so no
     // competing margin is set for it (see the CSS block).
     btn.className = (anchor.className ? anchor.className + ' ' : '') + 'edim-btn';
@@ -1256,7 +1392,7 @@
       State.shipmentHeaderId = row.shipment_header_id;
 
       // Nothing invalidates a captured row while the operator stays inside
-      // #/workbenchv - they can consign container after container without a
+      // #/workbench - they can consign container after container without a
       // single route change - so an old capture may describe a container that
       // has since moved on. Warn, never block.
       if (!State.usedFallback && State.rowAt) {
