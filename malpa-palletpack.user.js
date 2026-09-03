@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Pallet Pack
 // @namespace    malpa
-// @version      1.9.0
+// @version      1.9.1
 // @match        https://*.canary7.com/*
 // @homepageURL  https://github.com/zaynnev/malpa3pl
 // @supportURL   https://github.com/zaynnev/malpa3pl/issues
@@ -40,6 +40,38 @@
  *
  *  v1.2.3 — Shell is a fixed overlay pinned to C7's content area. We never reparent or
  *  restyle C7's own chrome, so its tabs cannot break.
+ *
+ *  ------------------------------------------------------------------------------
+ *  v1.9.1 — three defects found on NTHC260826 (263 detail lines, company 49).
+ *
+ *  (1) THE SHIPMENT LOAD READ PAGE 1 ONLY. loadShipment asked for per-page=200&page=1
+ *      and never looked at page 2. C7 truncates at the page size without complaint, so
+ *      on that order 63 of the 263 lines never reached Cache.items or Cache.barcodeIndex
+ *      — and every scan of those 63 SKUs was booked as an UNEXPECTED scan of an item the
+ *      order plainly listed. Now paginated to exhaustion (LINE_PAGE_SIZE / MAX_LINE_PAGES),
+ *      and a load that would still be truncated is REFUSED rather than packed blind on a
+ *      barcode index known to be incomplete.
+ *
+ *  (2) THE FALLBACK LOOKUP STARVED ITSELF. resolveUnexpectedRows() resolves every distinct
+ *      unexpected barcode in the modal in one tick, and lookupItemByReference went straight
+ *      to apiFetch — bypassing Q. 63 unknown SKUs meant up to 126 simultaneous requests
+ *      (monolith plus microservice fallback) off a handheld, with no timeout. They failed;
+ *      each failure spent one of MAX_LOOKUP_ATTEMPTS; two spent it entirely and the barcode
+ *      was pinned to "unknown barcode" for the rest of the shipment. So (1) put the SKU in
+ *      the unexpected bucket and (2) stopped it ever being named. Now: through Q at
+ *      concurrency 4 and low priority, and only a DEFINITE 4xx from C7 spends an attempt —
+ *      never a timeout, a 429, a 5xx, or a dropped connection.
+ *
+ *  (3) THE CLOSE BUTTON WAS BELOW THE FOLD. .mpp-modal is a column flex box capped at 94%
+ *      of the viewport; .mpp-vs-list had no flex or min-height, so it could not shrink, the
+ *      MODAL became the scroller, and Close — its last child — sat thousands of pixels down
+ *      a 260-line list. .mpp-overlay covers C7's own chrome at z-index 100000, so that was
+ *      a reload-only dead end with a part-scanned pallet on the floor. The list scrolls now
+ *      and the title and Close are pinned. Also: the Close listener was bound through
+ *      document.getElementById('mpp-vs-close'), which returns the FIRST match in the
+ *      document — so a second overlay would have bound the one UNDERNEATH and left the top
+ *      modal's button genuinely dead. Scoped to the modal, and a stale View-scanned overlay
+ *      is dropped on entry so there can never be two.
  *
  *  ------------------------------------------------------------------------------
  *  v1.9.0 — two additions to View scanned. Nothing was removed: every v1.8.0 path,
@@ -211,7 +243,7 @@
   // malpa.canary7.com is a static Angular app (S3/CloudFront — calling index.php
   // there returns an XML AccessDenied 403); the Canary7 API itself is served from
   // stgauth.canary7.com, which is what both proven sibling scripts call.
-  const VERSION          = '1.9.0';   // keep in step with @version or the fleet won't update
+  const VERSION          = '1.9.1';   // keep in step with @version or the fleet won't update
   const API_BASE         = 'https://stgauth.canary7.com/index.php?r=';
   const WAREHOUSE_ID     = 10;      // guide §5 — HAR shows 10; CONFIRM for production
   const PACK_LOCATION_ID = 72037;   // guide §3 D5 / §5 — packing/close location (code WDD-02); per-station constant, CONFIRM
@@ -222,6 +254,14 @@
   //        (2026-08-19) and cross-checked on shipment BP100932, whose
   //        shipmentHeader.company_id came back as 49.
   const PARTIAL_RESCAN_COMPANY_IDS = new Set([49]);
+
+  // Shipment-detail paging (v1.9.1). C7 honours per-page up to at least 200 on this route
+  // and truncates silently at whatever you ask for — it does NOT signal that more exist in
+  // the body, so the only safe read is "keep going until a short page comes back".
+  // MAX_LINE_PAGES is a runaway guard, not an expected ceiling: 25 x 200 = 5,000 lines,
+  // and the largest order seen on this system is 263 (NTHC260826).
+  const LINE_PAGE_SIZE = 200;
+  const MAX_LINE_PAGES = 25;
 
   // get-pack-container expand for the commit context resolve (guide §3 D4)
   const PP_GPC_EXPAND = [
@@ -858,12 +898,30 @@
       'item.itemUnitOfMeasures.itemUnitOfMeasureReference.reference',
     ].join(',');
 
-    const data = await apiGet(
-      `shipment/shipment-detail&shipment_number=${enc}` +
-      `&expand=${expand}&fields=${fields}&per-page=200&page=1`
-    );
-    const lines = Array.isArray(data) ? data : (data?.items || []);
+    // v1.9.1 — PAGINATE. Reading page 1 only cost NTHC260826 63 of its 263 lines; every
+    // scan of those SKUs then presented as an unexpected "unknown barcode" on an order
+    // that listed them. Loop until a short page comes back.
+    const lines = [];
+    let truncated = false;
+    for (let page = 1; ; page++) {
+      if (page > MAX_LINE_PAGES) { truncated = true; break; }
+      const data = await apiGet(
+        `shipment/shipment-detail&shipment_number=${enc}` +
+        `&expand=${expand}&fields=${fields}&per-page=${LINE_PAGE_SIZE}&page=${page}`
+      );
+      const batch = Array.isArray(data) ? data : (data?.items || []);
+      lines.push(...batch);
+      if (batch.length < LINE_PAGE_SIZE) break;
+    }
     if (!lines.length) { const e = new Error('Shipment not found.'); e.code = 'NOT_FOUND'; throw e; }
+    // A truncated load is not survivable. The barcode index would be missing lines and the
+    // operator would be told real items are unknown — the exact failure this version fixes.
+    // Refuse the shipment rather than blind-pack against an index we know is short.
+    if (truncated) {
+      const e = new Error(`Shipment has more than ${MAX_LINE_PAGES * LINE_PAGE_SIZE} lines — cannot load safely.`);
+      e.code = 'TOO_MANY_LINES';
+      throw e;
+    }
 
     // Guard on the SHIPMENT-HEADER leading status (the authoritative "Pack Pending"
     // signal — guide §7/§15). Detail rows don't reliably carry a leading status, so
@@ -1067,7 +1125,10 @@
   }
   const _unexpectedLookups = new Map();   // normRef(barcode) -> in-flight Promise (dedupe)
   const _unexpectedAttempts = new Map();  // normRef(barcode) -> failed attempts so far
-  const MAX_LOOKUP_ATTEMPTS = 2;
+  // v1.9.1 — raised from 2. Only a definite 4xx from C7 spends an attempt now (see the
+  // catch below), and the lookup runs through Q at concurrency 4, so a higher ceiling
+  // cannot become a request storm.
+  const MAX_LOOKUP_ATTEMPTS = 5;
   // `barcode` is the RAW scanned string. C7's reference match is EXACT (probed), so the
   // query must carry exactly what came off the scanner — normRef upper-cases and strips
   // characters, which is right for a cache key and wrong for the wire.
@@ -1083,7 +1144,16 @@
       return Promise.resolve({ unknown: true, factor: 1, uomName: '' });
     }
     const raw = String(barcode == null ? '' : barcode).trim() || key;
-    const p = lookupItemByReference(raw)
+    // v1.9.1 — through the queue. resolveUnexpectedRows() fires one of these per distinct
+    // unexpected barcode in the same tick and lookupItemByReference goes straight to
+    // apiFetch, so 63 unknown SKUs meant up to 126 concurrent requests off a TC51. Q caps
+    // that at 4 and retries transport failures with backoff.
+    // NO key: APIQueue.enqueue answers a duplicate key with Promise.resolve(NULL), not the
+    // in-flight promise, and a null here would be cached as {unknown:true} for good.
+    // _unexpectedLookups above is the dedupe and it returns the shared promise correctly;
+    // Q is only ever the concurrency limiter. priority -1 keeps a cosmetic lookup behind
+    // anything the commit path queues.
+    const p = Q.enqueue({ fn: () => lookupItemByReference(raw), priority: -1 })
       .then(item => {
         const uom = uomForReference(item, key);
         const resolved = item
@@ -1102,12 +1172,19 @@
       })
       .catch(err => {
         _unexpectedLookups.delete(key);
-        // An auth failure says nothing about this barcode — don't spend an attempt on it.
+        // v1.9.1 — only a DEFINITE answer about this barcode may spend an attempt.
+        // An auth failure says nothing about it; neither does a timeout, a 429, a 5xx, or
+        // a dropped connection — fetch rejects those with no .status at all. Spending
+        // attempts on transport failures is what pinned real, on-order SKUs to
+        // "unknown barcode" once the network went under on NTHC260826.
         const authy = isSessionExpired(err) || err.code === 'AUTH_BLIP';
-        if (!authy) _unexpectedAttempts.set(key, (_unexpectedAttempts.get(key) || 0) + 1);
+        const st = Number(err.status);
+        const definite = Number.isFinite(st) && st >= 400 && st < 500 && st !== 408 && st !== 429;
+        const spend = !authy && definite;
+        if (spend) _unexpectedAttempts.set(key, (_unexpectedAttempts.get(key) || 0) + 1);
         WARN('barcode lookup failed for', key, '—', err.message,
-             authy ? '(auth failure — no attempt spent)'
-                   : `(attempt ${_unexpectedAttempts.get(key)}/${MAX_LOOKUP_ATTEMPTS})`);
+             spend ? `(attempt ${_unexpectedAttempts.get(key)}/${MAX_LOOKUP_ATTEMPTS})`
+                   : '(transport or auth failure — no attempt spent)');
         return { unknown: true, factor: 1, uomName: '' };   // show the raw barcode, count 1
       });
     _unexpectedLookups.set(key, p);
@@ -1703,8 +1780,14 @@
       ? groups.join('')
       : '<div class="mpp-note">Nothing scanned yet.</div>';
 
+    // v1.9.1 — never two. Nothing stopped a second View-scanned overlay existing, and the
+    // Close listener was bound via document.getElementById, which returns the FIRST match
+    // in document order — i.e. the modal UNDERNEATH. The top one's Close would then have no
+    // listener at all, and .mpp-overlay covers C7's chrome at z-index 100000, so there is
+    // no other way out.
+    r.querySelectorAll('.mpp-vs-overlay').forEach(el => el.remove());
     const modal = document.createElement('div');
-    modal.className = 'mpp-overlay';
+    modal.className = 'mpp-overlay mpp-vs-overlay';
     modal.innerHTML = `
       <div class="mpp-modal">
         <div class="mpp-modal-title">Scanned so far</div>
@@ -1713,7 +1796,7 @@
       </div>`;
     r.appendChild(modal);
     resolveUnexpectedRows(modal);   // swap raw barcodes for their item codes
-    document.getElementById('mpp-vs-close')?.addEventListener('click', () => {
+    modal.querySelector('#mpp-vs-close')?.addEventListener('click', () => {
       modal.remove();
       setTimeout(() => document.getElementById('mpp-scan-in')?.focus(), 40);
     });
@@ -2789,6 +2872,10 @@
          the full panel height, which exceeds the visible area under Firefox's URL bar. */
       .mpp-overlay{position:fixed;inset:0;z-index:100000;background:rgba(57,73,103,.45);
         display:flex;align-items:center;justify-content:center;padding:12px}
+      /* v1.9.1 — size to the VISIBLE viewport. Under Firefox on a TC51 an inset:0 fixed box
+         extends behind the URL bar, which would clip the Close button we just pinned to the
+         bottom of the modal. Dropped silently where dvh is unsupported; inset:0 then stands. */
+      @supports (height:100dvh){ .mpp-overlay{height:100dvh} }
       .mpp-modal{width:100%;max-width:440px;max-height:94%;overflow:hidden auto;background:var(--c7-surf);
         border:1px solid var(--c7-border2);border-radius:8px;padding:16px;box-sizing:border-box;
         display:flex;flex-direction:column;gap:10px;box-shadow:0 12px 40px rgba(57,73,103,.25)}
@@ -2802,6 +2889,14 @@
       .mpp-modal .mpp-btn{min-height:48px;font-size:16px}
       .mpp-modal .mpp-fb{min-height:0}
       .mpp-vs-list{display:flex;flex-direction:column;gap:6px;margin:2px 0}
+      /* v1.9.1 — the LIST scrolls, not the modal. .mpp-modal is a column flex box capped
+         at 94%; .mpp-vs-list had no flex and min-height:auto, so it could not shrink, the
+         modal itself became the scroller, and the Close button — its last child — sat
+         thousands of pixels below the fold on a 260-line order. Pin every other child and
+         give the list the leftover height. Applies to the failed-verification modal too,
+         which renders the same list. */
+      .mpp-modal>*{flex-shrink:0}
+      .mpp-modal .mpp-vs-list{flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain}
       .mpp-vs-row{display:flex;justify-content:space-between;gap:10px;font-size:15px;
         padding:8px 12px;background:var(--c7-bg);border-radius:var(--c7-r);color:var(--c7-text)}
       .mpp-vs-bad{border-left:3px solid var(--c7-red);background:#fff3f3}
@@ -2872,6 +2967,7 @@
     inspectContainer, c7HoldsContainers,
     // partial rescan (v1.8.0)
     PARTIAL_RESCAN_COMPANY_IDS, partialRescanAvailable, unitsIn,
+    LINE_PAGE_SIZE, MAX_LINE_PAGES, MAX_LOOKUP_ATTEMPTS,
     // unverify from any container + per-container totals (v1.9.0)
     unverifyIn, unverifyUnexpectedIn, containerIsLocal, reconcileClosedBox,
     showViewScanned, itemScanRow, unexpectedScanRow,
