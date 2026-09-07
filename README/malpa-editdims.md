@@ -167,15 +167,3 @@ if(D&&D.tryInject){D.tryInject();console.log('after tryInject:', !!document.getE
 `window.__editDims` also exposes `state`, `lastPayload`, `lastResponse`, `capturedHeaders`,
 `open()`, `close()`, `tryInject()` and `watch()`. Everything the script does logs under
 `[Edit Dims]`.
-
----
-
-## Before you touch the write path
-
-> **Production.** There is no Canary7 sandbox. Every write hits real stock in warehouse 10. The only
-> safe place to test is **MA-TRL (company 46)**, the designated trial account — test shipment
-> `LA_TEST_SHIPMENT_20250822.1##7` was used throughout.
->
-> Pacing matters too: the proxy revokes the token on bulk mutation, so never loop writes.
-
----
