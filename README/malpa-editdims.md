@@ -179,24 +179,3 @@ if(D&&D.tryInject){D.tryInject();console.log('after tryInject:', !!document.getE
 > Pacing matters too: the proxy revokes the token on bulk mutation, so never loop writes.
 
 ---
-
-## Not yet settled
-
-None of these block the script working. All of them will bite eventually.
-
-- **The update URL is unverified.** The script's `@downloadURL` points at
-  `Malpa-3PL/Warehouse-Scripts` because that's what the rest of the fleet uses — but the tooling
-  resolves to `zaynnev/malpa3pl`. If the fleet metadata is stale, the handhelds will never
-  auto-update.
-- **A stray v1.1 sits in the repo** from an accidental push. It's the broken version. Overwrite or
-  delete it.
-- **Units are unknown.** Nothing confirms whether weight is kg or dimensions are cm. The UI shows no
-  unit labels rather than assert a wrong one — don't add them without checking.
-- **The toast timer is new to the fleet.** No other Malpa script auto-dismisses anything; the other
-  eight all use persistent-until-replaced banners. Worth deciding whether this one should match
-  them.
-
----
-
-*Built against Canary7 staging, confirmed live 31 August 2026 · Warehouse 10 (Darra) · Company 46
-(MA-TRL)*
