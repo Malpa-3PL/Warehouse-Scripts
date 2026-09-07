@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Pack v3
 // @namespace    https://malpa.canary7.com
-// @version      3.3.86
+// @version      3.4.0
 // @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-pack.user.js
 // @downloadURL  https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-pack.user.js
 // @description  High-throughput packing station for Canary7 WMS — optimistic scanning, async API queue, dynamic profiles
@@ -261,10 +261,18 @@
     const sourceNo = String(containerNo || '').trim();
     if (!sourceNo) return Promise.resolve([]);
 
-    // SIBP: the tote holds inventory for multiple shipments — GPC only shows the
-    // current shipment's children. Call C7's inventory endpoint directly to get
-    // the full tote picture. If operators lack permission it fails silently.
-    if (Workflow.usesItemInitiatedFlow()) {
+    // v3.4.0 — MIBP now takes the same tote-wide path as SIBP.
+    //
+    // Both flows keep ONE physical source tote across several shipments, and in
+    // both, GPC only ever returns the children of the shipment currently loaded.
+    // Feeding those shipment-scoped rows into SourceToteCache made the tote look
+    // empty the moment the loaded shipment was packed, so resetForNextTote()
+    // computed detailsRemaining = 0, dropped the retained tote number and made
+    // the operator rescan the tote for every single shipment in it.
+    // inventory/inventory?license_plate_no= is the only tote-wide truth.
+    // If operators lack permission it fails silently and we keep the GPC rows.
+    if (Workflow.usesItemInitiatedFlow() || Workflow.usesRetainedSourceFlow()) {
+      const flow = Workflow.usesItemInitiatedFlow() ? 'SIBP' : 'MIBP';
       return apiGet(`inventory/inventory&license_plate_no=${encodeURIComponent(sourceNo)}&expand=item&per-page=200&page=1`)
         .then(data => {
           const rows = Array.isArray(data) ? data : (data?.items || []);
@@ -275,7 +283,7 @@
           return rows;
         })
         .catch(err => {
-          console.warn('[MalpaPack] SIBP inventory detail lookup failed:', err.message);
+          console.warn(`[MalpaPack] ${flow} inventory detail lookup failed:`, err.message);
           return [];
         });
     }
@@ -782,12 +790,14 @@
     phase:             'BOOT', // BOOT | PROFILE | SCAN_TOTE | SIBP_PROCESSING | SIBP_ITEM_SCAN | CHOOSE_BOX | PACKING | CLOSING | COMPLETE
     sibpSourceContainerNo: null,
     sibpProcessing: false,
+    _piecesThisShipment: 1, // v3.4.0 — outbound pieces created for the loaded shipment
 
     reset() {
       this.containerType     = null;
       this.confirmedCartonType = null;
       this.outboundContainer = null;
       this.phase             = 'SCAN_TOTE';
+      this._piecesThisShipment = 1;
     },
 
     resetAll() {
@@ -795,6 +805,7 @@
         profileId: null, profile: null, packLocationId: null,
         packLocationCode: null, containerType: null, confirmedCartonType: null, containerTypes: null,
         outboundContainer: null, _nextContainerNo: null, phase: 'PROFILE', sibpSourceContainerNo: null, sibpProcessing: false,
+        _piecesThisShipment: 1,
       });
       ShipmentCache.clear();
       SourceToteCache.clear();
@@ -1193,6 +1204,71 @@
     }
   }
 
+  /**
+   * Same query as fetchOpenOutboundContainersForShipment, but it THROWS on
+   * failure instead of returning []. Used by verifyContainerClosed, where an
+   * empty list must mean "genuinely no longer open" and never "the read failed".
+   */
+  async function fetchOpenOutboundContainersStrict(shipmentHeaderId) {
+    const data = await apiGet(
+      `shipment/shipment-container` +
+      `&shipment_header_id=${shipmentHeaderId}` +
+      `&status_id=5` +
+      `&to_container=1` +
+      `&per-page=10&page=1`
+    );
+    return Array.isArray(data) ? data : (data?.items || []);
+  }
+
+  /**
+   * v3.4.0 — did close-to-container actually close the container?
+   *
+   * Canary7 returns HTTP 500 for two very different things:
+   *   (a) the container closed and a POST-close side effect failed
+   *       (print routing, label generation) — safe to carry on; and
+   *   (b) the close itself blew up server-side (SQL/integrity constraint on the
+   *       inventory move) — the container is still OPEN and nothing moved.
+   *
+   * The message alone cannot be trusted, so re-read the shipment's open
+   * containers and look for ours.
+   *
+   * @returns {Promise<boolean|null>} true = closed, false = still open,
+   *          null = could not verify.
+   */
+  async function verifyContainerClosed(containerId, shipmentHeaderId) {
+    if (!containerId || !shipmentHeaderId) return null;
+    try {
+      const open = await fetchOpenOutboundContainersStrict(shipmentHeaderId);
+      if (!Array.isArray(open)) return null;
+      return !open.some(c => Number(c.id) === Number(containerId));
+    } catch (err) {
+      console.warn('[MalpaPack] Close verification read failed:', err.message);
+      return null;
+    }
+  }
+
+  /**
+   * Server-side exception signatures. These NEVER come from post-close print
+   * routing — they mean the close transaction itself failed. Used only as the
+   * fallback when verifyContainerClosed could not reach the API.
+   */
+  const CLOSE_HARD_FAIL_SIGNATURES = [
+    'sqlstate',
+    'integrity constraint',
+    'foreign key',
+    'the sql being executed was',
+    'cannot delete or update a parent row',
+    'cannot add or update a child row',
+    'call to a member function',
+    'syntax error',
+    'deadlock',
+  ];
+
+  function looksLikeHardCloseFailure(msg) {
+    const m = String(msg || '').toLowerCase();
+    return CLOSE_HARD_FAIL_SIGNATURES.some(sig => m.includes(sig));
+  }
+
   async function deleteAbandonedContainer(containerId) {
     try {
       await apiDelete(`shipment/shipment-container/delete&id=${containerId}`);
@@ -1419,13 +1495,37 @@
       // Log the full error body so it appears in DevTools for diagnosis
       console.warn('[MalpaPack] close-to-container non-200:', res.status, JSON.stringify(body));
 
-      // ANY 500 from close-to-container is treated as a soft warning.
-      // Canary7 closes the container server-side before running post-close
-      // side effects (print routing, label generation). If those fail with
-      // a 500 the container IS already closed — we can safely continue to
-      // consigning. Only auth errors and network failures are hard failures.
+      // v3.4.0 — a 500 from close-to-container is NOT automatically soft.
+      //
+      // Until 3.3.86 every 500 was swallowed and a fake `status_id: 7` was
+      // returned. That was right for post-close print-routing failures and
+      // catastrophically wrong for the other case: when C7 fails to tear down
+      // the source inventory row it answers
+      //   "SQLSTATE[23000] ... Cannot delete or update a parent row ...
+      //    DELETE FROM inventory where id = ..."
+      // The container is still OPEN, the stock never moved and the last item
+      // un-verifies — but the script believed the close, saw items remaining
+      // and called onNewContainer(). Every retry minted another container:
+      // the 40-container shipments.
+      //
+      // So: re-read the shipment's open containers and let C7 tell us.
       if (res.status === 500) {
         const msg = body.message || `Server error ${res.status}`;
+        const shipmentHeaderId = ShipmentCache.shipmentHeader?.id;
+        const closed = await verifyContainerClosed(c.id, shipmentHeaderId);
+
+        // Confirmed still open — the close did not happen.
+        // Confirmed-unreadable + an exception signature — treat as failed too.
+        if (closed === false || (closed === null && looksLikeHardCloseFailure(msg))) {
+          perfMark('close-to-container hard-500', t0, msg);
+          const e = new Error(msg);
+          e._closeDidNotHappen = true;
+          e._containerNo = c.container_no;
+          throw e;
+        }
+
+        // Container is gone from the open list (or unverifiable with a benign
+        // message) — the close committed and a post-close side effect failed.
         perfMark('close-to-container soft-500', t0, msg);
         return {
           id:             c.id,
@@ -1433,6 +1533,7 @@
           status_id:      7,
           consignment_id: ShipmentCache.shipmentHeader?.consignment_id,
           _softError:     msg,   // surfaced as a UI warning, not a hard stop
+          _unverified:    closed === null,
         };
       }
 
@@ -4059,6 +4160,7 @@ color: #b91c1c;
       ShipmentCache.loadFromGPC(containers);
       ShipmentCache.sourceContainerNo = Session.sibpSourceContainerNo;
       _shipmentGen++; // v3.3.80 — a new shipment is now active
+      Session._piecesThisShipment = 1; // v3.4.0 — runaway-container guard
       refreshExpectedCartonForCurrentShipment(); // v3.3.83 — fire-and-forget; pick up post-tab-open shipments
 
       // Update ship badge with the real shipment number now that GPC has resolved
@@ -4261,6 +4363,7 @@ color: #b91c1c;
       ShipmentCache.loadFromGPC(containers);
       ShipmentCache.sourceContainerNo = containerNo;
       _shipmentGen++; // v3.3.80 — a new shipment is now active
+      Session._piecesThisShipment = 1; // v3.4.0 — runaway-container guard
       refreshExpectedCartonForCurrentShipment(); // v3.3.83 — fire-and-forget; pick up post-tab-open shipments
 
       // Now we have the shipmentHeaderId — fetch open containers for this shipment
@@ -5102,7 +5205,9 @@ color: #b91c1c;
         setFinalising(false);
         unlockScanAfterFinalising();
         setStatus('Container closed — creating next piece…', 'ok');
-        onNewContainer();
+        // Only make the next piece pay for an open-container read if this close
+        // was anything less than a clean 200.
+        await onNewContainer({ verifyOpen: !!(closeResp._softError || closeResp._unverified) });
       } else {
         // Final close — all items packed. Now consign and print label.
         setFinalising(true, 'All items packed — printing label…');
@@ -5136,10 +5241,31 @@ color: #b91c1c;
       // "No Print Route" is caught in the inner try blocks above and never reaches here.
       setFinalising(false);
       unlockScanAfterFinalising();
-      setStatus(`Close error: ${err.message}`, 'err');
-      EventLog.err(`Close container failed: ${err.message}`);
-      beep('err');
-      Session.phase = 'PACKING';
+
+      if (err._closeDidNotHappen) {
+        // v3.4.0 — C7 rejected the close itself. The container is STILL OPEN
+        // and the stock never moved, so we keep packing into the very same
+        // container. Creating a new one here is what produced 40-piece
+        // shipments. Session.outboundContainer is deliberately untouched.
+        const contNo = err._containerNo || Session.outboundContainer?.container_no || '';
+        setStatus(
+          `⛔ Canary7 refused to close ${contNo} — nothing moved and the container is still open. ` +
+          `Do NOT rescan into a new box. Press Close again; if it fails twice, raise it and leave the tote.`,
+          'err'
+        );
+        EventLog.err(`Close REJECTED by Canary7 for ${contNo}: ${err.message}`);
+        EventLog.err('Container left open on purpose — no new piece created.');
+        beep('err');
+        Session.phase = 'PACKING';
+        // The last item un-verifies server-side on this failure, so pull the
+        // truth back from C7 rather than trusting local scan state.
+        _refreshGPCAfterStaleChild(null).catch(() => {});
+      } else {
+        setStatus(`Close error: ${err.message}`, 'err');
+        EventLog.err(`Close container failed: ${err.message}`);
+        beep('err');
+        Session.phase = 'PACKING';
+      }
     }
     if (Session.phase === 'PACKING') R.btnClose.disabled = false;
   }
@@ -5148,8 +5274,31 @@ color: #b91c1c;
   // 17.  NEW CONTAINER (same shipment, remaining items continue)
   // ─────────────────────────────────────────────────────────────────────────────
 
-  function onNewContainer() {
+  /**
+   * v3.4.0 — a real shipment almost never needs more than a handful of pieces.
+   * If we get past this the script is looping, not packing: stop and make a
+   * human look, rather than minting containers until someone notices.
+   */
+  const MAX_PIECES_PER_SHIPMENT = 12;
+
+  async function onNewContainer({ verifyOpen = false } = {}) {
     if (Session.phase !== 'COMPLETE' && Session.phase !== 'PACKING') return;
+
+    // ── Runaway guard ────────────────────────────────────────────────────────
+    const pieceNo = (Session._piecesThisShipment || 1) + 1;
+    if (pieceNo > MAX_PIECES_PER_SHIPMENT) {
+      Session.phase = 'PACKING';
+      setStatus(
+        `⛔ ${MAX_PIECES_PER_SHIPMENT} pieces already created for this shipment — refusing to create another. ` +
+        `Something is wrong with the close. Stop and check the shipment's containers in Canary7.`,
+        'err'
+      );
+      EventLog.err(`Refused to create piece #${pieceNo} — piece cap (${MAX_PIECES_PER_SHIPMENT}) reached.`);
+      beep('err');
+      if (R.btnClose) R.btnClose.disabled = false;
+      return;
+    }
+
     // Reset only the outbound container session; shipment cache persists
     Session.containerType     = null;
     Session.confirmedCartonType = null;
@@ -5164,7 +5313,33 @@ color: #b91c1c;
     if (R.rollbackBanner) R.rollbackBanner.style.display = 'none';
     Session.phase = 'CHOOSE_BOX';
     setStatus('Creating next outbound container…', 'idle');
-    initiateContainerCreation();
+
+    // v3.4.0 — reuse an already-open container rather than minting a duplicate.
+    // Previously this called initiateContainerCreation() with no argument, so
+    // the reuse branch could never fire and every trip through here created a
+    // fresh container — including after a close that never actually happened.
+    //
+    // PERF — this read costs ~750ms, so it is NOT paid on the happy path. After
+    // a clean HTTP 200 close we know the previous container is gone, and the
+    // page-refresh case is already covered by the open-container check at tote
+    // load. We only pay it when the close was doubtful (soft-500 / unverified)
+    // or when this shipment has already run to several pieces.
+    let openContainers = [];
+    const mustVerify = verifyOpen || (Session._piecesThisShipment || 1) >= 3;
+    if (mustVerify) {
+      try {
+        const shId = ShipmentCache.shipmentHeader?.id;
+        if (shId) openContainers = await fetchOpenOutboundContainersForShipment(shId);
+      } catch (_) { openContainers = []; }
+    }
+
+    if (openContainers.length) {
+      EventLog.ok(`Reusing already-open container ${openContainers[0].container_no} instead of creating a new piece.`);
+    } else {
+      Session._piecesThisShipment = pieceNo;
+    }
+
+    await initiateContainerCreation(openContainers);
   }
 
   // Pack short is now integrated into onCloseContainer — no standalone function needed.
@@ -5291,8 +5466,16 @@ color: #b91c1c;
     // For MIBP: only retain if the tote still has items remaining across shipments.
     // For standard profiles with retain checkbox: always retain if checked —
     // detailsRemaining is 0 here because ShipmentCache was just cleared.
+    //
+    // v3.4.0 — MIBP no longer drops the tote on a zero count it cannot vouch for.
+    // SourceToteCache is only trustworthy once a tote-wide inventory read has
+    // landed (hasInventoryRows()). Without one, a zero just means "the shipment
+    // we happened to load is finished", which is exactly the false negative that
+    // sent operators back to the tote-scan screen after every shipment.
     const doRetain = shouldRetain && (
-      Workflow.usesRetainedSourceFlow() ? detailsRemaining > 0 : true
+      Workflow.usesRetainedSourceFlow()
+        ? (!SourceToteCache.hasInventoryRows() || detailsRemaining > 0)
+        : true
     );
     if (Workflow.usesRetainedSourceFlow() && R.retainChk) {
       R.retainChk.checked = true;
@@ -5592,6 +5775,7 @@ color: #b91c1c;
 
     if (R.rhCnt) R.rhCnt.textContent = shown;
   }
+
 
   function unverifyItem(track) {
     // Units committed by a previous container close are locked — they are
@@ -5934,6 +6118,40 @@ color: #b91c1c;
         _preloadedLocation   = loc.location_code;
           })
       .catch(() => {});
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  //  DEBUG HANDLE — on-device console + offline test harness
+  //  Read-only surface onto the internals the v3.4.0 fixes turn on.
+  // ─────────────────────────────────────────────────────────────────────────────
+  try {
+    const _g = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+    _g.__malpaPack = {
+      VERSION: '3.4.0',
+      Session, ShipmentCache, SourceToteCache, Workflow, R,
+      // failure-mode 1
+      looksLikeHardCloseFailure,
+      verifyContainerClosed,
+      closeContainer,
+      onNewContainer,
+      MAX_PIECES_PER_SHIPMENT,
+      CLOSE_HARD_FAIL_SIGNATURES,
+      // failure-mode 2
+      getDetailsRemaining,
+      loadToteInventoryDetailsInBackground,
+      resetForNextTote,
+      maybeAutoLoadRetainedTote,
+      renderItems,
+    };
+  } catch (_) {}
+
+  // Offline harness only. Double-gated (CommonJS present AND the harness flag)
+  // so a Tampermonkey sandbox that happens to expose `module` can never take
+  // this branch and skip tryInject().
+  if (typeof module !== 'undefined' && module.exports
+      && typeof window !== 'undefined' && window.__MALPA_HARNESS === true) {
+    module.exports = window.__malpaPack;
+    return;
   }
 
   tryInject();
