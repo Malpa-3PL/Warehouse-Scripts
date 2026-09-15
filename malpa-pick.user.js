@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         Malpa Pick
 // @namespace    https://malpa.canary7.com
-// @version      4.10.1
+// @version      4.11.0
 // @description  Picking interface for Canary7 WMS - TC51 optimised
 // @author       Malpa 3PL
 // @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-pick.user.js
 // @downloadURL  https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-pick.user.js
 // @match        https://*.canary7.com/*
-// @grant        none
+// @grant        GM_xmlhttpRequest
+// @connect      192.168.1.27
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -1141,7 +1142,11 @@
     }
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
-      throw new Error(`${body.message || `API error ${res.status}`} [${res.status}]`);
+      const e = new Error(`${body.message || `API error ${res.status}`} [${res.status}]`);
+      e._body = body; e._status = res.status;
+      e._url = API_BASE + path; e._method = 'GET';
+      reportPickError(e);            // v4.11.0 — fire and forget
+      throw e;
     }
     return res.json();
   }
@@ -1159,9 +1164,118 @@
     }
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
-      throw new Error(body.message || `API error ${res.status}`);
+      const e = new Error(body.message || `API error ${res.status}`);
+      e._body = body; e._status = res.status;
+      e._url = API_BASE + path; e._method = 'POST';
+      reportPickError(e);            // v4.11.0 — fire and forget
+      throw e;
     }
     return res.json();
+  }
+
+  // -----------------------------------------------------------------------------
+  // 1b. ERROR LOG - background only, no UI          (v4.11.0)
+  //
+  //     Every C7 API failure is posted to canary7-proxy, which writes it to
+  //     Supabase. Deliberately hooked in apiGet/apiPost rather than in the
+  //     individual catch blocks: that is the one place every failure passes
+  //     through, and it means a new screen gets logging for free.
+  //
+  //     NOTHING HERE IS VISIBLE TO THE PICKER. No banner, no handoff, no error
+  //     sheet - this is a TC51 in someone's hand, and a telemetry problem must
+  //     never interrupt a pick. Every path is wrapped and swallowed.
+  //
+  //     Transport is GM_xmlhttpRequest, which is why this script now takes a
+  //     grant. The page is https and the proxy is plain http on a LAN IP, so a
+  //     page fetch is blocked as mixed content and never leaves the device.
+  //     GM_xhr runs outside the page and is exempt. Needs @connect 192.168.1.27.
+  // -----------------------------------------------------------------------------
+
+  const ERROR_LOG_URL = 'http://192.168.1.27:8790/errors';
+
+  /** Who is signed in, from Canary7's own localStorage. Same source malpa-pack uses. */
+  function currentOperatorName() {
+    try {
+      const n = (localStorage.getItem('username') || '').trim();
+      return n || null;
+    } catch (_) { return null; }
+  }
+
+  function _pickScriptVersion() {
+    try {
+      return (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || null;
+    } catch (_) { return null; }
+  }
+
+  /**
+   * Post one API failure to the error log.
+   *
+   * 401 is skipped on purpose: an expired session is not a WMS data error, it
+   * is handled by _showSessionExpired(), and logging it would bury the real
+   * failures under a row for every call made after a token lapsed.
+   */
+  function reportPickError(err) {
+    try {
+      if (!err || err._status === 401) return;
+      if (typeof GM_xmlhttpRequest !== 'function') return;
+
+      const body  = err._body;
+      const instr = State.instruction || {};
+
+      const payload = {
+        // Pack-oriented columns that have no meaning mid-pick. Left explicitly
+        // null rather than filled with something plausible-but-wrong.
+        consignment_id:  null,
+        packer:          null,
+        pack_desk:       null,
+
+        company_code:    instr.company?.company_code || null,
+        shipment_number: instr.shipmentHeader?.shipment_number
+                           || instr.shipment_number || null,
+        occurred_at:     new Date().toISOString(),
+
+        // On this script the operator IS the picker.
+        picker:          currentOperatorName(),
+
+        request_url:     err._url    || null,
+        request_method:  err._method || null,
+        status_code:     err._status || null,
+
+        response_name:    (body && body.name)    || null,
+        response_message: (body && body.message) || err.message || null,
+
+        json_state: {
+          // The `script` column was dropped from the table, so this is the only
+          // thing distinguishing a pick error from a pack error. Do not remove.
+          script:         'malpa-pick',
+          script_version: _pickScriptVersion(),
+
+          screen:         State.screen || null,
+          profile:        State.profile?.name || null,
+          job_id:         State.jobId || null,
+          instruction_id: instr.id || null,
+          location:       instr.fromLocation?.location_code || null,
+          item_code:      instr.item?.item_code || null,
+          scan_count:     State.scanCount ?? null,
+          progress:       State.pickProgress || null,
+          response_code:  (body && typeof body.code === 'number') ? body.code : null,
+        },
+      };
+
+      GM_xmlhttpRequest({
+        method: 'POST',
+        url: ERROR_LOG_URL,
+        headers: { 'Content-Type': 'application/json' },
+        data: JSON.stringify(payload),
+        timeout: 8000,
+        onload:    () => {},
+        onerror:   () => {},
+        ontimeout: () => {},
+      });
+    } catch (e) {
+      // Swallowed. A broken reporter must never reach a picker mid-job.
+      try { console.warn('[MalpaPick] error log post failed:', e); } catch (_) {}
+    }
   }
 
   // Fire-and-forget job unassign - called when picker backs out of summary
@@ -4599,8 +4713,20 @@
   // -----------------------------------------------------------------------------
   // Exposed for on-device troubleshooting and the offline test harness.
   // -----------------------------------------------------------------------------
-  window.__malpaPick = {
-    VERSION: '4.10.0',
+  // v4.11.0 — this script now takes a @grant, so bare `window` here is the
+  // Tampermonkey sandbox window, not the page's. Without unsafeWindow this
+  // handle is invisible to the on-device console, which on a TC51 is the only
+  // debugging available.
+  const _g = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+  _g.__malpaPick = {
+    // Read from the @version header rather than hand-maintained: this said
+    // '4.10.0' on a 4.10.1 file, so anyone checking the running build was told
+    // the wrong answer. GM_info is absent in the Node test harness, hence the
+    // literal fallback.
+    VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '4.11.0',
+    reportPickError,
+    currentOperatorName,
+    ERROR_LOG_URL,
     State, get R() { return R; },
     openPick, closeUI, injectNav,
     showOurs, hideOurs, syncTabs, restoreOtherPanels,
