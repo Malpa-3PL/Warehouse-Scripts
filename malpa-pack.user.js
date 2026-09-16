@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Pack v3
 // @namespace    https://malpa.canary7.com
-// @version      3.4.0
+// @version      3.7.0
 // @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-pack.user.js
 // @downloadURL  https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-pack.user.js
 // @description  High-throughput packing station for Canary7 WMS — optimistic scanning, async API queue, dynamic profiles
@@ -9,6 +9,8 @@
 // @match        https://*.canary7.com/*
 // @grant        GM_xmlhttpRequest
 // @connect      metrics.malpasoft.com
+// @connect      api.retool.com
+// @connect      192.168.1.27
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -60,6 +62,48 @@
 
   const RETAIN_TOTE_ENABLED_KEY = 'mp_retain_tote';
   const RETAIN_TOTE_NO_KEY      = 'mp_retained_tote_no';
+
+  // v3.4.0 — errored-shipment handoff.
+  // Jamieson Jensen, users.id 196 (username 'jamieson', warehouse 10) — confirmed
+  // against the live users table, not guessed.
+  const HANDOFF_USER_ID    = 196;
+  const HANDOFF_USER_NAME  = 'Jamieson Jensen';
+  // ── Error-sheet printing ──────────────────────────────────────────────────
+  // Deliberately routed through a Retool workflow rather than calling
+  // APITemplate and PrintNode from here.
+  //
+  // Those two need an APITemplate account key and a PrintNode account key. A
+  // userscript has nowhere to hide either: every TC51 and packing browser gets
+  // a readable copy, and a leaked PrintNode key can print anything to any
+  // Malpa printer and is billable. A Retool workflow key can only trigger this
+  // one workflow, so that is the only credential that ships to the floor.
+  // The workflow also resolves pack desk -> printer from print_routing, which
+  // keeps the printer map out of the script entirely.
+  //
+  // Same proxy pattern already used above for tote inventory details.
+  const ERROR_SHEET_WORKFLOW_URL =
+    'https://api.retool.com/v1/workflows/2b4b5db5-c23f-4a87-a7e4-42d14349619e/startTrigger';
+  const ERROR_SHEET_WORKFLOW_KEY = 'retool_wk_900f70073cea4a8f809bc2ec4bb79cbd';
+  const ERROR_SHEET_TEMPLATE_ID  = '4e377b2970784710';
+
+  // Print procedures that mean "a 4x6 thermal label printer at this desk", in
+  // preference order. Consignment Paperwork is deliberately absent — that route
+  // is the A4 Brother and would print a 4x6 sheet badly.
+  const SHEET_PRINT_PROCEDURES = ['Carrier Label', 'Custom Carrier'];
+
+  // Container numbers beginning AC come from Canary7's auto-generate route
+  // (container type 38, "Pick Container - Auto") — those are the OUTBOUND
+  // containers this station creates. A source tote is anything else: the
+  // physical R/G/O/P/B/W tote series the stock arrived in.
+  //
+  // Deliberately an exclusion, not a whitelist of those letters. A new tote
+  // series would silently blank the field on every sheet, and the field's job
+  // is to tell someone where to go looking.
+  const AUTOGEN_CONTAINER_RE = /^AC/i;
+
+  const ERRORED_KEY        = 'mp_pack_errored_shipments';
+  const ERRORED_MAX        = 20;
+  const ERRORED_SKIP_HOURS = 12;
 
   // Same expected-carton source as the standalone Pack Prompt script.
   // Card 581 maps shipment number → expected carton label, then we map that
@@ -320,6 +364,19 @@
     if (R?.toteIn) R.toteIn.value = '';
   }
 
+  /**
+   * Clear the scan box unless the operator asked to keep the number.
+   *
+   * v3.6.0 — "Retain container number after packing" is the operator's stated
+   * intent, so it is the only thing that decides this. Note the difference
+   * from refuseHandedOffShipment, which clears AND unticks the box on purpose:
+   * that tote must be set aside, so its number must not be handed back.
+   */
+  function clearToteInputUnlessRetained() {
+    if (R?.retainChk?.checked) return;
+    clearRetainedToteNumber();
+  }
+
   function resetRetainedToteState() {
     try { localStorage.setItem(RETAIN_TOTE_ENABLED_KEY, '0'); } catch (_) {}
     clearRetainedToteNumber();
@@ -330,6 +387,41 @@
   // ─────────────────────────────────────────────────────────────────────────────
   // 1.  AUTH
   // ─────────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Who is signed in at this station, from Canary7's own localStorage.
+   *
+   * v3.6.0 — costs nothing and is available before the first render, which is
+   * the point. The error sheet's packer name was previously resolved ONLY by
+   * querying several days of inventory log per error, to answer a question the
+   * session already knew the answer to in the ordinary case: the person
+   * packing at WDD-01 is the person signed in at WDD-01.
+   *
+   * The inventory-log lookup still runs in the background and still wins when
+   * it lands — it is authoritative, and on a multi-piece shipment the packer
+   * genuinely may not be whoever is standing here now. This just means the row
+   * is never empty while waiting for it.
+   *
+   * The JWT also carries the WMS user id (`user.wms_id`, 182 for this account —
+   * the same id that appears in `created_by` on container records) if an id is
+   * ever needed rather than a display name.
+   */
+  function currentOperatorName() {
+    try {
+      const n = (localStorage.getItem('username') || '').trim();
+      return n || null;
+    } catch (_) { return null; }
+  }
+
+  /** This operator's Canary7 users.id, from the JWT (user.wms_id). 182 = Zaynne. */
+  function currentOperatorWmsId() {
+    try {
+      const tok = getToken();
+      if (!tok || tok.split('.').length !== 3) return null;
+      const p = JSON.parse(atob(tok.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
+      return Number(p?.user?.wms_id) || null;
+    } catch (_) { return null; }
+  }
 
   function getToken() {
     for (const key of ['access_token', 'token', 'id_token', 'auth_token']) {
@@ -414,6 +506,7 @@
       const body = await res.json().catch(() => ({}));
       const e = new Error(`${body.message || `API error ${res.status}`} [${res.status}]`);
       e._body = body; e._status = res.status; // v3.3.84: carry full body so the consign path can surface real server detail
+      e._url = API_BASE + path; e._method = 'GET';   // v3.7.0: for the error log
       throw e;
     }
     return res.json();
@@ -429,6 +522,7 @@
       const body = await res.json().catch(() => ({}));
       const e = new Error(body.message || `API error ${res.status}`);
       e._body = body; e._status = res.status; // v3.3.84: carry full body so the consign path can surface real server detail
+      e._url = API_BASE + path; e._method = 'POST';  // v3.7.0: for the error log
       throw e;
     }
     return res.json();
@@ -559,6 +653,7 @@
       this.shipmentHeader    = c.shipmentHeader || c.shipment_header;
       this.company           = c.company;
       this.jobInstruction    = c.jobInstruction;
+      ShipmentSnapshot.capture(this);   // v3.7.0 — survives resetForNextTote()
 
       // Collect children from ALL containers in the response — Canary7 sometimes
       // returns [source_tote, outbound_container] and children may appear in either.
@@ -862,8 +957,11 @@
 
     _renderInto(body) {
       body.innerHTML = '';
+      // v3.4.0 — persisted errored shipments sit above the live log and, unlike
+      // it, survive tote loads and page reloads.
+      const persisted = renderErrorLogInto(body);
       if (!this.entries.length) {
-        body.append(h('div', { cls: 'mp-log-empty' }, 'No events yet this shipment.'));
+        if (!persisted) body.append(h('div', { cls: 'mp-log-empty' }, 'No events yet this shipment.'));
         return;
       }
       // Most recent first
@@ -877,6 +975,414 @@
       }
     },
   };
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 4a. ERRORED SHIPMENTS — persisted across tote loads AND page reloads
+  //
+  //     EventLog lives in memory and is cleared on every tote scan. On MIBP and
+  //     SIBP the next shipment loads automatically, so the record of what just
+  //     broke was wiped before the operator could read it. This store keeps the
+  //     shipment number and the reason.
+  //
+  //     It also backs the skip list: a shipment recorded here within
+  //     ERRORED_SKIP_HOURS is not loaded again at this station. That is what
+  //     actually frees the operator from the reload loop — the reassignment is
+  //     what stops Canary7 offering it, but the skip list holds even if the
+  //     reassignment call fails.
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  const ErroredShipments = {
+    _read() {
+      try {
+        const raw = localStorage.getItem(ERRORED_KEY);
+        const arr = raw ? JSON.parse(raw) : [];
+        return Array.isArray(arr) ? arr : [];
+      } catch (_) { return []; }
+    },
+    _write(list) {
+      try { localStorage.setItem(ERRORED_KEY, JSON.stringify(list.slice(0, ERRORED_MAX))); } catch (_) {}
+    },
+    get all() { return this._read(); },
+
+    record({ shipmentNo, shipmentHeaderId, jobId, reason, stage, profile, packDesk, containerNo, sourceTote, userName }) {
+      const row = {
+        shipmentNo:       shipmentNo || '—',
+        shipmentHeaderId: shipmentHeaderId || null,
+        jobId:            jobId || null,
+        reason:           String(reason || 'Unknown error').slice(0, 300),
+        stage:            stage || 'unknown',
+        profile:          profile || null,
+        // For the printed sheet. Both are captured at close time, not read
+        // here — resetForNextTote() nulls Session.outboundContainer before the
+        // consign-failure handoff runs.
+        packDesk:         packDesk || null,
+        containerNo:      containerNo || null,
+        // The tote the stock came out of. Captured at close time for the same
+        // reason as the two above — resetForNextTote() clears ShipmentCache
+        // before the consign-failure handoff runs, so resolving it here would
+        // read an already-emptied cache.
+        sourceTote:       sourceTote || null,
+        // Seeded with whoever is signed in at this station, then upgraded by
+        // the inventory-log lookup if that lands. Null when this station did
+        // not do the packing — see packedHere in handOffErroredShipment.
+        userName:         userName || null,
+        at:               Date.now(),
+        handoff:          'pending',
+        handoffNote:      null,
+        printed:          'pending',
+        printNote:        null,
+      };
+      // One row per shipment — a repeat error replaces the older entry.
+      const list = this._read()
+        .filter(r => !(row.shipmentHeaderId && r.shipmentHeaderId === row.shipmentHeaderId));
+      list.unshift(row);
+      this._write(list);
+      return row;
+    },
+
+    setHandoff(shipmentHeaderId, state, note = null) {
+      const list = this._read();
+      const row = list.find(r => r.shipmentHeaderId === shipmentHeaderId);
+      if (!row) return null;
+      row.handoff = state;
+      row.handoffNote = note;
+      this._write(list);
+      return row;
+    },
+
+    setUser(shipmentHeaderId, userName) {
+      const list = this._read();
+      const row = list.find(r => r.shipmentHeaderId === shipmentHeaderId);
+      if (!row) return null;
+      row.userName = userName || null;
+      this._write(list);
+      return row;
+    },
+
+    setPrinted(shipmentHeaderId, state, note = null) {
+      const list = this._read();
+      const row = list.find(r => r.shipmentHeaderId === shipmentHeaderId);
+      if (!row) return null;
+      row.printed = state;
+      row.printNote = note;
+      this._write(list);
+      return row;
+    },
+
+    find(shipmentHeaderId) {
+      if (!shipmentHeaderId) return null;
+      return this._read().find(r => r.shipmentHeaderId === shipmentHeaderId) || null;
+    },
+
+    /** Handed off recently enough that this station must not pick it up again. */
+    isSkipped(shipmentHeaderId) {
+      if (!shipmentHeaderId) return false;
+      const cutoff = Date.now() - ERRORED_SKIP_HOURS * 3600 * 1000;
+      return this._read().some(r =>
+        r.shipmentHeaderId === shipmentHeaderId && (r.at || 0) >= cutoff);
+    },
+
+    clear() { try { localStorage.removeItem(ERRORED_KEY); } catch (_) {} },
+  };
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 4b. ERROR LOG — ship failures to Supabase via canary7-proxy   (v3.7.0)
+  //
+  //     Fire-and-forget. Nothing here may throw, block, or slow the pack
+  //     screen: an operator hitting an error is already having a bad time and
+  //     the telemetry must not make it worse.
+  //
+  //     Transport is GM_xmlhttpRequest, and it has to be. The pack screen is
+  //     https and the proxy is plain http on a LAN IP, so a page fetch is
+  //     blocked as mixed content and never leaves the device. GM_xhr runs
+  //     outside the page and is not subject to that (nor to the page CSP) —
+  //     the same reason retoolWorkflowPost uses it. Needs @connect 192.168.1.27.
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  const ERROR_LOG_URL = 'http://192.168.1.27:8790/errors';
+
+  /**
+   * Shipment context captured at LOAD time, keyed by shipment_header_id.
+   *
+   * The consign chain fails asynchronously, usually after resetForNextTote()
+   * has cleared ShipmentCache and often after the next shipment has loaded.
+   * Reading company/carrier/address at failure time therefore returns null —
+   * or worse, the WRONG shipment's values. Snapshot at load, look up by id.
+   *
+   * Same trap the record() comments describe for packDesk/containerNo/
+   * sourceTote, which is why those are passed as arguments rather than read.
+   */
+  const ShipmentSnapshot = {
+    _byId: new Map(),
+    _max: 20,
+
+    capture(cache) {
+      try {
+        const sh = cache.shipmentHeader || {};
+        // Store under BOTH ids. The cache keys itself on the container's
+        // `shipment_header_id`, but the close path captures
+        // `ShipmentCache.shipmentHeader?.id` — two different sources for what
+        // should be one number. Keying on only one of them meant the lookup
+        // silently missed and every snapshot field came back null.
+        const ids = [cache.shipmentHeaderId, sh.id].filter(Boolean);
+        if (!ids.length) return;
+        const snap = {
+          company_code:    cache.company?.company_code || null,
+          shipment_number: sh.shipment_number || null,
+          // Whole address object, verbatim. This script only ever names three
+          // keys on it (ship_to_name / _phone_num / _email_address), so
+          // picking fields apart would guess at what C7 calls the rest.
+          ship_to:         sh.address || null,
+          carrier:         sh.carrier?.name || null,
+          carrier_service: sh.carrierService?.name || null,
+        };
+        for (const id of ids) this._byId.set(id, snap);
+        while (this._byId.size > this._max) {
+          this._byId.delete(this._byId.keys().next().value);
+        }
+      } catch (_) { /* never break a tote load over telemetry */ }
+    },
+
+    get(id) { return (id && this._byId.get(id)) || {}; },
+  };
+
+  /**
+   * Picker by source tote, captured at tote-load time.
+   *
+   * PICKER AND PACKER ARE TWO DIFFERENT PEOPLE AND TWO DIFFERENT LOOKUPS.
+   *   picker — fetchLastPickerForTote(sourceTote): who filled the tote.
+   *   packer — fetchPackerForContainer(outbound): who packed the box.
+   * ErroredShipments.userName holds the packer (seeded with the signed-in
+   * operator, upgraded by the log lookup). Nothing here touches it, so the
+   * two can no longer overwrite each other.
+   *
+   * Free, because the picker lookup already runs on every tote load to feed
+   * the badge — this just keeps the answer instead of discarding it. No extra
+   * call, and nothing added to the handoff path, which v3.6.0 deliberately
+   * kept clear of slow lookups.
+   */
+  const PickerByTote = {
+    _byTote: new Map(),
+    _max: 20,
+    set(tote, username) {
+      try {
+        const key = String(tote || '').trim();
+        if (!key || !username) return;
+        this._byTote.set(key, username);
+        while (this._byTote.size > this._max) {
+          this._byTote.delete(this._byTote.keys().next().value);
+        }
+      } catch (_) {}
+    },
+    get(tote) {
+      try { return this._byTote.get(String(tote || '').trim()) || null; }
+      catch (_) { return null; }
+    },
+  };
+
+  /**
+   * Everything the error log needs, captured at CLOSE time.
+   *
+   * v3.7.0 second pass. The first attempt looked all of this up at report
+   * time — the snapshot by shipment id, the container off Session — and every
+   * field came back null, because by then resetForNextTote() has cleared
+   * ShipmentCache and nulled Session.outboundContainer. The script already
+   * documents that trap at the shipNoAtClose/toteAtClose block and works
+   * around it by capturing before the try. This does the same.
+   *
+   * Threaded through the handoff as an argument rather than looked up, for
+   * exactly the reason packDesk, containerNo and sourceTote already are.
+   */
+  function _captureErrorState(sourceTote) {
+    try {
+      const sh = ShipmentCache.shipmentHeader || {};
+      const c  = Session.outboundContainer || {};
+      return {
+        company_code:    ShipmentCache.company?.company_code || null,
+        shipment_number: sh.shipment_number || null,
+        ship_to:         sh.address || null,
+        carrier:         sh.carrier?.name || null,
+        carrier_service: sh.carrierService?.name || null,
+        // Tote first, then the cache's own source container: on cluster
+        // profiles resolveSourceTote() can return null, which is why picker
+        // was empty on every Cluster Satchel row.
+        picker:          PickerByTote.get(sourceTote)
+                           || PickerByTote.get(ShipmentCache.sourceContainerNo)
+                           || null,
+        container: {
+          number: c.container_no || null,
+          type:   c.containerType?.name
+                    || Session.confirmedCartonType?.name
+                    || Session.containerType?.name || null,
+          status: c.status ?? null,
+          weight: c.weight ?? null,
+          length: c.length ?? null,
+          width:  c.width  ?? null,
+          height: c.height ?? null,
+        },
+      };
+    } catch (_) { return {}; }
+  }
+
+  /** Container state at report time — fallback only, usually already cleared. */
+  function _containerStateForLog() {
+    try {
+      const c = Session.outboundContainer || {};
+      return {
+        number: c.container_no || null,
+        type:   c.containerType?.name || Session.containerType?.name || null,
+        status: c.status ?? null,
+        weight: c.weight ?? null,
+        length: c.length ?? null,
+        width:  c.width  ?? null,
+        height: c.height ?? null,
+      };
+    } catch (_) { return {}; }
+  }
+
+  /**
+   * Fetch company / address / carrier straight from the shipment header.
+   *
+   * v3.7.4. The consign-pending path (tryConsignPendingContainer) never loads
+   * ShipmentCache — the container is already packed, so there is no GPC call
+   * and no close-time capture. Scavenging those fields from what that path
+   * happens to hold was never going to work: get-consigning-container does not
+   * expand them, and get-pack-container 500s ("Job does not exist for this
+   * container") once the packing job is finished. Both confirmed by probe.
+   *
+   * This endpoint does work on a finished shipment. Confirmed against
+   * TEST-SH-DDP-20260909##2: returns company.company_code, the full address
+   * object, carrier.name and carrierService.name.
+   *
+   * One extra read, on an error path only, never awaited by anything the
+   * operator is waiting on.
+   */
+  async function fetchShipmentHeaderForLog(shipmentNumber) {
+    const no = String(shipmentNumber || '').trim();
+    if (!no) return null;
+    try {
+      const rows = await apiGet(
+        `shipment/shipment-header` +
+        `&shipment_number=${encodeURIComponent(no)}` +
+        `&warehouse_id=${WAREHOUSE_ID}` +
+        `&expand=address,carrier,carrierService,company`
+      );
+      const h = Array.isArray(rows) ? rows[0] : rows;
+      if (!h) return null;
+      return {
+        company_code:    h.company?.company_code || null,
+        ship_to:         h.address || null,
+        carrier:         h.carrier?.name || null,
+        carrier_service: h.carrierService?.name || null,
+      };
+    } catch (_) {
+      return null;   // telemetry must never surface an error of its own
+    }
+  }
+
+  function _scriptVersion() {
+    try {
+      return (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || null;
+    } catch (_) { return null; }
+  }
+
+  /**
+   * POST one failure to the error log. Never awaited, never throws.
+   *
+   * @param {object}  row     the row ErroredShipments.record() just persisted
+   * @param {Error?}  err     the original error, for _status/_body/_url/_method
+   * @param {number?} consignmentId
+   * @param {string?} packer  from fetchPackerForContainer; falls back to the
+   *                          signed-in operator seeded into row.userName
+   * @param {object?} state   captured by _captureErrorState() at close time.
+   *                          Authoritative — the ShipmentSnapshot lookup below
+   *                          is only a fallback for callers that have none.
+   */
+  async function reportPackError(row, err, consignmentId, packer, state) {
+    try {
+      let snap = (state && Object.keys(state).length)
+        ? state
+        : ShipmentSnapshot.get(row.shipmentHeaderId);
+      const body = err && err._body;
+
+      const shipNo = (row.shipmentNo && row.shipmentNo !== '—')
+        ? row.shipmentNo : (snap.shipment_number || null);
+
+      // Backfill whatever the capture could not reach. On the normal
+      // pack-and-close path this is a no-op; on the consign-pending path it
+      // is the only source for these four fields.
+      if (!snap.company_code && shipNo) {
+        const hdr = await fetchShipmentHeaderForLog(shipNo);
+        if (hdr) {
+          snap = Object.assign({}, snap, {
+            company_code:    snap.company_code    || hdr.company_code,
+            ship_to:         snap.ship_to         || hdr.ship_to,
+            carrier:         snap.carrier         || hdr.carrier,
+            carrier_service: snap.carrier_service || hdr.carrier_service,
+          });
+        }
+      }
+
+      const payload = {
+        // No fallback to _lastConsignmentId. It is module-scoped and survives
+        // between shipments, so falling back to it would confidently attribute
+        // a PREVIOUS shipment's consignment to this failure. Null is correct
+        // when the caller has none.
+        consignment_id:   consignmentId || null,
+        company_code:     snap.company_code || null,
+        shipment_number:  shipNo,
+        occurred_at:      new Date(row.at || Date.now()).toISOString(),
+
+        // Two separate sources, so neither can clobber the other.
+        picker:           snap.picker || PickerByTote.get(row.sourceTote),
+        packer:           packer || row.userName || null,
+        pack_desk:        row.packDesk || null,
+
+        request_url:      (err && err._url)    || null,
+        request_method:   (err && err._method) || null,
+        status_code:      (err && err._status) || null,
+
+        // C7 answers a business rejection with HTTP 500 and the real identity
+        // in `code` — 1073 is "The Unit value must be at least 1." Group and
+        // alert on the code; the message is prose that can be reworded.
+        response_name:    (body && body.name)    || null,
+        response_message: (body && body.message) || row.reason || null,
+        response_code:    (body && typeof body.code === 'number') ? body.code : null,
+
+        script:           'malpa-pack',
+        script_version:   _scriptVersion(),
+        device:           row.packDesk || Session.packLocationCode || null,
+
+        json_state: {
+          stage:           row.stage || null,
+          profile:         row.profile || null,
+          source_tote:     row.sourceTote || null,
+          ship_to:         snap.ship_to || null,
+          carrier:         snap.carrier || null,
+          carrier_service: snap.carrier_service || null,
+          container:       snap.container || _containerStateForLog(),
+        },
+
+        response_body: (body && typeof body === 'object') ? body : null,
+      };
+
+      if (typeof GM_xmlhttpRequest !== 'function') return;   // no grant, no send
+
+      GM_xmlhttpRequest({
+        method: 'POST',
+        url: ERROR_LOG_URL,
+        headers: { 'Content-Type': 'application/json' },
+        data: JSON.stringify(payload),
+        timeout: 8000,
+        onload:    (res) => orBreadcrumb('error_log', { status: res.status }),
+        onerror:   ()    => orBreadcrumb('error_log', { status: 0, error: 'network' }),
+        ontimeout: ()    => orBreadcrumb('error_log', { status: 0, error: 'timeout' }),
+      });
+    } catch (e) {
+      // Swallowed on purpose. A broken reporter must never surface at a bench.
+      try { console.warn('[MalpaPack] error log post failed:', e); } catch (_) {}
+    }
+  }
 
   // ─────────────────────────────────────────────────────────────────────────────
   // 4.  WORKFLOW ENGINE
@@ -1047,24 +1553,29 @@
   const RETOOL_TOTE_DETAILS_WORKFLOW_URL = 'https://api.retool.com/v1/workflows/b6bc8588-78ad-4a00-8a40-5cc6f495b4ed/startTrigger';
   const RETOOL_TOTE_DETAILS_API_KEY = 'retool_wk_9ab058313edc4add9ff09efdd342e8b3';
 
-  function retoolWorkflowRequest(body) {
+  /**
+   * v3.5.0 — generalised from retoolWorkflowRequest so a second workflow (the
+   * error-sheet printer) can reuse the same transport instead of copy-pasting
+   * it. GM_xmlhttpRequest first because the page's own CSP does not apply to
+   * it; plain fetch as the fallback when the grant is unavailable.
+   */
+  function retoolWorkflowPost(url, apiKey, body, label = 'retool_workflow') {
     const headers = {
       'Content-Type': 'application/json',
-      'X-Workflow-Api-Key': RETOOL_TOTE_DETAILS_API_KEY,
+      'X-Workflow-Api-Key': apiKey,
     };
 
-
     if (typeof GM_xmlhttpRequest === 'function') {
-        return new Promise((resolve, reject) => {
+      return new Promise((resolve, reject) => {
         const t0 = perfNow(); // v3.3.85: for the OpenReplay breadcrumb below
         GM_xmlhttpRequest({
           method: 'POST',
-          url: RETOOL_TOTE_DETAILS_WORKFLOW_URL,
+          url,
           headers,
           data: JSON.stringify(body),
           timeout: 20000,
           onload: (res) => {
-            orBreadcrumb('retool_tote_details', { status: res.status, ms: Math.round(perfNow() - t0) });
+            orBreadcrumb(label, { status: res.status, ms: Math.round(perfNow() - t0) });
             let payload = null;
             try { payload = res.responseText ? JSON.parse(res.responseText) : null; }
             catch (_) { payload = res.responseText; }
@@ -1074,19 +1585,24 @@
             }
             resolve(payload);
           },
-          onerror:   (e) => { orBreadcrumb('retool_tote_details', { status: 0, error: 'network', ms: Math.round(perfNow() - t0) }); console.error('[MalpaPack] retoolWorkflowRequest: onerror', e); reject(new Error('Retool workflow request failed')); },
-          ontimeout: ()  => { orBreadcrumb('retool_tote_details', { status: 0, error: 'timeout', ms: Math.round(perfNow() - t0) }); console.error('[MalpaPack] retoolWorkflowRequest: timeout'); reject(new Error('Retool workflow request timed out')); },
+          onerror:   (e) => { orBreadcrumb(label, { status: 0, error: 'network', ms: Math.round(perfNow() - t0) }); console.error(`[MalpaPack] ${label}: onerror`, e); reject(new Error('Retool workflow request failed')); },
+          ontimeout: ()  => { orBreadcrumb(label, { status: 0, error: 'timeout', ms: Math.round(perfNow() - t0) }); console.error(`[MalpaPack] ${label}: timeout`); reject(new Error('Retool workflow request timed out')); },
         });
       });
     }
 
-    return fetch(RETOOL_TOTE_DETAILS_WORKFLOW_URL, {
+    return fetch(url, {
       method: 'POST', headers, body: JSON.stringify(body),
     }).then(async (res) => {
-        const payload = await res.json().catch(() => res.text());
-        if (!res.ok) throw new Error(`Retool workflow ${res.status}`);
+      const payload = await res.json().catch(() => res.text());
+      if (!res.ok) throw new Error(`Retool workflow ${res.status}`);
       return payload;
     });
+  }
+
+  function retoolWorkflowRequest(body) {
+    return retoolWorkflowPost(
+      RETOOL_TOTE_DETAILS_WORKFLOW_URL, RETOOL_TOTE_DETAILS_API_KEY, body, 'retool_tote_details');
   }
 
   /**
@@ -1559,6 +2075,178 @@
     );
   }
 
+  // Container status 7. Canary7's own status table calls this "Consigning
+  // Pending"; the packing side of this file calls the same id "closed". Same
+  // state, two vocabularies — the container is shut and waiting for a label.
+  const CONSIGNING_PENDING_STATUS_ID = 7;
+
+  async function fetchConsigningContainer(containerNo) {
+    return apiGet(
+      `shipment/shipment-container/get-consigning-container` +
+      // shipmentHeader is what gives the errored row a real shipment number
+      // (PORTAL-B4-093428) instead of the container number. Confirmed accepted
+      // against staging 10 Sep — worth knowing that Canary7 answers 403, not
+      // 400, for an expand it does not support, so do not add to this list
+      // speculatively.
+      `&expand=status,stagingDock,consignment,containerType,shipmentHeader` +
+      `&container_no=${encodeURIComponent(containerNo)}` +
+      `&initiation_method_id=1&item_code=null`
+    );
+  }
+
+  /**
+   * A container that will not load for PACKING may simply be past packing.
+   *
+   * Consigning Pending sits two steps after Pack Pending, so there is nothing
+   * left to pack — the box is shut and waiting for a label. Rather than telling
+   * the operator the tote will not load, finish the job: consign it and print.
+   *
+   * Deliberately NOT prompted (Zaynne, 10 Sep). The trigger is the server's own
+   * status rather than the AC prefix, which is what makes that safe: a
+   * container mid-packing is not at status 7, so a mis-scan during packing
+   * still just fails to load exactly as it does today.
+   *
+   * The status check is a WHITELIST. Only 7 consigns. Already-consigned (9),
+   * still-open (5) and any status Canary7 adds later all fall through to a
+   * refusal that names the state, rather than being enumerated and guessed at.
+   *
+   * @returns {boolean} true if this handled the scan — including a refusal, so
+   *   the caller does not also report a packing error for the same scan.
+   */
+  async function tryConsignPendingContainer(containerNo, t0 = perfNow()) {
+    let row = null;
+    try {
+      const data = await fetchConsigningContainer(containerNo);
+      const arr  = Array.isArray(data) ? data : (data ? [data] : []);
+      row = arr[0] || null;
+    } catch (_) {
+      return false; // not a consigning container — let the packing error stand
+    }
+    if (!row) return false;
+
+    if (Number(row.status_id) !== CONSIGNING_PENDING_STATUS_ID) {
+      const what = row.status?.description || `status ${row.status_id}`;
+      setStatus(`${containerNo} is at "${what}" — not consigning it.`, 'warn');
+      EventLog.err(`${containerNo} not consigned — status is "${what}", not Consigning Pending.`);
+      beep('err');
+      return true;
+    }
+
+    if (Number(row.to_container) !== 1) {
+      setStatus(`${containerNo} is not an outbound container — not consigning it.`, 'warn');
+      EventLog.err(`${containerNo} not consigned — to_container is not 1.`);
+      beep('err');
+      return true;
+    }
+
+    const consignmentId = row.consignment_id || row.consignment?.id || null;
+    if (!consignmentId) {
+      setStatus(`${containerNo} is ready to consign but has no consignment attached.`, 'err');
+      EventLog.err(`${containerNo} is Consigning Pending with no consignment_id — tell a supervisor.`);
+      beep('err');
+      return true;
+    }
+
+    // consigningProfileId() is null on SIBP (pre-consigned) and on any profile
+    // with none configured. createConsignmentPieces returns null and does
+    // nothing at all in that case — the operator would scan and get silence,
+    // which is the worst outcome available. Say why instead.
+    const cpId = Workflow.consigningProfileId();
+    if (!cpId) {
+      setStatus(`${containerNo} is ready to consign, but ${Session.profile?.name || 'this profile'} has no consigning profile.`, 'err');
+      EventLog.err(`Cannot consign ${containerNo} — no consigning_profile_id on ${Session.profile?.name || 'this profile'}.`);
+      beep('err');
+      return true;
+    }
+
+    // Falls back to the container number if the expand ever stops coming back,
+    // so the errored row stays identifiable rather than becoming an em dash.
+    const shipNo = row.shipmentHeader?.shipment_number || containerNo;
+
+    setStatus(`${containerNo} is already packed — consigning…`, 'loading');
+    EventLog.ok(`${containerNo} is Consigning Pending — skipping the packing steps.`);
+
+    try {
+      const body = await createConsignmentPieces(consignmentId);
+      _lastConsignmentId = consignmentId;
+      if (R.reprintBtn) {
+        R.reprintBtn.disabled = false;
+        R.reprintBtn.title = `Reprint label for consignment ${consignmentId}`;
+      }
+      const tracking = normalizePiecesResponse(body)
+        .map(p => p.tracking_number || p.carrier_piece_number)
+        .filter(Boolean)
+        .join(', ');
+      const desk = row.stagingDock?.location_code || Session.packLocationCode || 'your desk';
+      setStatus(`✅ ${containerNo} consigned${tracking ? ` — ${tracking}` : ''}. Label printing at ${desk}.`, 'ok');
+      EventLog.ok(`Consigned ${containerNo} (consignment ${consignmentId})${tracking ? ` — ${tracking}` : ''}.`);
+      beep('ok');
+      perfMark('consign-only path', t0, containerNo);
+      return true;
+    } catch (err) {
+      // Same annotation the post-close consign uses, so the operator sees the
+      // carrier's actual complaint rather than a generic failure.
+      const e = annotateConsignError(err);
+
+      // v3.6.0 fix — route through the SAME failure machinery as the post-close
+      // consign. The first cut of this path handled its own failure with a
+      // status line and nothing else, which meant a consign failure here
+      // produced no errored-shipment record, no handoff to Jamieson, no banner
+      // and no print choice — and because the skip list keys off a row that was
+      // never written, the operator could load the same tote straight back.
+      // A shipment that fails to consign is broken in exactly the way the
+      // handoff exists for (code 1073 is a bad address), so it takes the same
+      // road as every other consign failure.
+      //
+      // get-consigning-container returns job_id: null. No lookup here —
+      // handOffErroredShipment resolves it from the container for every path,
+      // so doing it twice would just cost an extra read.
+      const jobId = row.job_id || null;
+
+      _onConsignFailure(e, {
+        shipNo,
+        consId: consignmentId,
+        shipmentHeaderId: row.shipment_header_id || null,
+        jobId,
+        packDesk: row.stagingDock?.location_code || Session.packLocationCode || null,
+        containerNo,
+        // Nothing was packed in this session — there is no source tote in hand,
+        // and inventing one would put a wrong bin on the error sheet.
+        sourceTote: null,
+        // v3.7.2 — error log. THIS PATH NEVER LOADS ShipmentCache: the
+        // container is already packed, so there is no GPC call and no
+        // close-time capture to thread through. Everything must come off the
+        // get-consigning-container row instead.
+        //
+        // company_code, ship_to, carrier and carrier_service are null here
+        // because that endpoint's expand does not return them, and
+        // api-traps.md warns that C7 answers 403 (not 400) for an expand it
+        // does not support — so widening the list needs a live probe, not a
+        // guess. Until then these are genuinely unavailable on this path.
+        state: {
+          company_code:    null,
+          shipment_number: row.shipmentHeader?.shipment_number || null,
+          ship_to:         null,
+          carrier:         null,
+          carrier_service: null,
+          picker:          PickerByTote.get(containerNo),
+          container: {
+            number: row.container_no || containerNo || null,
+            type:   row.containerType?.name || null,
+            status: (row.status && typeof row.status === 'object')
+                      ? (row.status.name ?? row.status.id ?? null)
+                      : (row.status ?? null),
+            weight: row.weight ?? null,
+            length: row.length ?? null,
+            width:  row.width  ?? null,
+            height: row.height ?? null,
+          },
+        },
+      });
+      return true;
+    }
+  }
+
   async function setCarrierPieceNo(consignmentId, containerNo = undefined) {
     const containerParam = containerNo
       ? encodeURIComponent(containerNo)
@@ -1673,11 +2361,26 @@
     // (console line + custom event) even when C7's tracker isn't capturing the fetch
     // itself. gm_xhr:false — this goes through page fetch, unlike the two GM calls.
     orBreadcrumb('consign_error', { status: (err && err._status) || 0, detail, gm_xhr: false });
+    // v3.7.0 — carry the raw context onto the new Error. Without this the
+    // consign path receives a message and nothing else, and the error log
+    // cannot record status, code or URL for the failure that matters most.
+    const carry = (e) => {
+      if (err) {
+        e._body   = err._body;
+        e._status = err._status;
+        e._url    = err._url;
+        e._method = err._method;
+      }
+      return e;
+    };
+
     if (isVagueConsignError(detail)) {
       const warnings = preConsignValidation();
-      if (warnings.length) return new Error(`${detail} — possible cause: ${warnings.join(' | ')}`);
+      if (warnings.length) {
+        return carry(new Error(`${detail} — possible cause: ${warnings.join(' | ')}`));
+      }
     }
-    return new Error(detail);
+    return carry(new Error(detail));
   }
 
   function startPostCloseConsigning(consignmentId, closeResp = {}) {
@@ -1746,9 +2449,875 @@
     return apiGet(`shipment/consignment/reprint&consignment_id=${consignmentId}`);
   }
 
+  /**
+   * Canary7 answers these with HTTP 200 and the real outcome in the BODY:
+   *   {"code":200,"status":"success"}
+   * confirmed in a HAR of the Canary7 UI's own assign flow (11 Sep).
+   *
+   * So `res.ok` proves the request was accepted, NOT that the job moved. This
+   * file has now been caught by that shape three times — the close-to-container
+   * 500s, APITemplate answering 200 with status:'error', and this. Here it meant
+   * the banner told an operator "Allocated to Jamieson Jensen" while the job sat
+   * untouched with `user_id` still set to them (PORTAL-B4-093428987, job
+   * 1646985). A handoff that lies is worse than one that fails, because nobody
+   * goes looking.
+   *
+   * Throws on anything that is not an explicit success, so the existing
+   * 'unassigned' / 'failed' handoff states do their job and the banner stays
+   * honest.
+   */
+  function assertJobCallSucceeded(body, what) {
+    const status = String(body?.status ?? '').toLowerCase();
+    const code   = Number(body?.code ?? 0);
+    // Canary7 signals success in more than one shape. Both are real:
+    //   {"code":200,"status":"success"}  — assign/unassign, per the HAR
+    //   {"status":200}                   — e.g. shipment-detail delete
+    // So accept an explicit success string, or a 200 in either field. Anything
+    // else — 'error', a 4xx code, an empty body — is a failure, which is the
+    // whole point: a refused assign arrives as HTTP 200.
+    if (status === 'success' || code === 200 || Number(status) === 200) return body;
+    const why = body?.message || body?.error || status || 'no status in the response';
+    throw new Error(`${what} did not take — ${why}`);
+  }
+
+  /**
+   * Find the job that actually needs handing off, by SHIPMENT not container.
+   *
+   * v3.6.0 — the bug this exists to fix, from iugb.har (11 Sep):
+   *
+   *   03:16:52  Canary7 creates job 1647332, type 68 "Consigning", user_id null
+   *   03:16:55  the script unassigns and reassigns job 1647114 — the PACKING
+   *             job it read from GPC at tote-load — and Canary7 answers
+   *             {"code":200,"status":"success"}
+   *
+   * Both calls succeeded. The banner said "Allocated to Jamieson Jensen". And
+   * the consigning job sat unowned until someone assigned it by hand, because
+   * nothing had ever looked at it. Reassigning a finished job is a no-op that
+   * reports success, which is the worst kind of wrong.
+   *
+   * `reference_number=<shipment_number>` is the query Canary7's own UI uses to
+   * list a shipment's jobs — the container is the wrong handle, because the
+   * job that matters is created against the shipment after the close.
+   *
+   * Only ever returns a job that is **unassigned or already this operator's**.
+   * Taking someone else's job would be a quiet theft of their work, and the
+   * whole point here is to stop being confidently wrong.
+   *
+   * ONE attempt by default, no sleeping. The consigning job already exists by
+   * the time we look — in the capture it was created at 03:16:52 against an
+   * assign at 03:16:55 — and a retry loop here is not free: it sits inside
+   * `_handoffInFlight`, so it blocks the banner's buttons and any second
+   * handoff for as long as it runs. `attempts` is left adjustable for tests.
+   */
+  async function findJobToHandOff(shipmentNo, { attempts = 1, delayMs = 0 } = {}) {
+    if (!shipmentNo) return null;
+    const mine = currentOperatorWmsId();
+    for (let i = 0; i < attempts; i++) {
+      try {
+        const data = await apiGet(
+          `job/job&expand=job_type` +
+          `&per-page=50&page=1` +
+          `&fields=id,job_type_id,user_id,job_no,created_at,job_type.name` +
+          `&close=1&reference_number=${encodeURIComponent(shipmentNo)}`
+        );
+        const rows = Array.isArray(data) ? data : (data?.items || []);
+        const candidates = rows
+          .filter(j => j && (j.user_id == null || (mine && Number(j.user_id) === mine)))
+          .sort((a, b) => (Number(b.created_at) || 0) - (Number(a.created_at) || 0));
+        if (candidates.length) return candidates[0];
+      } catch (_) { /* try again, or fall through to null */ }
+      if (i < attempts - 1) await new Promise(r => setTimeout(r, delayMs));
+    }
+    return null;
+  }
+
+  /**
+   * Does this job belong to that shipment?
+   *
+   * `job_no` is the shipment number, optionally suffixed `##N` for split jobs —
+   * e.g. shipment PORTAL-B4-093428987 has job_no PORTAL-B4-093428987##1.
+   */
+  function jobBelongsToShipment(job, shipmentNo) {
+    const no = String(shipmentNo || '').trim();
+    const jn = String(job?.job_no || '').trim();
+    if (!no || !jn) return false;
+    return jn === no || jn.startsWith(`${no}##`);
+  }
+
   /** Unassign a job so the current user can load it */
   async function unassignJob(jobId) {
-    return apiGet(`job/job/unassign-job&job_id=${jobId}`);
+    return assertJobCallSucceeded(
+      await apiGet(`job/job/unassign-job&job_id=${jobId}`),
+      `unassign of job ${jobId}`,
+    );
+  }
+
+  /**
+   * Assign a job to a user.
+   *
+   * CONFIRMED v3.5.0 against a HAR capture of the Canary7 UI's own assign flow:
+   *   GET index.php?r=job/job/assign-job&job_id=7000&user_id=196   -> 200
+   *   GET index.php?r=job/job/unassign-job&job_id=7000             -> 200
+   * Both are GETs despite mutating, which is why they read oddly next to the
+   * rest of the API.
+   *
+   * The handoff unassigns before assigning. Reassigning straight over an
+   * existing owner was not exercised in the capture, and unassign-job is
+   * cheap and confirmed, so the two-step avoids relying on behaviour nobody
+   * has observed.
+   */
+  async function assignJobToUser(jobId, userId) {
+    return assertJobCallSucceeded(
+      await apiGet(`job/job/assign-job&job_id=${jobId}&user_id=${userId}`),
+      `assign of job ${jobId} to user ${userId}`,
+    );
+  }
+
+  /**
+   * Print the packing-error sheet to the operator's own pack desk.
+   *
+   * Fire-and-forget by design: a printer that is offline, out of labels or
+   * simply not mapped must never block the handoff or the operator. The result
+   * is recorded on the persisted row and shown on the banner, so a sheet that
+   * did not print is visible rather than silently missing.
+   *
+   * The workflow does the two steps the Retool app already does:
+   *   create-pdf  (template_id + this payload)  ->  download_url
+   *   printjobs   (contentType 'pdf_uri', content = download_url)
+   * and resolves pack_desk -> printerId from print_routing.
+   */
+  async function printErrorSheet(row) {
+    if (!ERROR_SHEET_WORKFLOW_URL || !ERROR_SHEET_WORKFLOW_KEY) {
+      ErroredShipments.setPrinted(row.shipmentHeaderId, 'skipped', 'print workflow not configured');
+      EventLog.err('Error sheet NOT printed — print workflow not configured in the script.');
+      return null;
+    }
+    if (!row.packDesk) {
+      ErroredShipments.setPrinted(row.shipmentHeaderId, 'failed', 'no pack desk known');
+      EventLog.err('Error sheet NOT printed — pack desk unknown, cannot pick a printer.');
+      return null;
+    }
+
+    // Resolve the printer here, where there is already an authenticated Canary7
+    // client, rather than making the workflow hold a credential or a map.
+    let printer = null;
+    try {
+      printer = await resolvePackDeskPrinter(row.packDesk);
+    } catch (err) {
+      console.warn('[MalpaPack] print-routing lookup failed:', err.message);
+    }
+    if (!printer) {
+      ErroredShipments.setPrinted(row.shipmentHeaderId, 'failed',
+        `no 4x6 print route for ${row.packDesk}`);
+      EventLog.err(`Error sheet NOT printed — no active label print route for ${row.packDesk}.`);
+      return null;
+    }
+
+    // v3.6.0 — NOTHING is looked up here. Print what the row already knows.
+    //
+    // This briefly retried the packer lookup when the name was missing, on the
+    // reasoning that a click landing seconds later would find the `packing`
+    // transaction that did not exist at handoff. That was wrong on the floor:
+    // an operator who clicks Print the moment the banner appears is the one
+    // most likely to hit an unresolved lookup, and both banner buttons are
+    // disabled while the print runs — so the slowest possible path trapped
+    // them with nothing to do and no way out.
+    //
+    // A missing name costs an em dash on one field. Blocking the only action
+    // available to the operator costs the station. The background lookup
+    // started at handoff usually lands well before anyone reads the banner;
+    // when it does not, the sheet prints without it.
+    const userName = row.userName;
+
+    const payload = {
+      shipment_number: row.shipmentNo,
+      error_time:      fmtSheetTime(row.at),
+      pack_desk:       row.packDesk,
+      user_name:       userName || '',
+      // The Retool workflow forwards `payload` wholesale
+      // (JSON.stringify(startTrigger.data.payload)) rather than enumerating
+      // fields, so adding a key here needs no change at that end. The template
+      // already has the row and prints an em dash when it is empty.
+      source_tote:     row.sourceTote || '',
+      container_no:    row.containerNo || '',
+      error_message:   row.reason,
+      stage:           row.stage,
+    };
+
+    try {
+      const res = await retoolWorkflowPost(
+        ERROR_SHEET_WORKFLOW_URL, ERROR_SHEET_WORKFLOW_KEY,
+        {
+          template_id: ERROR_SHEET_TEMPLATE_ID,
+          pack_desk: row.packDesk,
+          printer_id: printer.printerId,
+          payload,
+        },
+        'error_sheet_print');
+
+      // Do not trust a 200, and do not trust silence either.
+      //
+      // A webhook-triggered Retool workflow only returns its own data if it has
+      // a Response block. Without one the reply is just the run envelope —
+      // { success: true, workflow_run: {...} } — which means "the run started",
+      // NOT "a sheet came out". Treating that as success would tell the
+      // operator to tag a shipment with a sheet that never printed, which is
+      // the worst outcome available: they walk away believing it is handled.
+      //
+      // So: 'success' is the only thing that earns 'done'. A recognisable
+      // envelope with no status is 'queued'. Anything else is a failure.
+      const status = res?.status || res?.data?.status || null;
+
+      if (!status) {
+        const async = !!(res && (res.workflow_run || res.success !== undefined));
+        ErroredShipments.setPrinted(row.shipmentHeaderId, async ? 'queued' : 'failed',
+          async ? 'workflow started, no Response block to confirm it'
+                : 'workflow returned nothing recognisable');
+        EventLog.err(async
+          ? `Error sheet sent to ${row.packDesk} but not confirmed — add a Response block to the workflow.`
+          : `Error sheet print gave no usable answer for ${row.shipmentNo}.`);
+        return res;
+      }
+
+      if (String(status).toLowerCase() !== 'success') {
+        const why = res?.reason || res?.data?.reason || status;
+        ErroredShipments.setPrinted(row.shipmentHeaderId, 'failed', `workflow: ${why}`);
+        EventLog.err(`Error sheet failed to print for ${row.shipmentNo} — ${why}.`);
+        return res;
+      }
+      ErroredShipments.setPrinted(row.shipmentHeaderId, 'done',
+        `printed at ${row.packDesk} (${printer.printerName || printer.printerId})`);
+      EventLog.ok(`Error sheet printed at ${row.packDesk} — ${printer.printerName || printer.printerId}.`);
+      return res;
+    } catch (err) {
+      ErroredShipments.setPrinted(row.shipmentHeaderId, 'failed', err.message);
+      EventLog.err(`Error sheet did not print: ${err.message}. Write the details down instead.`);
+      return null;
+    }
+  }
+
+  /**
+   * dd/mm/yyyy h:mm:ss AM/PM, operator local time. Brisbane has no DST.
+   *
+   * The `% 12 || 12` is the bit worth not rewriting casually: midnight is
+   * 12 AM and noon is 12 PM, not 0. Both are covered by tests.
+   */
+  function fmtSheetTime(ts) {
+    const d = new Date(ts || Date.now());
+    const p = (n) => String(n).padStart(2, '0');
+    const h24 = d.getHours();
+    const ampm = h24 < 12 ? 'AM' : 'PM';
+    const h12 = h24 % 12 || 12;
+    return `${p(d.getDate())}/${p(d.getMonth() + 1)}/${d.getFullYear()} `
+         + `${h12}:${p(d.getMinutes())}:${p(d.getSeconds())} ${ampm}`;
+  }
+
+  // Resolved pack desk -> PrintNode printer. Cached for the session: print
+  // routing does not change mid-shift, and this only runs on an error anyway.
+  let _printerCache = null;
+
+  /**
+   * Resolve which PrintNode printer belongs to a pack desk, live from Canary7.
+   *
+   * Deliberately a lookup and not a hardcoded map. Malpa adds and re-maps pack
+   * desks, and a map baked into a script version goes stale silently — a sheet
+   * quietly printing at the wrong desk is worse than none. Add a desk with a
+   * print route in Canary7 and this picks it up with no code change.
+   *
+   * The match is on print_routing.name, which carries the desk code
+   * ("WDD-01 CL"). It cannot be the printer's own name: WDD-03's printer is
+   * called "HIP-001", so name-matching the printer would miss it entirely.
+   */
+  async function resolvePackDeskPrinter(packDesk) {
+    const desk = String(packDesk || '').trim().toUpperCase();
+    if (!desk) return null;
+
+    if (!_printerCache) {
+      const data = await apiGet(
+        `configuration/print-routing` +
+        `&expand=printer,printProcedure` +
+        `&per-page=200&page=1`
+      );
+      _printerCache = Array.isArray(data) ? data : (data?.items || []);
+    }
+
+    const candidates = _printerCache.filter(r =>
+      Number(r.status) === 1 &&
+      r.printer?.printer_id &&
+      SHEET_PRINT_PROCEDURES.includes(r.printProcedure?.name) &&
+      String(r.name || '').trim().toUpperCase().split(/\s+/)[0] === desk
+    );
+    if (!candidates.length) return null;
+
+    candidates.sort((a, b) => {
+      const pa = SHEET_PRINT_PROCEDURES.indexOf(a.printProcedure.name);
+      const pb = SHEET_PRINT_PROCEDURES.indexOf(b.printProcedure.name);
+      return pa !== pb ? pa - pb : (a.sequence || 0) - (b.sequence || 0);
+    });
+
+    const win = candidates[0];
+    return {
+      printerId: Number(win.printer.printer_id),
+      printerName: win.printer.name || null,
+      via: win.printProcedure.name,
+    };
+  }
+
+  /**
+   * The tote the stock came OUT of, as opposed to the outbound container this
+   * station made. Printed on the error sheet so whoever fixes the shipment
+   * knows where to go looking. No new API call — the script already tracks it.
+   *
+   * The cache selection mirrors the one at the tote-counter read (see the
+   * `tracks` ternary in renderItems): on retained-source and item-initiated
+   * flows the tote the operator physically scanned lives on SourceToteCache,
+   * and ShipmentCache may be holding the outbound container instead. Reading
+   * only ShipmentCache would blank this field on exactly MIBP and SIBP — the
+   * two profiles where the source tote differs from the container, which is
+   * the case the field exists to serve.
+   *
+   * Checks run in order of confidence rather than as a single read, because
+   * GPC cannot be trusted positionally: loadFromGPC's own comment notes the
+   * response is sometimes [source_tote, outbound_container], so containers[0]
+   * is occasionally the AC container.
+   */
+  function resolveSourceTote() {
+    const notAutogen = (v) => {
+      const t = String(v || '').trim();
+      return t && !AUTOGEN_CONTAINER_RE.test(t) ? t : null;
+    };
+
+    const retained = Workflow.usesRetainedSourceFlow() || Workflow.usesItemInitiatedFlow();
+    if (retained && SourceToteCache.allItems.length) {
+      const fromTote = notAutogen(SourceToteCache.sourceContainerNo);
+      if (fromTote) return fromTote;
+    }
+
+    const cached = notAutogen(ShipmentCache.sourceContainerNo);
+    if (cached) return cached;
+
+    for (const track of ShipmentCache.allItems) {
+      const fromItem = notAutogen(track.sourceContainerNo);
+      if (fromItem) return fromItem;
+    }
+
+    // Last, because on MIBP/SIBP the box holds a retained tote that may have
+    // moved on by now.
+    return notAutogen(R.toteIn?.value) || null;
+  }
+
+  let _handoffInFlight = false;
+
+  /**
+   * A shipment errored in a way this operator cannot clear. Record it, take the
+   * job off this station, push it to Jamieson, and let the operator carry on.
+   *
+   * MIBP/SIBP only. Those two load the next shipment automatically, so without
+   * this the broken shipment is handed straight back. Cluster and standard
+   * profiles already let the operator escape by scanning a different tote, so
+   * reassigning there would take work off them for no reason.
+   */
+  async function handOffErroredShipment({
+    reason, stage, shipmentNo, shipmentHeaderId, jobId, packDesk, containerNo,
+    sourceTote = null,
+    error = null, consignmentId = null, state = null,   // v3.7.0 — error log only
+  }) {
+    if (_handoffInFlight) return null;
+    _handoffInFlight = true;
+
+    // Record FIRST — before any network call — so the shipment is never lost to
+    // a failed request or a page reload.
+    const row = ErroredShipments.record({
+      shipmentNo, shipmentHeaderId, jobId, reason, stage,
+      profile: Session.profile?.name || null,
+      packDesk: packDesk || Session.packLocationCode || null,
+      containerNo,
+      sourceTote,
+      // Always seeded, including on the consign-only path.
+      //
+      // That path briefly did NOT seed, on the reasoning that whoever scans an
+      // already-packed container is not the packer and naming them would be
+      // confidently wrong. True in principle, useless in practice: with the
+      // print no longer waiting on the inventory-log lookup, the field simply
+      // printed blank every time — three floor tests running, telling nobody
+      // anything. A name to go and ask beats an empty box, and the log lookup
+      // still overwrites it with the real packer whenever it lands.
+      userName: currentOperatorName(),
+    });
+    EventLog.err(`⛔ ${row.shipmentNo} failed at ${stage}: ${row.reason}`);
+
+    // v3.6.0 — show the banner NOW, before the three network calls below.
+    //
+    // The handoff does unassign, then assign, then a multi-day inventory-log
+    // lookup before the row is complete. That was several seconds in which the
+    // station appeared frozen and a modal then arrived out of nowhere — often
+    // after the operator had moved on to the next tote.
+    //
+    // That was merely annoying while the banner was an acknowledgement. Now it
+    // carries a DECISION, and a late decision modal asks a question about work
+    // they have already stopped thinking about — which is how a mis-aimed
+    // click happens. So: the stop is instant, and the choice appears when it
+    // is a real choice. While `resolving` is set the buttons render disabled,
+    // because there is nothing worth printing until the row is filled in.
+    // v3.6.0 — kick the packer lookup off NOW, in parallel with the unassign
+    // and assign below, and never await it on this path.
+    //
+    // It reads several days of inventory log and is by far the slowest call
+    // here. The operator's decision does not depend on it — only the printed
+    // sheet carries the name — so awaiting it held the banner's buttons
+    // disabled behind a stage they could do nothing about, and behind a
+    // progress line about a task that is none of their business.
+    //
+    // Starting it here rather than after the handoff means it has the whole
+    // unassign/assign round trip to resolve in, so by the time anyone reaches
+    // for Print it has usually landed. If it has not, printErrorSheet retries
+    // the lookup itself.
+    const packerPromise = fetchPackerForContainer(containerNo).catch(() => null);
+
+    // v3.7.0 — error log. Hung off packerPromise rather than fired above,
+    // because at record() time row.userName is still only the seeded
+    // signed-in operator; the real packer arrives with this lookup. The
+    // error_writer role is INSERT-only by design, so there is no UPDATE
+    // available to correct the name later — it has to be right first time.
+    //
+    // Nothing awaits this, so the banner and the handoff are unaffected. The
+    // 5s race exists so a stalled lookup costs us the packer's name, not the
+    // entire row.
+    Promise.race([
+      packerPromise,
+      new Promise(resolve => setTimeout(() => resolve(null), 5000)),
+    ])
+      .then(packer => reportPackError(row, error, consignmentId, packer, state))
+      .catch(() => reportPackError(row, error, consignmentId, null, state));
+
+    // Warm the print-routing cache while we are here. resolvePackDeskPrinter
+    // fetches the whole routing table once per session and memoises it in
+    // _printerCache — but the FIRST error of a shift would otherwise pay for
+    // that fetch on the Print click, where the operator is waiting. Errors are
+    // rare and the handoff has dead time in it, so spend it here instead.
+    // Fire-and-forget: if it fails, the click falls back to fetching it.
+    const deskForPrinter = packDesk || Session.packLocationCode || null;
+    if (deskForPrinter) resolvePackDeskPrinter(deskForPrinter).catch(() => {});
+
+    showHandoffBanner(row, { resolving: 'Taking the job off this station…' });
+
+    // v3.6.0 — resolve the job from the container when we were not handed one.
+    //
+    // `_currentJobId` is set at TOTE-LOAD time from the GPC jobInstruction —
+    // the packing job — and onCloseContainer captures it before the close. By
+    // the time a consign fails, that job is finished and the job actually
+    // outstanding is a consigning job the script never saw. So the handoff had
+    // nothing to reassign and quietly left the work with the operator.
+    //
+    // Observed on PORTAL-B4-093428987: job 1646985 still carried user_id 182
+    // (the operator) after a handoff that reported nothing wrong.
+    //
+    // The container is the stable handle — job/job sorted by -updated_at gives
+    // the job that is current for it. Source tote first, since that is where
+    // the shipment's own job lives, then the outbound container.
+    try {
+      // Inside the try on purpose: `_handoffInFlight` is cleared in the finally
+      // below, so anything that can throw must sit where that finally covers
+      // it. Resolving the job outside it once stranded the flag true, and every
+      // later handoff then returned null without explanation.
+      const target = await findJobToHandOff(shipmentNo);
+      if (target) {
+        if (target.id !== jobId) {
+          EventLog.ok(
+            `Handing off job ${target.id} (${target.job_type?.name || `type ${target.job_type_id}`})` +
+            `${jobId ? ` — not ${jobId}, which is already finished` : ''}.`
+          );
+        }
+        jobId = target.id;
+      } else if (!jobId) {
+        // Nothing found by shipment. The container is a weaker handle, and a
+        // DANGEROUS one unguarded: on MIBP/SIBP the tote is retained across
+        // shipments, so the newest job against it may belong to the shipment
+        // the operator has just loaded and is actively packing. Handing that to
+        // Jamieson would take live work off them.
+        //
+        // So match on job_no — it carries the shipment number — and take
+        // nothing that is not demonstrably this failure's job.
+        for (const handle of [sourceTote, containerNo]) {
+          if (!handle) continue;
+          try {
+            const data = await apiGet(
+              `job/job&expand=jobInstruction` +
+              `&per-page=10&page=1&sort=-updated_at` +
+              `&fields=id,job_no,user_id` +
+              `&close=1&container_number=${encodeURIComponent(handle)}`
+            );
+            const rows = Array.isArray(data) ? data : (data?.items || []);
+            const match = rows.find(j => jobBelongsToShipment(j, shipmentNo));
+            if (match?.id) {
+              jobId = match.id;
+              EventLog.ok(`Job ${jobId} found against ${handle} for ${shipmentNo}.`);
+              break;
+            }
+            if (rows.length) {
+              EventLog.err(`Jobs against ${handle} belong to other shipments — not touching them.`);
+            }
+          } catch (_) { /* try the next handle */ }
+        }
+      }
+
+      if (!jobId) {
+        ErroredShipments.setHandoff(shipmentHeaderId, 'failed', 'no job linked — assign manually');
+        EventLog.err(`${row.shipmentNo}: no job linked to this container, cannot hand off — tell a supervisor.`);
+      } else {
+        // v3.6.0 — only unassign a job that is actually assigned to someone.
+        //
+        // findJobToHandOff deliberately returns jobs with user_id null — an
+        // unowned consigning job is precisely what we are looking for — and the
+        // old unconditional unassign-then-assign then hit "This job is already
+        // unassigned [500]" on exactly the job we most wanted. The unassign
+        // threw, so the assign never ran, and the banner reported NOT
+        // allocated. Honest, but nothing moved.
+        // ASSIGN FIRST. Zaynne, 11 Sep: "just fetch the new job id for the
+        // shipment and assign it to jamieson".
+        //
+        // The unassign-then-assign pair came from a HAR of the Canary7 UI
+        // reassigning a job that HAD an owner. The job we target usually has
+        // none — findJobToHandOff looks for precisely that — and unassigning an
+        // unowned job returns 500 "This job is already unassigned", which
+        // aborted the handoff before it ever reached the assign. Putting a
+        // call that can only fail in front of the one that matters was the
+        // whole bug.
+        //
+        // So: assign. Only if Canary7 refuses do we unassign and try again,
+        // which covers a job still held by this operator.
+        try {
+          await assignJobToUser(jobId, HANDOFF_USER_ID);
+          ErroredShipments.setHandoff(shipmentHeaderId, 'done', `assigned to ${HANDOFF_USER_NAME}`);
+          EventLog.ok(`Job ${jobId} assigned to ${HANDOFF_USER_NAME}.`);
+        } catch (firstErr) {
+          EventLog.err(`Direct assign of job ${jobId} refused — ${firstErr.message}. Unassigning, then retrying.`);
+          let cameOffStation = false;
+          try {
+            await unassignJob(jobId);
+            cameOffStation = true;
+            EventLog.ok(`Job ${jobId} unassigned from this station.`);
+            await assignJobToUser(jobId, HANDOFF_USER_ID);
+            ErroredShipments.setHandoff(shipmentHeaderId, 'done', `assigned to ${HANDOFF_USER_NAME}`);
+            EventLog.ok(`Job ${jobId} assigned to ${HANDOFF_USER_NAME}.`);
+          } catch (secondErr) {
+            // Two different states, and the difference matters to whoever reads
+            // the log: 'unassigned' means it left this station but never
+            // reached Jamieson; 'failed' means nothing moved at all and the
+            // operator still holds it.
+            const state = cameOffStation ? 'unassigned' : 'failed';
+            ErroredShipments.setHandoff(shipmentHeaderId, state,
+              cameOffStation ? `assign failed: ${secondErr.message}`
+                             : `unassign failed: ${secondErr.message}`);
+            EventLog.err(`Job ${jobId} NOT assigned to ${HANDOFF_USER_NAME} — ${secondErr.message}.`);
+          }
+        }
+      }
+    } catch (err) {
+      ErroredShipments.setHandoff(shipmentHeaderId, 'failed', `unassign failed: ${err.message}`);
+      EventLog.err(`Could not unassign job ${jobId}: ${err.message}`);
+    } finally {
+      _handoffInFlight = false;
+      _currentJobId = null;
+    }
+
+    // Who was packing, for the sheet. Lands on the stored row whenever it
+    // arrives — nothing waits for it, and the operator is never shown a stage
+    // for it. If they print first, printErrorSheet retries the lookup, so the
+    // sheet still carries a name rather than an em dash.
+    packerPromise.then((packer) => {
+      if (packer) {
+        ErroredShipments.setUser(shipmentHeaderId, packer);
+        EventLog.ok(`Packer identified as ${packer}.`);
+      } else {
+        EventLog.err('Could not identify the packer from the inventory log.');
+      }
+      const b = document.getElementById('mp-log-body');
+      if (b) EventLog._renderInto(b);
+    });
+
+    // v3.6.0 — the sheet is NOT printed here any more. It prints only when the
+    // operator asks for it on the banner.
+    //
+    // Why: the diagnostic signal is printer SILENCE. A failed shipment used to
+    // produce no label, and that absence is what made an operator stop and look.
+    // Auto-printing replaced the silence with a 4x6 label — off the same
+    // printer, on the same stock, at the exact moment they expect a carrier
+    // label. A distracted operator can stick it on the parcel and ship it.
+    //
+    // The handoff above still resolves the printer and the packer, so the row is
+    // complete and the banner can name the desk. Only the print itself waits.
+    const finalRow = ErroredShipments.find(shipmentHeaderId) || row;
+    showHandoffBanner(finalRow);
+    const body = document.getElementById('mp-log-body');
+    if (body) EventLog._renderInto(body);
+    return finalRow;
+  }
+
+  /**
+   * Loud, non-auto-dismissing banner. The operator must acknowledge it — on a
+   * handheld this is the only thing that reliably lands, and unlike the status
+   * line it cannot be overwritten by the next shipment loading behind it.
+   * Built with text nodes, never innerHTML: `reason` is a raw server message.
+   */
+  // Only one banner may be on screen. It is now re-rendered in place as the
+  // handoff resolves, so without this the three renders would stack three
+  // overlays — and two errors in quick succession would have stacked two even
+  // before that change.
+  let _handoffBannerNodes = null;
+
+  function showHandoffBanner(row, { resolving = null } = {}) {
+    const replacing = !!_handoffBannerNodes;
+    if (replacing) {
+      _handoffBannerNodes.forEach(n => { try { n.remove(); } catch (_) {} });
+      _handoffBannerNodes = null;
+    }
+    const overlay = h('div', { cls: 'mp-popup-overlay' });
+    const popup   = h('div', { cls: 'mp-handoff-popup' });
+    // The allocation line stays honest per state — never tell an operator
+    // Jamieson has it when the assign call did not actually succeed. The
+    // physical instruction below is the same either way, so it is constant.
+    const allocated = row.handoff === 'done';
+    const stateLine = allocated
+      ? `Allocated to ${HANDOFF_USER_NAME}.`
+      : row.handoff === 'unassigned'
+        ? `Taken off your station — waiting for ${HANDOFF_USER_NAME} to pick it up.`
+        : `⚠ NOT allocated — ${row.handoffNote || 'tell a supervisor'}.`;
+    // The instruction depends on whether a sheet actually printed. Telling an
+    // operator to tag the shipment when no sheet came out leaves them holding
+    // stock with nothing to attach — so 'queued' gets its own wording rather
+    // than being rounded up to success.
+    //
+    // v3.6.0 — 'pending' now means "the operator has not chosen yet", because
+    // printing no longer happens during the handoff. It must NOT fall through to
+    // the NO SHEET PRINTED wording: at this point nothing has failed, and
+    // telling them a sheet failed before they have been offered one is a lie
+    // that trains them to ignore the line.
+    const undecided    = !row.printed || row.printed === 'pending';
+    const printedOk    = row.printed === 'done';
+    const printedMaybe = row.printed === 'queued';
+    const declined     = row.printed === 'declined';
+    // Wording is Zaynne's (11 Sep). Note it says "hand off to Jamieson" where
+    // the printed sheet's own band still says TAG SHIPMENT AND PLACE ON
+    // BOOKSHELF — see the note in the handover before changing either.
+    const action = undecided
+      ? `Print an error label for this shipment and hand off to Jamieson.`
+      : printedOk
+        ? `Tag the shipment with the sheet from ${row.packDesk || 'your printer'}, then hand off to Jamieson.`
+        : printedMaybe
+          ? `Check ${row.packDesk || 'your printer'} for the sheet. If nothing comes out, write the order number and the error above on a label. Then hand off to Jamieson.`
+          : declined
+            ? 'No label printed — write the order number and the error above on a label, then hand off to Jamieson.'
+            : 'NO SHEET PRINTED — write the order number and the error above on a label, then hand off to Jamieson.';
+
+    popup.append(
+      h('div', { cls: 'mp-handoff-icon' }, '⛔'),
+      h('div', { cls: 'mp-handoff-title' }, 'This shipment has an Error'),
+      // Big and selectable — the operator may have to copy this onto paper.
+      h('div', { cls: 'mp-handoff-shipno' }, row.shipmentNo || '—'),
+      h('div', { cls: 'mp-handoff-reason' }, row.reason || 'Unknown error'),
+      h('div', { cls: 'mp-handoff-state' + (allocated ? '' : ' warn') }, stateLine),
+      h('div', { cls: 'mp-handoff-action' + (printedOk || printedMaybe ? '' : ' warn') }, action),
+      h('div', { cls: 'mp-handoff-sub' },
+        'Then carry on with the next tote — it stays in your error log.'),
+    );
+    const close = () => {
+      overlay.remove();
+      popup.remove();
+      _handoffBannerNodes = null;
+    };
+    const refreshLog = () => {
+      const b = document.getElementById('mp-log-body');
+      if (b) EventLog._renderInto(b);
+    };
+
+    if (undecided) {
+      // v3.6.0 — the print decision, as two deliberate CLICKS.
+      //
+      // THE SCANNER IS THE HAZARD. Scan guns send Enter. If either button holds
+      // focus, or is the implicit default, or the popup listens for Enter, then
+      // one stray scan answers this dialog with nobody having read a word — and
+      // if the answer it lands on is "print", we have rebuilt the auto-print
+      // this change exists to remove.
+      //
+      // So, all deliberate and none of it decorative:
+      //   · no autofocus on either button
+      //   · no keydown/Enter handler anywhere on the popup
+      //   · no default/submit button (type="button", never inside a form)
+      //   · no Escape-to-dismiss, no backdrop-click-to-dismiss — a dismissal
+      //     that is not an explicit choice is indistinguishable from a
+      //     scanned-through yes
+      //   · the two actions styled differently and stacked apart, so they are
+      //     not interchangeable at a glance on a handheld
+      const printBtn = h('button', { cls: 'mp-handoff-print', type: 'button' }, '🖨  Print error label');
+      const noBtn    = h('button', { cls: 'mp-handoff-decline', type: 'button' }, "No label — I'll write it down");
+
+      // Still filling the row in. The operator can read the shipment number and
+      // the error immediately — that is the point of showing this early — but
+      // there is nothing worth printing yet, so the choice is visible and
+      // inert rather than absent. A button that appears late is a button that
+      // can be hit by accident on the way to something else.
+      if (resolving) {
+        printBtn.disabled = true;
+        noBtn.disabled = true;
+        popup.append(h('div', { cls: 'mp-handoff-resolving' }, resolving));
+      }
+
+      printBtn.addEventListener('click', () => {
+        // Close FIRST, then print.
+        //
+        // The Retool workflow takes ~4.2s measured on the floor — APITemplate
+        // renders the PDF through Puppeteer, then PrintNode accepts the job.
+        // None of that is something the operator can hurry or influence, and
+        // holding a modal over them for four seconds on the path where nothing
+        // has gone wrong is the wrong way round. Let them get on with the next
+        // tote.
+        close();
+        setStatus(`Printing error sheet for ${row.shipmentNo}…`, 'loading');
+
+        printErrorSheet(row)
+          .catch(() => null)
+          .then(() => {
+            const after = ErroredShipments.find(row.shipmentHeaderId)
+              || { ...row, printed: 'unknown' };
+            refreshLog();
+
+            if (after.printed === 'done') {
+              // Deliberately NO second interruption. A label coming out of the
+              // printer is its own confirmation — the same reasoning that makes
+              // printer silence the diagnostic signal in the first place.
+              setStatus(`✅ Error sheet printed at ${after.packDesk || 'your printer'} for ${after.shipmentNo}.`, 'ok');
+              return;
+            }
+
+            // Anything else and they may be holding a shipment with no paper
+            // for it. That is worth interrupting for a second time, because the
+            // instruction changes: write it down instead.
+            setStatus(`⚠ Error sheet for ${after.shipmentNo} did not confirm — check ${after.packDesk || 'the printer'}.`, 'err');
+            beep('err');
+            showHandoffBanner(after);
+          });
+      });
+
+      noBtn.addEventListener('click', () => {
+        ErroredShipments.setPrinted(row.shipmentHeaderId, 'declined',
+          'operator chose to write it down');
+        EventLog.err(`No error sheet for ${row.shipmentNo} — declined at the desk. Reprintable from the error log.`);
+        close();
+        refreshLog();
+      });
+
+      const choices = h('div', { cls: 'mp-handoff-choices' });
+      choices.append(printBtn, noBtn);
+      popup.append(choices);
+    } else {
+      const btn = h('button', { cls: 'mp-handoff-dismiss', type: 'button' }, 'Continue →');
+      btn.addEventListener('click', close);
+      popup.append(btn);
+    }
+
+    document.body.append(overlay, popup);
+    _handoffBannerNodes = [overlay, popup];
+    // Once per error, not once per re-render as the handoff resolves.
+    if (!replacing) beep('err');
+  }
+
+  /**
+   * Persisted errored-shipment block for the console popover. Rendered above the
+   * live event log and, unlike it, survives tote loads and page reloads.
+   */
+  function renderErrorLogInto(body) {
+    if (!body) return 0;
+    const rows = ErroredShipments.all;
+    if (!rows.length) return 0;
+
+    const wrap = h('div', { cls: 'mp-errlog' });
+    const head = h('div', { cls: 'mp-errlog-head' });
+    head.append(h('span', {}, `⛔ Errored shipments (${rows.length})`));
+    const clearBtn = h('button', { cls: 'mp-errlog-clear' }, 'Clear');
+    clearBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      ErroredShipments.clear();
+      const b = document.getElementById('mp-log-body');
+      if (b) EventLog._renderInto(b);
+    });
+    // v3.6.0 — reprint the most recent error label, on demand.
+    //
+    // An operator can hit "No" by accident, or change their mind, or have the
+    // printer eat it. Every field the sheet needs is already persisted on the
+    // row, so this works after a page reload and across a shift change.
+    //
+    // Scoped to the NEWEST row by decision (Zaynne, 10 Sep) rather than a
+    // per-row button. The cost of that choice: with two failures in quick
+    // succession the older one is unreachable from here. It is still in the log
+    // below, and still rolls off at ERRORED_MAX = 20.
+    const last = rows[0];
+    const printLastBtn = h('button', { cls: 'mp-errlog-print', type: 'button' }, '🖨 Print last sheet');
+    printLastBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      printLastBtn.disabled = true;
+      printLastBtn.textContent = 'Printing…';
+      await printErrorSheet(last);
+      const b = document.getElementById('mp-log-body');
+      if (b) EventLog._renderInto(b);
+    });
+    head.append(printLastBtn, clearBtn);
+    wrap.append(head);
+
+    for (const r of rows) {
+      const when = new Date(r.at || Date.now());
+      const hhmm = `${String(when.getHours()).padStart(2, '0')}:${String(when.getMinutes()).padStart(2, '0')}`;
+      const badge = r.handoff === 'done' ? `→ ${HANDOFF_USER_NAME}`
+        : r.handoff === 'unassigned' ? 'unassigned'
+        : 'NOT handed off';
+      const printBadge = r.printed === 'done' ? `sheet @ ${r.packDesk || '?'}`
+        : r.printed === 'queued' ? `sheet sent to ${r.packDesk || '?'} (unconfirmed)`
+        // v3.6.0 — 'declined' is an operator CHOICE, not a failure. It reads
+        // differently from 'SHEET FAILED' on purpose: nothing is broken, and a
+        // supervisor scanning this log should not be sent chasing a printer.
+        : r.printed === 'declined' ? 'no sheet — written down'
+        : r.printed === 'skipped' ? 'no sheet (not configured)'
+        : r.printed === 'failed' ? 'SHEET FAILED'
+        : 'sheet not yet chosen';
+      const row = h('div', { cls: 'mp-errlog-row' + (r.handoff === 'done' ? '' : ' warn') });
+      row.append(
+        h('div', { cls: 'mp-errlog-ship' }, r.shipmentNo || '—'),
+        h('div', { cls: 'mp-errlog-reason' }, r.reason || ''),
+        h('div', { cls: 'mp-errlog-meta' }, `${hhmm} · ${r.stage || '?'} · ${badge} · ${printBadge}`),
+      );
+      wrap.append(row);
+    }
+    body.append(wrap);
+    return rows.length;
+  }
+
+  /**
+   * Shared guard for both auto-loading flows: if GPC just handed us a shipment
+   * we already handed off, refuse it and put the station back to a scannable
+   * state instead of loading it again.
+   * @returns {object|null} the stored row if refused, else null
+   */
+  function refuseHandedOffShipment(containers, sourceLabel) {
+    // v3.5.0 — all profiles. With the job reassigned, Canary7 should not offer
+    // it back anyway; this is the belt to that braces, and it costs nothing on
+    // profiles that never auto-load.
+    const shipmentId = containers?.[0]?.shipment_header_id || null;
+    if (!ErroredShipments.isSkipped(shipmentId)) return null;
+    const row = ErroredShipments.find(shipmentId);
+
+    _autoReloadAfterClose = false;
+    clearRetainedToteNumber();
+    if (R.retainChk) {
+      R.retainChk.checked = false;
+      try { localStorage.setItem(RETAIN_TOTE_ENABLED_KEY, '0'); } catch (_) {}
+    }
+    ShipmentCache.clear();
+    Session.phase = Workflow.usesItemInitiatedFlow() ? 'SIBP_ITEM_SCAN' : 'SCAN_TOTE';
+    renderItems('');
+    EventLog.err(`${sourceLabel} still holds handed-off shipment ${row?.shipmentNo || shipmentId} — set it aside.`);
+    setStatus(`⛔ ${row?.shipmentNo || 'That shipment'} was handed off — set this tote aside and scan a different one.`, 'err');
+    showHandoffBanner(row || { shipmentNo: String(shipmentId), reason: 'Previously handed off', handoff: 'done' });
+    return row || { shipmentHeaderId: shipmentId };
   }
 
   /**
@@ -1797,6 +3366,45 @@
     );
     const rows = Array.isArray(data) ? data : (data?.items || []);
     return rows[0]?.username || null;
+  }
+
+  /**
+   * Who was packing. Same endpoint as fetchLastPickerForTote, different
+   * transaction type — inventory-log rows for `packing` carry the operator's
+   * name in `username`, and the outbound container's license_plate_no is
+   * unique to this shipment at this desk.
+   *
+   * Not the picker: fetchLastPickerForTote answers "who filled this tote",
+   * which is usually a different person and the wrong name to print on an
+   * error sheet.
+   *
+   * The log is append-only, so the rows survive even when the close that
+   * failed rolled the inventory move back.
+   */
+  async function fetchPackerForContainer(containerNo) {
+    const no = String(containerNo || '').trim();
+    if (!no) return null;
+    const pad = n => String(n).padStart(2, '0');
+    const fmt = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+    const now = new Date();
+    const past = new Date(now);
+    past.setDate(past.getDate() - 1);
+    try {
+      const data = await apiGet(
+        `logging/inventory-log` +
+        `&per-page=1&page=1` +
+        `&sort=-transaction_time` +
+        `&start_date=${fmt(past)}` +
+        `&end_date=${fmt(now)}` +
+        `&transaction_type=packing` +
+        `&license_plate_no=${encodeURIComponent(no)}`
+      );
+      const rows = Array.isArray(data) ? data : (data?.items || []);
+      return rows[0]?.username || null;
+    } catch (err) {
+      console.warn('[MalpaPack] packer lookup failed:', err.message);
+      return null;
+    }
   }
 
   /** Update the picker badge in the log pill. Pass null to hide it. */
@@ -2621,6 +4229,94 @@ color: #b91c1c;
   transition: all .1s;
 }
 .mp-undo:hover { border-color: var(--c7-red); color: var(--c7-red); }
+/* v3.4.0 — errored-shipment handoff banner + persisted error log */
+.mp-handoff-popup {
+  position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  z-index: 2147483000; width: min(92vw, 460px);
+  background: #fff; border: 3px solid var(--c7-red, #d9534f);
+  border-radius: 10px; padding: 22px 20px; text-align: center;
+  box-shadow: 0 12px 48px rgba(0,0,0,.45); font-family: var(--c7-font);
+}
+.mp-handoff-icon   { font-size: 40px; line-height: 1; margin-bottom: 8px; }
+.mp-handoff-title  { font-size: 17px; font-weight: 800; color: #b8332f; margin-bottom: 8px; }
+.mp-handoff-shipno {
+  font-size: 30px; font-weight: 800; line-height: 1.15; color: #111;
+  letter-spacing: .5px; word-break: break-all; margin-bottom: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  user-select: all; -webkit-user-select: all;
+}
+.mp-handoff-action {
+  font-size: 14px; font-weight: 700; color: #7a4a00;
+  background: #fff7e6; border: 1px solid #f0d9a8; border-radius: 6px;
+  padding: 10px 12px; margin-bottom: 10px; text-align: left;
+}
+.mp-handoff-action.warn { color: #8a1c18; background: #fdecea; border-color: #f2b8b5; }
+.mp-handoff-reason {
+  font-size: 13px; color: #444; background: #fdf2f2; border: 1px solid #f0c9c7;
+  border-radius: 6px; padding: 8px 10px; margin-bottom: 10px;
+  max-height: 6.5em; overflow-y: auto; word-break: break-word; text-align: left;
+}
+.mp-handoff-state { font-size: 14px; font-weight: 700; color: #1f5c2f; margin-bottom: 10px; }
+.mp-handoff-state.warn { color: #b8332f; }
+.mp-handoff-sub   { font-size: 12px; color: #777; margin-bottom: 16px; }
+.mp-handoff-dismiss {
+  width: 100%; padding: 13px; font-size: 16px; font-weight: 700;
+  background: var(--c7-red, #d9534f); color: #fff; border: 0;
+  border-radius: 6px; cursor: pointer; font-family: var(--c7-font);
+}
+/* v3.6.0 — the print choice. The gap is not decoration: these two must never
+   read as one button with a slightly different label, because the operator is
+   often reading this at arm's length on a handheld while holding a parcel. */
+.mp-handoff-choices { display: flex; flex-direction: column; gap: 10px; margin-top: 4px; }
+/* Shown while the handoff is still resolving. Amber, not red: nothing is
+   wrong, the sheet just is not ready to print yet. */
+.mp-handoff-resolving {
+  font-size: 12px; font-weight: 700; color: #8a6d1a;
+  background: #fdf6e0; border: 1px solid #e8d48a;
+  border-radius: 5px; padding: 6px 8px; margin-bottom: 10px;
+}
+.mp-handoff-print {
+  width: 100%; padding: 13px; font-size: 16px; font-weight: 700;
+  background: var(--c7-red, #d9534f); color: #fff; border: 0;
+  border-radius: 6px; cursor: pointer; font-family: var(--c7-font);
+}
+/* Deliberately quiet. Declining is a legitimate, common answer — it must not
+   look like the dangerous one, or operators will print by reflex to avoid the
+   scary-looking button, which is auto-print with extra steps. */
+.mp-handoff-decline {
+  width: 100%; padding: 11px; font-size: 14px; font-weight: 700;
+  background: #fff; color: #555; border: 1px solid #bbb;
+  border-radius: 6px; cursor: pointer; font-family: var(--c7-font);
+}
+.mp-handoff-print:disabled,
+.mp-handoff-decline:disabled { opacity: .55; cursor: default; }
+.mp-errlog-print {
+  font-size: 10px; font-weight: 700; padding: 2px 8px; cursor: pointer;
+  background: transparent; color: #888; border: 1px solid #ccc; border-radius: 3px;
+  font-family: var(--c7-font); margin-right: 6px;
+}
+.mp-errlog-print:hover { color: var(--c7-red, #d9534f); border-color: var(--c7-red, #d9534f); }
+.mp-errlog-print:disabled { opacity: .55; cursor: default; }
+.mp-errlog { margin-bottom: 10px; border-bottom: 1px solid rgba(0,0,0,.12); padding-bottom: 8px; }
+.mp-errlog-head {
+  display: flex; align-items: center; justify-content: space-between;
+  font-size: 11px; font-weight: 800; letter-spacing: .4px;
+  text-transform: uppercase; color: #b8332f; margin-bottom: 6px;
+}
+.mp-errlog-clear {
+  font-size: 10px; font-weight: 700; padding: 2px 8px; cursor: pointer;
+  background: transparent; color: #888; border: 1px solid #ccc; border-radius: 3px;
+  font-family: var(--c7-font);
+}
+.mp-errlog-clear:hover { color: var(--c7-red, #d9534f); border-color: var(--c7-red, #d9534f); }
+.mp-errlog-row {
+  padding: 6px 8px; margin-bottom: 4px; border-radius: 5px;
+  background: #f6f8fa; border-left: 3px solid #9aa5b1;
+}
+.mp-errlog-row.warn { background: #fdf2f2; border-left-color: var(--c7-red, #d9534f); }
+.mp-errlog-ship   { font-size: 13px; font-weight: 800; color: #222; }
+.mp-errlog-reason { font-size: 11px; color: #555; word-break: break-word; margin: 2px 0; }
+.mp-errlog-meta   { font-size: 10px; color: #888; }
 .mp-locked-label {
   display: inline-block; margin-top: 4px; padding: 2px 8px;
   font-size: 11px; font-weight: 700; letter-spacing: .3px;
@@ -4156,11 +5852,22 @@ color: #b91c1c;
       const containers = Array.isArray(data) ? data : [data];
       if (!containers.length) throw new Error('No packing data found for that item.');
 
+      // v3.4.0 — never reload a shipment we just handed off.
+      if (refuseHandedOffShipment(containers, `Item ${itemCode}`)) {
+        setSibpItemScanEnabled(true);
+        return;
+      }
+
       ShipmentCache.clear();
       ShipmentCache.loadFromGPC(containers);
       ShipmentCache.sourceContainerNo = Session.sibpSourceContainerNo;
       _shipmentGen++; // v3.3.80 — a new shipment is now active
-      Session._piecesThisShipment = 1; // v3.4.0 — runaway-container guard
+      // v3.6.0 — THIS LINE IS THE FALLBACK ONLY, and this is the exact spot
+      // that made the cap useless: on SIBP every item scan reaches here, so
+      // the old scalar guard reset continuously and never counted past 2.
+      // The real guard is PieceCounts, keyed on shipment_header_id, which this
+      // does not touch. Do not "restore" the scalar as the authority.
+      Session._piecesThisShipment = 1;
       refreshExpectedCartonForCurrentShipment(); // v3.3.83 — fire-and-forget; pick up post-tab-open shipments
 
       // Update ship badge with the real shipment number now that GPC has resolved
@@ -4327,7 +6034,10 @@ color: #b91c1c;
       // ── Picker badge ─────────────────────────────────────────────────────
       updatePickerBadge(null);
       fetchLastPickerForTote(Session.sibpSourceContainerNo)
-        .then(username => updatePickerBadge(username))
+        .then(username => {
+          PickerByTote.set(Session.sibpSourceContainerNo, username); // v3.7.0 — error log
+          updatePickerBadge(username);
+        })
         .catch(() => {});
       // ── Ship badge — show tote number immediately, shipment number will
       // update once GPC resolves on first item scan
@@ -4360,10 +6070,22 @@ color: #b91c1c;
       const containers = Array.isArray(data) ? data : [data];
       if (!containers.length) throw new Error('No packing data found for that container.');
 
+      // v3.4.0 — never reload a shipment we just handed off.
+      if (refuseHandedOffShipment(containers, `Tote ${containerNo}`)) {
+        R.toteBtn.disabled = false;
+        if (R.profSel) R.profSel.disabled = false;
+        if (R.locBtn)  R.locBtn.disabled  = false;
+        if (R.locIn)   R.locIn.disabled   = false;
+        return false;
+      }
+
       ShipmentCache.loadFromGPC(containers);
       ShipmentCache.sourceContainerNo = containerNo;
       _shipmentGen++; // v3.3.80 — a new shipment is now active
-      Session._piecesThisShipment = 1; // v3.4.0 — runaway-container guard
+      // v3.6.0 — fallback only; the authority is PieceCounts, keyed on
+      // shipment_header_id and untouched here. A rescan of the same tote must
+      // not hand the shipment a fresh allowance of 12.
+      Session._piecesThisShipment = 1;
       refreshExpectedCartonForCurrentShipment(); // v3.3.83 — fire-and-forget; pick up post-tab-open shipments
 
       // Now we have the shipmentHeaderId — fetch open containers for this shipment
@@ -4426,7 +6148,10 @@ color: #b91c1c;
       // ── Picker badge: fire background lookup, never blocks operator ───────
       updatePickerBadge(null); // clear any previous tote's badge immediately
       fetchLastPickerForTote(containerNo)
-        .then(username => updatePickerBadge(username))
+        .then(username => {
+          PickerByTote.set(containerNo, username);   // v3.7.0 — error log
+          updatePickerBadge(username);
+        })
         .catch(() => {}); // silent fail — informational only
 
       // Multi-tote awareness: if the shipment spans more than one distinct source
@@ -4446,6 +6171,25 @@ color: #b91c1c;
       perfMark('tote load to packing ready', t0, containerNo);
       return true;
     } catch (err) {
+      // v3.6.0 — before reporting a load failure, ask whether this container is
+      // simply past packing. Hooked HERE rather than at the empty-GPC check so
+      // it covers both shapes of "won't load": GPC returning nothing, and GPC
+      // erroring outright. Costs one extra read only on a scan that already
+      // failed, so the happy path is untouched.
+      const handled = await tryConsignPendingContainer(containerNo, t0);
+      if (handled) {
+        renderItems('');
+        // One place rather than at each of the six exits inside: consigned,
+        // refused by status, refused for no profile — the scan is over either
+        // way and the box should be ready for the next one.
+        clearToteInputUnlessRetained();
+        R.toteBtn.disabled = false;
+        if (R.profSel) R.profSel.disabled = false;
+        if (R.locBtn)  R.locBtn.disabled  = false;
+        if (R.locIn)   R.locIn.disabled   = false;
+        return true;
+      }
+
       setStatus(`Load error: ${err.message}`, 'err');
       EventLog.err(`Load error: ${err.message}`);
       renderItems(''); // v3.3.82 — clear loading skeletons on failure
@@ -5135,6 +6879,24 @@ color: #b91c1c;
 
     const remainingBeforeClose = ShipmentCache.pendingItems.length;
 
+    // v3.4.0 — captured BEFORE the try: the catch and the async consign
+    // failure handler both run after resetForNextTote() may have cleared
+    // ShipmentCache and _currentJobId.
+    const shipNoAtClose  = ShipmentCache.shipmentHeader?.shipment_number || null;
+    const shipIdAtClose  = ShipmentCache.shipmentHeader?.id || null;
+    const jobIdAtClose   = _currentJobId || null;
+    const contNoAtClose  = Session.outboundContainer?.container_no || null;
+    const deskAtClose    = Session.packLocationCode || null;
+    // Captured HERE, beside the two above and before the try block, for the
+    // same reason they are: resetForNextTote() clears ShipmentCache before the
+    // consign-failure handoff runs, so resolving the tote inside the failure
+    // handler would read an already-emptied cache and print an em dash.
+    const toteAtClose    = resolveSourceTote();
+    // v3.7.0 — same reason as the five above. The error log needs company,
+    // address, carrier and container dimensions, none of which survive to the
+    // failure handler.
+    const stateAtClose   = _captureErrorState(toteAtClose);
+
     Session.phase = 'CLOSING';
     try {
       const ct = Session.confirmedCartonType || Session.containerType;
@@ -5215,25 +6977,14 @@ color: #b91c1c;
         // run concurrently with (or print ahead of) another shipment's chain.
         const postCloseCallsReady = _enqueueConsign(() => startPostCloseConsigning(consId, closeResp));
         EventLog.ok('All items packed — label printing.');
-        postCloseCallsReady.catch(err => {
-          // Always surface the failure loudly — badge, log, beep, reprint —
-          // even if the operator has already moved on to the next shipment.
-          const shipNo = shipNoForBadge || '—';
-          updateShipBadge(shipNo, true);
-          const msg = err.message || 'Unknown error';
-          setStatus(`⚠ Label failed for ${shipNo}: ${msg}. Fix the shipment in C7 then use ⟳ Reprint.`, 'err');
-          EventLog.err(`Consign failed for ${shipNo}: ${msg}`);
-          beep('err');
-          if (R.reprintBtn && consId) { R.reprintBtn.disabled = false; }
-          // v3.3.80: state/UI mutations only if no newer shipment has loaded —
-          // otherwise these would clobber the shipment the operator is packing.
-          if (_shipmentGen === genAtClose) {
-            setFinalising(false);
-            unlockScanAfterFinalising();
-            Session.phase = 'COMPLETE';
-            if (R.btnClose) { R.btnClose.disabled = true; R.btnClose.style.opacity = '.55'; }
-          }
-        });
+        postCloseCallsReady.catch(err =>
+          _onConsignFailure(err, {
+            shipNo: shipNoForBadge || '—', consId, genAtClose,
+            shipmentHeaderId: shipIdAtClose, jobId: jobIdAtClose,
+            packDesk: deskAtClose, containerNo: contNoAtClose,
+            sourceTote: toteAtClose,
+            state: stateAtClose,   // v3.7.0 — error log
+          }));
         resetForNextTote(postCloseCallsReady, t0);
       }
     } catch (err) {
@@ -5260,6 +7011,27 @@ color: #b91c1c;
         // The last item un-verifies server-side on this failure, so pull the
         // truth back from C7 rather than trusting local scan state.
         _refreshGPCAfterStaleChild(null).catch(() => {});
+
+        // v3.5.0 — every profile. MIBP/SIBP auto-load the same broken shipment
+        // straight back, which is what made this urgent, but a cluster operator
+        // still cannot pack it and still needs it off their station and in
+        // someone's queue.
+        handOffErroredShipment({
+          reason: err.message,
+          stage: 'close-to-container',
+          shipmentNo: shipNoAtClose,
+          shipmentHeaderId: shipIdAtClose,
+          jobId: jobIdAtClose,
+          packDesk: deskAtClose,
+          containerNo: contNoAtClose,
+          sourceTote: toteAtClose,
+          // v3.7.0 — consignmentId is deliberately null here, not consId.
+          // Two reasons: `const consId` is scoped to the try block above and
+          // is not visible in this catch, and semantically the close is what
+          // CREATES the consignment — if the close was rejected there is no
+          // consignment to name.
+          error: err, consignmentId: null, state: stateAtClose,
+        }).then(() => resetForNextTote()).catch(() => {});
       } else {
         setStatus(`Close error: ${err.message}`, 'err');
         EventLog.err(`Close container failed: ${err.message}`);
@@ -5268,6 +7040,58 @@ color: #b91c1c;
       }
     }
     if (Session.phase === 'PACKING') R.btnClose.disabled = false;
+  }
+
+  /**
+   * The consign/label chain for a CLOSED shipment failed.
+   *
+   * This runs asynchronously and, on SIBP/MIBP, usually lands AFTER the next
+   * shipment has already auto-loaded. Anything that describes "the shipment on
+   * screen" must therefore be gated on the shipment generation; only things
+   * that describe "a shipment that failed" may fire unconditionally.
+   *
+   * v3.4.0 — the shipment badge moved behind that gate. It was repainting the
+   * newly loaded shipment's badge with the FAILED shipment's number (in red),
+   * so operators could not tell what they were packing. The failed number is
+   * already in the event log and in the status line, which is where it belongs.
+   */
+  function _onConsignFailure(err, {
+    shipNo = '—', consId = null, genAtClose = null,
+    shipmentHeaderId = null, jobId = null, packDesk = null, containerNo = null,
+    sourceTote = null,
+    state = null,   // v3.7.0 — error log, captured at close time
+  } = {}) {
+    const msg = err?.message || 'Unknown error';
+
+    // Unconditional — these name the failed shipment explicitly and never
+    // claim to describe what is currently loaded.
+    setStatus(`⚠ Label failed for ${shipNo}: ${msg}. Fix the shipment in C7 then use ⟳ Reprint.`, 'err');
+    EventLog.err(`Consign failed for ${shipNo}: ${msg}`);
+    beep('err');
+    if (R.reprintBtn && consId) { R.reprintBtn.disabled = false; }
+
+    // v3.5.0 — the shipment is closed but its label is broken. Hand the job to
+    // Jamieson rather than leaving a consigned-but-unlabelled shipment with no
+    // owner. Fires regardless of the generation gate below: the shipment
+    // errored either way, and every profile needs it owned by someone.
+    handOffErroredShipment({
+      reason: msg, stage: 'consign/label',
+      shipmentNo: shipNo, shipmentHeaderId, jobId, packDesk, containerNo,
+      sourceTote,
+      error: err, consignmentId: consId, state,   // v3.7.0 — error log
+    }).catch(() => {});
+
+    // Gated — only if no newer shipment has loaded, or these clobber the
+    // shipment the operator is now packing.
+    if (genAtClose !== null && _shipmentGen !== genAtClose) {
+      EventLog.err(`(${shipNo} badge not shown — a newer shipment is loaded.)`);
+      return;
+    }
+    updateShipBadge(shipNo, true);
+    setFinalising(false);
+    unlockScanAfterFinalising();
+    Session.phase = 'COMPLETE';
+    if (R.btnClose) { R.btnClose.disabled = true; R.btnClose.style.opacity = '.55'; }
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -5281,11 +7105,92 @@ color: #b91c1c;
    */
   const MAX_PIECES_PER_SHIPMENT = 12;
 
+  /**
+   * Outbound pieces created per shipment — keyed on shipment_header_id and
+   * persisted to localStorage.
+   *
+   * v3.6.0 — this was a single counter on Session, reset to 1 on every GPC
+   * load. On SIBP every ITEM SCAN is a GPC load, so it reset continuously and
+   * MAX_PIECES_PER_SHIPMENT never accumulated past 2 — on precisely the profile
+   * where the runaway happened (shipment 256682##1, header 737674, 31 Aug,
+   * 08:44–11:50, 2,311 containers). The guard was never broken and its
+   * arithmetic was never wrong. It was simply never allowed to count.
+   *
+   * Keyed on the shipment so a tote rescan, an auto-reload or a hundred item
+   * scans cannot reset it. Persisted so that a page refresh part-way through a
+   * runaway does not hand the loop a fresh allowance of 12 — which is the
+   * failure mode an in-memory fix would still have.
+   *
+   * Pruned by age and count: this must not grow without bound in an operator's
+   * browser, and a shipment nobody has touched in a day is not the one looping.
+   */
+  const PIECE_COUNT_KEY      = 'malpaPack.pieceCounts.v1';
+  const PIECE_COUNT_MAX_AGE  = 24 * 60 * 60 * 1000; // one shift, generously
+  const PIECE_COUNT_MAX_KEYS = 50;
+
+  const PieceCounts = {
+    _read() {
+      try {
+        const raw = localStorage.getItem(PIECE_COUNT_KEY);
+        const obj = raw ? JSON.parse(raw) : {};
+        return (obj && typeof obj === 'object' && !Array.isArray(obj)) ? obj : {};
+      } catch (_) { return {}; }
+    },
+    _write(map) {
+      try { localStorage.setItem(PIECE_COUNT_KEY, JSON.stringify(map)); } catch (_) {}
+    },
+    _prune(map) {
+      const cutoff = Date.now() - PIECE_COUNT_MAX_AGE;
+      for (const k of Object.keys(map)) {
+        if (!map[k] || Number(map[k].at || 0) < cutoff) delete map[k];
+      }
+      const keys = Object.keys(map);
+      if (keys.length > PIECE_COUNT_MAX_KEYS) {
+        keys.sort((a, b) => Number(map[a].at || 0) - Number(map[b].at || 0))
+            .slice(0, keys.length - PIECE_COUNT_MAX_KEYS)
+            .forEach(k => delete map[k]);
+      }
+      return map;
+    },
+    get(shipmentHeaderId) {
+      if (!shipmentHeaderId) return null;
+      const e = this._prune(this._read())[String(shipmentHeaderId)];
+      return e ? (Number(e.n) || 1) : 1;
+    },
+    set(shipmentHeaderId, n) {
+      if (!shipmentHeaderId) return null;
+      const map = this._prune(this._read());
+      map[String(shipmentHeaderId)] = { n: Number(n) || 1, at: Date.now() };
+      this._write(map);
+      return Number(n) || 1;
+    },
+    clear() { try { localStorage.removeItem(PIECE_COUNT_KEY); } catch (_) {} },
+  };
+
+  /**
+   * Pieces created so far for the loaded shipment.
+   *
+   * The keyed store is the authority whenever we know which shipment we are
+   * on. `Session._piecesThisShipment` survives only as the fallback for the
+   * case where we do not — losing the guard entirely there would be worse than
+   * a counter that can be reset.
+   */
+  function piecesForCurrentShipment() {
+    const shId = ShipmentCache.shipmentHeader?.id || null;
+    return shId ? PieceCounts.get(shId) : (Session._piecesThisShipment || 1);
+  }
+
+  function setPiecesForCurrentShipment(n) {
+    const shId = ShipmentCache.shipmentHeader?.id || null;
+    Session._piecesThisShipment = n; // keep the fallback in step
+    if (shId) PieceCounts.set(shId, n);
+  }
+
   async function onNewContainer({ verifyOpen = false } = {}) {
     if (Session.phase !== 'COMPLETE' && Session.phase !== 'PACKING') return;
 
     // ── Runaway guard ────────────────────────────────────────────────────────
-    const pieceNo = (Session._piecesThisShipment || 1) + 1;
+    const pieceNo = (piecesForCurrentShipment() || 1) + 1;
     if (pieceNo > MAX_PIECES_PER_SHIPMENT) {
       Session.phase = 'PACKING';
       setStatus(
@@ -5325,7 +7230,7 @@ color: #b91c1c;
     // load. We only pay it when the close was doubtful (soft-500 / unverified)
     // or when this shipment has already run to several pieces.
     let openContainers = [];
-    const mustVerify = verifyOpen || (Session._piecesThisShipment || 1) >= 3;
+    const mustVerify = verifyOpen || (piecesForCurrentShipment() || 1) >= 3;
     if (mustVerify) {
       try {
         const shId = ShipmentCache.shipmentHeader?.id;
@@ -5336,7 +7241,7 @@ color: #b91c1c;
     if (openContainers.length) {
       EventLog.ok(`Reusing already-open container ${openContainers[0].container_no} instead of creating a new piece.`);
     } else {
-      Session._piecesThisShipment = pieceNo;
+      setPiecesForCurrentShipment(pieceNo);
     }
 
     await initiateContainerCreation(openContainers);
@@ -6127,20 +8032,67 @@ color: #b91c1c;
   try {
     const _g = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
     _g.__malpaPack = {
-      VERSION: '3.4.0',
-      Session, ShipmentCache, SourceToteCache, Workflow, R,
+      // Read from the @version header rather than hand-maintained here. This
+      // said '3.4.0' right through the 3.5.0 release and every change on
+      // 10–11 Sep, so anyone checking the running build was told the wrong
+      // answer with total confidence. GM_info is absent in the Node test
+      // harness, hence the literal fallback.
+      VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '3.7.0',
+      Session, ShipmentCache, SourceToteCache, Workflow, R, EventLog,
+      // v3.7.0 — error log internals, so the pipeline can be inspected from
+      // the console on a bench instead of guessed at from null columns.
+      ShipmentSnapshot, PickerByTote, reportPackError, ERROR_LOG_URL,
       // failure-mode 1
       looksLikeHardCloseFailure,
       verifyContainerClosed,
       closeContainer,
       onNewContainer,
       MAX_PIECES_PER_SHIPMENT,
+      PieceCounts,
+      piecesForCurrentShipment,
+      setPiecesForCurrentShipment,
       CLOSE_HARD_FAIL_SIGNATURES,
       // failure-mode 2
       getDetailsRemaining,
       loadToteInventoryDetailsInBackground,
       resetForNextTote,
       maybeAutoLoadRetainedTote,
+      _onConsignFailure,
+      updateShipBadge,
+      ErroredShipments,
+      handOffErroredShipment,
+      refuseHandedOffShipment,
+      renderErrorLogInto,
+      showHandoffBanner,
+      assignJobToUser,
+      unassignJob,
+      printErrorSheet,
+      resolveSourceTote,
+      currentOperatorName,
+      currentOperatorWmsId,
+      findJobToHandOff,
+      clearToteInputUnlessRetained,
+      // consign-only path
+      tryConsignPendingContainer,
+      fetchConsigningContainer,
+      CONSIGNING_PENDING_STATUS_ID,
+      createConsignmentPieces,
+      // handy from the browser console when poking at endpoints
+      apiGet,
+      apiPost,
+      fetchPackerForContainer,
+      resolvePackDeskPrinter,
+      clearPrinterCache() { _printerCache = null; },
+      fmtSheetTime,
+      retoolWorkflowPost,
+      HANDOFF_USER_ID,
+      HANDOFF_USER_NAME,
+      ERROR_SHEET_TEMPLATE_ID,
+      get errorSheetConfigured() {
+        return !!(ERROR_SHEET_WORKFLOW_URL && ERROR_SHEET_WORKFLOW_KEY);
+      },
+      get shipmentGen() { return _shipmentGen; },
+      bumpShipmentGen() { _shipmentGen++; },
       renderItems,
     };
   } catch (_) {}
