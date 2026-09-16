@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Pick
 // @namespace    https://malpa.canary7.com
-// @version      4.11.0
+// @version      4.13.0
 // @description  Picking interface for Canary7 WMS - TC51 optimised
 // @author       Malpa 3PL
 // @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-pick.user.js
@@ -1371,6 +1371,7 @@
     jobId: null,
     instruction: null,
     groupRecord: null,
+    groupRecordFailed: false,   // grouped instr whose group record would not load
     summary: null,
     containersByPosition: {},
     scanCount: 0,
@@ -1392,6 +1393,7 @@
       this.jobId = null;
       this.instruction = null;
       this.groupRecord = null;
+      this.groupRecordFailed = false;
       this.summary = null;
       this.containersByPosition = {};
       this.scanCount = 0;
@@ -3769,19 +3771,28 @@
   // Fetch group record for a grouped instruction - stores in State.groupRecord
   async function loadGroupRecordIfNeeded(instruction) {
     const groupId = instruction?.job_instruction_group_id;
+    State.groupRecordFailed = false;
     if (!groupId) {
       State.groupRecord = null;
       return;
     }
+    const EXPAND = encodeURIComponent(
+      'fromLocation,toLocation,item.itemUnitOfMeasures.unitOfMeasure,' +
+      'item.itemUnitOfMeasures.itemUnitOfMeasureReference,batch,license_plate_no,' +
+      'shipmentNumber,itemUnitOfMeasure.unitOfMeasure,jobInstructionGroup.id'
+    );
+    const _fetch = () => apiGet(
+      `shipment/shipment-picking-profile/get-job-instruction-groups&id=${groupId}&expand=${EXPAND}`
+    );
     try {
-      const EXPAND = encodeURIComponent(
-        'fromLocation,toLocation,item.itemUnitOfMeasures.unitOfMeasure,' +
-        'item.itemUnitOfMeasures.itemUnitOfMeasureReference,batch,license_plate_no,' +
-        'shipmentNumber,itemUnitOfMeasure.unitOfMeasure,jobInstructionGroup.id'
-      );
-      const data = await apiGet(
-        `shipment/shipment-picking-profile/get-job-instruction-groups&id=${groupId}&expand=${EXPAND}`
-      );
+      let data;
+      try {
+        data = await _fetch();
+      } catch (firstErr) {
+        if (firstErr.message?.includes('Session expired')) throw firstErr;
+        await new Promise(r => setTimeout(r, 600));
+        data = await _fetch();
+      }
       const arr = Array.isArray(data) ? data : [];
       State.groupRecord = arr[0] || null;
       console.log('[MalpaPick] groupRecord loaded:', State.groupRecord);
@@ -3789,6 +3800,24 @@
       console.warn('[MalpaPick] loadGroupRecordIfNeeded failed:', e.message);
       State.groupRecord = null;
     }
+    // A grouped instruction with no usable group record is NOT safe to fall
+    // through on. effectiveQty()/displayQty() would silently drop back to
+    // instruction.quantity -- the PER-SHIPMENT qty -- so a group of 4 spread
+    // over 2 shipments would read as 2. C7 then rejects the perform with
+    // "Less Units Picking Not Availabe for Grouped Items" and the picker has
+    // no way to know why. Flag it and block at scan time instead.
+    if (!State.groupRecord || !State.groupRecord.units) {
+      State.groupRecordFailed = true;
+      console.warn('[MalpaPick] grouped instruction', instruction?.id,
+                   'has no usable group record - pick blocked');
+      try { reportPickError(new Error('groupRecord unavailable for group ' + groupId)); } catch (_) {}
+    }
+  }
+
+  // True when we cannot trust the quantity for this instruction.
+  function groupQtyUnavailable(instruction) {
+    return !!instruction?.job_instruction_group_id &&
+           (State.groupRecordFailed || !State.groupRecord?.units);
   }
 
   // Effective quantity to show and pick:
@@ -3815,6 +3844,22 @@
     const divided = raw / factor;
     // Return integer if clean division, otherwise 2dp
     return Number.isInteger(divided) ? divided : parseFloat(divided.toFixed(2));
+  }
+
+  // Convert a DISPLAY quantity (what the picker sees and taps -- cartons,
+  // pallets, whatever the UoM is) into the RAW each-count C7 wants in
+  // picking_qty. State.scanCount is always in display units; effectiveQty()
+  // is always raw. Mixing them sends 3 where C7 expects 18 on a factor-6 SKU.
+  // For grouped instructions groupRecord.units is already the value C7 wants,
+  // so it passes straight through.
+  function toRawQty(instruction, displayUnits) {
+    if (instruction?.job_instruction_group_id && State.groupRecord?.units) {
+      return displayUnits;
+    }
+    const factor = instruction?.itemUnitOfMeasure?.factor || 1;
+    if (factor <= 1) return displayUnits;
+    const raw = displayUnits * factor;
+    return Number.isInteger(raw) ? raw : Math.round(raw);
   }
 
   // Group-perform API call
@@ -4145,7 +4190,19 @@
       return;
     }
 
-    const qty = effectiveQty(State.instruction);
+    // Grouped instruction whose group record never loaded -- we do not know
+    // the real quantity, so refuse rather than pick the wrong number.
+    if (groupQtyUnavailable(State.instruction)) {
+      setScanFeedback('Group qty unavailable - back out and re-open the job', 'err');
+      Audio.chime('error');
+      Voice.error('Group quantity unavailable');
+      if (navigator.vibrate) navigator.vibrate([60, 30, 60]);
+      return;
+    }
+
+    // Display units, not raw eaches: a factor-6 carton pick of 6 is ONE
+    // carton to the picker and must not open the numpad.
+    const qty = displayQty(State.instruction);
 
     if (qty === 1) {
       setScanFeedback('Item verified v', 'ok');
@@ -4277,7 +4334,17 @@
     setScanFeedback('Confirming?', 'dim');
 
     try {
-      const pickQty = State.scanCount || effectiveQty(State.instruction);
+      if (groupQtyUnavailable(State.instruction)) {
+        setScanFeedback('Group qty unavailable - back out and re-open the job', 'err');
+        Audio.chime('error');
+        Voice.error('Group quantity unavailable');
+        if (R.scanIn) { R.scanIn.disabled = false; R.scanIn.focus(); }
+        return;
+      }
+      // scanCount is in DISPLAY units; C7 wants raw eaches.
+      const pickQty = State.scanCount
+        ? toRawQty(State.instruction, State.scanCount)
+        : effectiveQty(State.instruction);
       const _doPerform = () => State.instruction.job_instruction_group_id
         ? groupPerform(State.instruction, label, pickQty)
         : performPick(State.instruction, label, pickQty);
@@ -4380,17 +4447,41 @@
     overlay.className = 'mpk-numpad-overlay';
     overlay.id = 'mpk-numpad-overlay';
 
+    // Inline error line inside the numpad sheet. The overlay covers the pick
+    // screen's own feedback strip, so anything reported via setScanFeedback()
+    // while the numpad is open is invisible to the picker -- it has to surface
+    // here or nowhere.
+    const _showQtyError = (msg) => {
+      const el = overlay.querySelector('#mpk-numpad-err');
+      if (el) {
+        el.textContent = msg;
+        el.style.display = 'block';
+      }
+      Audio.chime('error');
+      Voice.error('Pick all units');
+      if (navigator.vibrate) navigator.vibrate([60, 30, 60]);
+    };
+
     const render = () => {
       const requiredQty = displayQty(State.instruction);
-      // Default display: 1 (picker has scanned 1 item to trigger the modal)
-      // Shows the required qty as a target hint below
-      const display = entered || '1';
+      const isGrouped   = !!State.instruction?.job_instruction_group_id;
+      // Default display = the full required qty, NOT a hardcoded 1.
+      //
+      // Grouped (SIBP/MIBP) instructions are all-or-nothing server-side: C7
+      // rejects any picking_qty below the group total with
+      //   "Less Units Picking Not Availabe for Grouped Items"   (sic)
+      // Confirmed live 2026-09-17 against MA-TRL group 61299 (2 shipments x
+      // 2 units, groupRecord.units = 4). Seeding the display with '1' meant a
+      // picker who tapped Confirm without typing sent picking_qty=1 and
+      // guaranteed a server rejection on every multi-unit group.
+      const display = entered || String(requiredQty);
       overlay.innerHTML = `
         <div class="mpk-numpad-sheet">
           <div class="mpk-numpad-display">
             ${_esc(display)}
             <span class="mpk-numpad-target">of ${requiredQty} required</span>
           </div>
+          <div id="mpk-numpad-err" style="display:none;margin:2px 8px 4px;padding:6px 8px;border-radius:4px;background:#3a1416;color:#ff6b6b;font-size:12px;font-weight:700;text-align:center;line-height:1.3"></div>
           <div class="mpk-numpad-grid">
             <button class="mpk-numpad-key" data-k="1">1</button>
             <button class="mpk-numpad-key" data-k="2">2</button>
@@ -4421,9 +4512,16 @@
             _firstKey = entered.length === 0;
             render();
           } else if (k === 'confirm') {
-            let val = entered ? parseInt(entered, 10) : 1;
+            let val = entered ? parseInt(entered, 10) : requiredQty;
             if (!val || val < 1) return;
-            if (val > requiredQty) val = requiredQty; // final guard -- never exceed
+            if (val > requiredQty) val = requiredQty; // ceiling -- never exceed
+            // Floor guard. A grouped pick cannot be split: surface it here
+            // rather than letting C7 bounce it back as an opaque error after
+            // the picker has already walked on to the tote scan.
+            if (isGrouped && val < requiredQty) {
+              _showQtyError(`All ${requiredQty} required - a grouped pick cannot be split. Short? Use Short Pick.`);
+              return;
+            }
             overlay.remove();
             State.scanCount = val;
             fireItemVerification(State.instruction);
@@ -4475,7 +4573,11 @@
 
   // Called when scanning additional items while numpad overlay is open
   function onQtyModalScan(barcode) {
-    const qty = effectiveQty(State.instruction);
+    // Display units -- scanCount counts physical scans, so the target it is
+    // compared against must be the display qty. Against raw eaches the
+    // auto-confirm and the overscan block would both never fire on a
+    // multi-each UoM.
+    const qty = displayQty(State.instruction);
 
     // Block further scans once target reached -- prevents overscan
     if (State.scanCount >= qty) {
