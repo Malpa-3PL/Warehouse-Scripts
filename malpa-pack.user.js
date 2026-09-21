@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Pack v3
 // @namespace    https://malpa.canary7.com
-// @version      3.7.0
+// @version      3.7.1
 // @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-pack.user.js
 // @downloadURL  https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-pack.user.js
 // @description  High-throughput packing station for Canary7 WMS — optimistic scanning, async API queue, dynamic profiles
@@ -2383,6 +2383,90 @@
     return carry(new Error(detail));
   }
 
+  // The carrier rejects a consignment when any parcel on it has no weight.
+  // In practice that parcel is the SOURCE PICKING TOTE: the pick creates a
+  // container row against the shipment carrying the same consignment_id, and
+  // once packing moves the units into the outbound satchel that row is left
+  // behind — empty, no weight, still on the consignment. Canary7 counts it
+  // (`no_of_containers: 2`, `container_type: "Multiple"`) and Australia Post
+  // refuses the lot.
+  //
+  // Confirmed on shipment 20614 / header 778063 (22 Sep): tote G512, class 3,
+  // to_container null, weight null, zero children, consignment_id 1306689 —
+  // alongside satchel AC000000766930 at 0.346kg holding both units.
+  //
+  // cleanupEmptyClosedContainers cannot help: it only considers status 7 AND
+  // to_container 1, and this row is status 5 with to_container null.
+  const EMPTY_PARCEL_ERROR_RE = /parcels?\s+must\s+have\s+a\s+weight/i;
+
+  /**
+   * Delete every container on a shipment that holds nothing.
+   *
+   * Emptiness is the only test — status is deliberately NOT considered
+   * (Zaynne, 22 Sep): a container with no children is not a parcel whatever
+   * Canary7 thinks its status is.
+   *
+   * @returns {string[]} container numbers actually removed, VERIFIED gone.
+   *   Empty array means "changed nothing" — so the caller must not retry and
+   *   must report the original failure.
+   */
+  async function deleteEmptyContainersForShipment(shipmentHeaderId) {
+    if (!shipmentHeaderId) return [];
+    const list = () => apiGet(
+      `shipment/shipment-container` +
+      `&shipment_header_id=${shipmentHeaderId}` +
+      `&expand=shipmentDetailChildren` +
+      `&per-page=50&page=1`
+    );
+    const rowsOf = (d) => (Array.isArray(d) ? d : (d?.items || []))
+      .filter(c => c && c.shipment_header_id === shipmentHeaderId);
+
+    const removed = [];
+    try {
+      const rows   = rowsOf(await list());
+      const empty  = rows.filter(c => (c.shipmentDetailChildren || []).length === 0);
+      const filled = rows.filter(c => (c.shipmentDetailChildren || []).length > 0);
+      if (!empty.length) return [];
+
+      // Never strip a shipment of every container. If nothing holds stock then
+      // something is wrong upstream and deleting is not the answer.
+      if (!filled.length) {
+        EventLog.err('Every container on this shipment is empty — not deleting any.');
+        return [];
+      }
+
+      for (const c of empty) {
+        try {
+          await apiDelete(`shipment/shipment-container/delete&id=${c.id}`);
+          removed.push(c.container_no || String(c.id));
+        } catch (e) {
+          // FK violations are common here — see the SQLSTATE[23000] rows in the
+          // error log. Fail soft; the caller reports the original consign error.
+          EventLog.err(`Could not remove empty container ${c.container_no}: ${e.message}`);
+        }
+      }
+      if (!removed.length) return [];
+
+      // VERIFY. A Canary7 200 means the request was accepted, never that the
+      // thing happened — this codebase has been caught by that three times.
+      // Retrying a consign on the strength of a delete that did not land would
+      // just produce the same failure with an extra call in front of it.
+      const after = rowsOf(await list()).map(c => c.container_no);
+      const survived = removed.filter(no => after.includes(no));
+      if (survived.length) {
+        EventLog.err(`Still on the shipment after delete: ${survived.join(', ')} — not retrying.`);
+        return [];
+      }
+
+      EventLog.ok(`Removed empty container(s) from the shipment: ${removed.join(', ')}.`);
+      orBreadcrumb('empty_container_removed', { count: removed.length, containers: removed.join(',') });
+      return removed;
+    } catch (err) {
+      EventLog.err(`Empty-container cleanup failed: ${err.message}`);
+      return [];
+    }
+  }
+
   function startPostCloseConsigning(consignmentId, closeResp = {}) {
     // SIBP is pre-consigned. Do not create pieces and do not call
     // set-carrier-piece-no here; live tests returned C7 500s for that endpoint.
@@ -2403,7 +2487,9 @@
       R.reprintBtn.disabled = false;
       R.reprintBtn.title = `Reprint label for consignment ${consignmentId}`;
     }
-    return createConsignmentPieces(consignmentId)
+    const shipmentHeaderId = ShipmentCache.shipmentHeader?.id || null;
+
+    const runChain = () => createConsignmentPieces(consignmentId)
       .then(() => setCarrierPieceNo(consignmentId, containerNo))
       .then(body => {
         const tracking = normalizePiecesResponse(body)
@@ -2411,13 +2497,43 @@
           .filter(Boolean)
           .join(', ');
         if (tracking) console.log('[MalpaPack] Tracking number assigned:', tracking);
-      })
-      .catch(err => {
-        // v3.3.84: surface the server's ACTUAL error (nested carrier detail and
-        // all), and only fall back to the phone/email/weight heuristics when C7's
-        // message is genuinely vague — never bury a specific carrier error.
-        throw annotateConsignError(err);
       });
+
+    return runChain().catch(async (err) => {
+      const msg = String(err?.message || err?._body?.message || '');
+
+      // v3.7.1 — ONE automatic recovery, and only for the weightless-parcel
+      // rejection. This is the manual fix the floor already performs — delete
+      // the empty container, consign again — so it is automating a known-good
+      // procedure rather than guessing at a new one.
+      //
+      // Nothing is reported while this is working: a recovery that succeeds is
+      // not an error the operator or the error log needs to hear about
+      // (Zaynne, 22 Sep). Only a failed RETRY throws.
+      if (EMPTY_PARCEL_ERROR_RE.test(msg)) {
+        EventLog.err('Carrier refused — a parcel on this shipment has no weight. Removing empty containers and retrying.');
+        const removed = await deleteEmptyContainersForShipment(shipmentHeaderId);
+        if (removed.length) {
+          try {
+            await runChain();
+            EventLog.ok(`Consigned after removing ${removed.join(', ')}.`);
+            orBreadcrumb('consign_recovered', { containers: removed.join(','), after: 'empty_parcel' });
+            return;
+          } catch (retryErr) {
+            // The retry is the one that gets reported. If this still fails the
+            // empty container was not the cause, and the real error is here.
+            throw annotateConsignError(retryErr);
+          }
+        }
+        // Nothing was removed — fall through and report the original failure
+        // rather than a misleading one about the cleanup.
+      }
+
+      // v3.3.84: surface the server's ACTUAL error (nested carrier detail and
+      // all), and only fall back to the phone/email/weight heuristics when C7's
+      // message is genuinely vague — never bury a specific carrier error.
+      throw annotateConsignError(err);
+    });
   }
 
   /** Track the last successfully consigned consignment_id for reprint */
@@ -8077,6 +8193,10 @@ color: #b91c1c;
       fetchConsigningContainer,
       CONSIGNING_PENDING_STATUS_ID,
       createConsignmentPieces,
+      // empty-parcel recovery
+      deleteEmptyContainersForShipment,
+      startPostCloseConsigning,
+      EMPTY_PARCEL_ERROR_RE,
       // handy from the browser console when poking at endpoints
       apiGet,
       apiPost,
