@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Receiving
 // @namespace    https://malpa.canary7.com
-// @version      2.4.3
+// @version      2.4.4
 // @description  Fast single-screen receiving for Canary7 WMS - TC51 optimised
 // @author       Malpa 3PL
 // @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-receiving.user.js
@@ -1064,8 +1064,26 @@
       `&detail_id=${detail.id}`);
   }
 
-  async function postCheckin(detail, item, uom, qty, locationId) {
+  async function postCheckin(detail, item, uom, qty, locationId, batch) {
     const p = State.profile;
+    // `batch` is snapshotted by doCheckin with its other inputs, so a retry after
+    // an await cannot pick up a State.cur that has since been reset or swapped.
+    const c = batch || {};
+    if (isBatch(item) && !String(c.batchNo || '').trim()) {
+      // Fail locally, before any request: never post a batch item with no batch.
+      throw new Error('Batch number is required');
+    }
+    // Batch-tracked items MUST carry batch_no and batch_expiry. C7's PHP reads
+    // $body['batch_no'] directly, so leaving the key out fails with
+    // 'Undefined array key "batch_no"' before anything is written. Key names are
+    // copied from C7's own receiving screen (HAR, RCV26092201 / NFSGW375):
+    //   "batch_no": "20260926", "batch_expiry": null
+    // Non-batch items keep the exact body they always had - C7 accepts those
+    // without the keys, and that path is proven in production.
+    const batchFields = isBatch(item) ? {
+      batch_no:     c?.batchNo || '',
+      batch_expiry: _toDateInput(c?.expiry) || null,   // YYYY-MM-DD, or null
+    } : {};
     return apiPost('receiving/receiving/checkin', {
       receipt_detail:          sanitizeDetail(detail),
       label_quantity:          0,
@@ -1073,6 +1091,7 @@
       receiving_profile_id:    p.id,
       item_id:                 item.id,
       item_unit_of_measure_id: uom.id,
+      ...batchFields,
       quantity:                qty,
       reason_code:             null,
       comments:                null,
@@ -2097,6 +2116,13 @@
   async function doCheckin() {
     const c = State.cur;
     if (!c || !c.location || _writeInFlight) return;
+    // Never post a batch item without its batch. Checked here, before the write
+    // latch, so nothing is sent and the operator lands back on the batch row.
+    if (isBatch(c.item) && !String(c.batchNo || '').trim()) {
+      c.batchDone = false;
+      reject('Batch number is required');
+      return;
+    }
     _writeInFlight = true;
 
     State.busy = 'Checking in...';
@@ -2112,11 +2138,12 @@
     const uomLabel   = uomName(c.uom);
     const baseQty    = qty;                       // quantity is already base units
     const openBefore = c.detail.open_quantity || 0;
+    const batchSnap  = { batchNo: c.batchNo, expiry: c.expiry };
 
     try {
       let result, recoveredOpen = null;
       try {
-        result = await postCheckin(c.detail, c.item, c.uom, qty, locRec.id);
+        result = await postCheckin(c.detail, c.item, c.uom, qty, locRec.id, batchSnap);
       } catch (firstErr) {
         if (firstErr.code === 'SESSION_EXPIRED') throw firstErr;
         // Deterministic refusal - nothing was written, so surface it now.
@@ -2151,7 +2178,7 @@
             if (i >= 0) State.details[i] = { ...State.details[i], ...fresh };
           }
           await new Promise(r => setTimeout(r, 400));
-          result = await postCheckin(c.detail, c.item, c.uom, qty, locRec.id);
+          result = await postCheckin(c.detail, c.item, c.uom, qty, locRec.id, batchSnap);
         }
       }
 
