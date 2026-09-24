@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Pack v3
 // @namespace    https://malpa.canary7.com
-// @version      3.7.1
+// @version      3.8.0
 // @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-pack.user.js
 // @downloadURL  https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-pack.user.js
 // @description  High-throughput packing station for Canary7 WMS — optimistic scanning, async API queue, dynamic profiles
@@ -1385,6 +1385,129 @@
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
+  // 4c. CARTON OVERRIDE LOG                                          (v3.8.0)
+  //
+  //     When a packer scans a carton that differs from the one the pack screen
+  //     suggested, post one row to pack_log.carton_overrides via canary7-proxy.
+  //     Scanning the suggested carton, or the blank "confirm" scan, logs nothing.
+  //
+  //     Same rules as the error log: fire-and-forget over GM_xmlhttpRequest
+  //     (the proxy is plain http, so a page fetch would be blocked as mixed
+  //     content), never throws, never delays the close.
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  const CARTON_LOG_URL = 'http://192.168.1.27:8790/carton-override';
+
+  // The suggestion is ONE carton for the whole shipment. On piece 2+ of a
+  // multi-container shipment the scanned carton is expected to differ, and with
+  // no piece-number column those rows would be indistinguishable from genuine
+  // overrides. Multi-container shipments were 1.0% of all orders over the 90
+  // days to 24 Sep 2026 (2.3% of carton-packed ones), so only the first piece
+  // is logged. Set true to log every piece.
+  const CARTON_LOG_EVERY_PIECE = false;
+
+  // From Canary7's shipment_type table, read 24 Sep 2026. An unknown id logs as
+  // "type <id>" rather than null, so a newly added type shows up instead of
+  // silently vanishing from the report.
+  const SHIPMENT_TYPE_NAMES = {
+    1: 'Sales Order',
+    3: 'SIBP (Single Item Bulk Processing)',
+    4: 'Cluster Picking',
+    6: 'Wholesale',
+    7: 'LOCOD (Label On Carton Out Door)',
+    8: 'MIBP (Multi Item Bulk Processing)',
+    9: 'Bulky Cluster',
+    10: 'Wavepick Cluster',
+    11: 'Order Hold',
+  };
+
+  // One row per shipment + piece. A close that fails and is retried would
+  // otherwise log the same override twice.
+  const _cartonOverrideLogged = new Set();
+
+  /** item_category_1 for each shipment detail line, in order: "3, 3, 4". */
+  function _itemCategoriesForLog() {
+    const seen = new Set();
+    const cats = [];
+    for (const t of ShipmentCache.allItems || []) {
+      const sd = t.child?.shipmentDetail || {};
+      // One detail line can be split across several children (UOM or
+      // allocation splits). Count the DETAIL once, as specified.
+      const key = sd.id ?? t.child?.shipment_detail_id ?? t.child?.id;
+      if (key != null && seen.has(key)) continue;
+      if (key != null) seen.add(key);
+      const c = sd.item?.item_category_1;
+      cats.push(c === null || c === undefined || c === '' ? '-' : String(c));
+    }
+    return cats.length ? cats.join(', ') : null;
+  }
+
+  /** shipment_header.shipment_detail_qty_sum, falling back to summing the children. */
+  function _shipmentQtyTotalForLog() {
+    const sh = ShipmentCache.shipmentHeader || {};
+    const n = Number(sh.shipment_detail_qty_sum ?? sh.total_quantity);
+    if (Number.isFinite(n) && n > 0) return n;
+    const sum = (ShipmentCache.allItems || [])
+      .reduce((a, t) => a + (Number(t._originalRequired ?? t.required) || 0), 0);
+    return sum || null;
+  }
+
+  function buildCartonOverridePayload(suggested, scanned) {
+    const sh = ShipmentCache.shipmentHeader || {};
+    const typeId = sh.shipment_type_id;
+    return {
+      company:            ShipmentCache.company?.company_code || null,
+      shipment_number:    sh.shipment_number || null,
+      item_categories:    _itemCategoriesForLog(),
+      // 'None' when the lookup had nothing for this shipment (NOT IN LOOKUP /
+      // LOOKUP UNAVAILABLE). Those rows are the shipments the carton lookup
+      // is missing — kept on purpose.
+      suggested_carton:   suggested ? cartonLabel(suggested) : 'None',
+      scanned_carton:     cartonLabel(scanned),
+      shipment_qty_total: _shipmentQtyTotalForLog(),
+      shipment_type:      typeId == null ? null : (SHIPMENT_TYPE_NAMES[typeId] || `type ${typeId}`),
+      packer:             currentOperatorName(),
+    };
+  }
+
+  /**
+   * Log a carton override if — and only if — the packer scanned a different
+   * carton from the suggestion, OR scanned a carton when there was no
+   * suggestion at all (logged with suggested_carton = 'None').
+   * Scanning the suggested carton logs nothing.
+   */
+  function reportCartonOverride(suggested, scanned) {
+    try {
+      if (!scanned) return;
+      if (suggested && (suggested === scanned
+          || (suggested.id != null && suggested.id === scanned.id))) return;
+
+      const piece = piecesForCurrentShipment() || 1;
+      if (!CARTON_LOG_EVERY_PIECE && piece > 1) return;
+
+      const shKey = ShipmentCache.shipmentHeader?.id || ShipmentCache.shipmentHeaderId || '?';
+      const dedupeKey = `${shKey}:${piece}`;
+      if (_cartonOverrideLogged.has(dedupeKey)) return;
+      _cartonOverrideLogged.add(dedupeKey);
+
+      if (typeof GM_xmlhttpRequest !== 'function') return;   // no grant, no send
+
+      GM_xmlhttpRequest({
+        method: 'POST',
+        url: CARTON_LOG_URL,
+        headers: { 'Content-Type': 'application/json' },
+        data: JSON.stringify(buildCartonOverridePayload(suggested, scanned)),
+        timeout: 8000,
+        onload:    (res) => orBreadcrumb('carton_override', { status: res.status }),
+        onerror:   ()    => orBreadcrumb('carton_override', { status: 0, error: 'network' }),
+        ontimeout: ()    => orBreadcrumb('carton_override', { status: 0, error: 'timeout' }),
+      });
+    } catch (e) {
+      try { console.warn('[MalpaPack] carton override post failed:', e); } catch (_) {}
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
   // 4.  WORKFLOW ENGINE
   //     Translates profile flags into UI behaviour decisions.
   // ─────────────────────────────────────────────────────────────────────────────
@@ -1425,8 +1548,20 @@
     /** Whether user must confirm container type (vs auto-select default) */
     confirmContainerType: () => !!Session.profile?.confirm_container_type_check,
 
-    /** Allow closing with items still remaining — enabled for all profiles except SIBP and MIBP */
-    allowEarlyClose: () => !Workflow.isSIBP() && !Workflow.isMIBP(),
+    /**
+     * Allow closing with items still remaining (multi-container shipments).
+     *
+     * v3.8.0 — MIBP now allowed. It was excluded alongside SIBP, which left an
+     * MIBP shipment unable to go out in more than one container: the Close
+     * button stayed disabled until every item was scanned, then auto-closed.
+     * The mid-shipment path (close → next piece → final close → consign) is
+     * profile-agnostic and does not touch MIBP's retained source tote — that is
+     * only handled in resetForNextTote(), after the FINAL close.
+     *
+     * SIBP stays excluded: it is single-item and pre-consigned, so there is no
+     * second piece to create.
+     */
+    allowEarlyClose: () => !Workflow.isSIBP(),
 
     /**
      * Determine close-to-container location.
@@ -6930,6 +7065,9 @@ color: #b91c1c;
       return;
     }
     if (R.cartonScanIn) R.cartonScanIn.value = '';
+    // v3.8.0 — log it if the packer overrode the suggestion. Read the
+    // suggestion BEFORE applying the scan, and never let the log touch the close.
+    reportCartonOverride(getSuggestedCartonType(), ct);
     applyCartonTypeForClose(ct);
     setStatus(`Carton confirmed: ${cartonLabel(ct)} — closing container…`, 'ok');
     beep('ok');
@@ -8153,7 +8291,7 @@ color: #b91c1c;
       // 10–11 Sep, so anyone checking the running build was told the wrong
       // answer with total confidence. GM_info is absent in the Node test
       // harness, hence the literal fallback.
-      VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '3.7.0',
+      VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '3.8.0',
       Session, ShipmentCache, SourceToteCache, Workflow, R, EventLog,
       // v3.7.0 — error log internals, so the pipeline can be inspected from
       // the console on a bench instead of guessed at from null columns.
