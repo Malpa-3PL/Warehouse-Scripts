@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Edit Dimensions
 // @namespace    https://malpa.canary7.com
-// @version      2.5.0
+// @version      2.6.0
 // @description  Adds an "Edit Dimensions" button to the Canary7 consigning screen (#/workbench) so an operator can correct a container's length / width / height
 // @author       Malpa 3PL
 // @homepageURL  https://github.com/zaynnev/malpa3pl
@@ -14,7 +14,84 @@
 // ==/UserScript==
 
 /* =============================================================================
- * malpa-editdims.user.js  -  v2.5.0
+ * malpa-editdims.user.js  -  v2.6.0
+ *
+ * v2.6.0 IS ONE FIX: THE VERIFYING RE-READ NOW ASKS AN ENDPOINT THAT CAN
+ * ACTUALLY ANSWER THE QUESTION. Nothing about the route, the interception, the
+ * anchor, the write URL, the modal, the toast or the four-field comparison
+ * moved. What moved is WHICH endpoint proves the write.
+ *
+ *   THE FALSE NEGATIVE. An operator set dimensions on container B-83395-2
+ *   (id 1566386). The write landed perfectly and the modal said:
+ *
+ *     VERIFY FAILED - the re-read does not match what was submitted.
+ *       weight: submitted 2.4,  re-read 10.8
+ *       length: submitted 40,   re-read 50
+ *       width:  submitted 32,   re-read 35
+ *       height: submitted 29,   re-read 37
+ *     Write HTTP 200 (ok)
+ *
+ *   THE WRITE HAD SUCCEEDED. Confirmed against the live API:
+ *     GET shipment/shipment-container?container_no=B-83395-2
+ *     -> [{ "id":1566386, "container_no":"B-83395-2", "status_id":9,
+ *           "shipment_header_id":787125, "staging_dock_id":70164,
+ *           "weight":2.4, "length":40, "width":32, "height":29 }]
+ *   Exactly what was submitted. Exactly ONE row with that container number.
+ *   Status advanced 7 -> 9. The operator was sent to re-check a container that
+ *   was already correct - the most expensive kind of wrong.
+ *
+ *   WHY. v2.5.0 verified with consigningUrl() ->
+ *   shipment/shipment-container/get-consigning-container. THAT IS THE
+ *   CONSIGNING SCREEN'S WORKFLOW ENDPOINT, not a record lookup. It answers
+ *   "which container is being consigned", and once close-to-container has
+ *   closed the container (status 7 -> 9) it stops answering for that container
+ *   and returns something else - the next container in the consigning queue, or
+ *   a consignment-level aggregate. The 10.8 / 50 / 35 / 37 it came back with
+ *   are neither the pre-write nor the post-write values of 1566386; they are
+ *   another record entirely, wearing the shape of an answer.
+ *
+ *   WHY THE EXISTING MITIGATION DID NOT FIRE. v2.5.0 already had the right
+ *   endpoint - containerByNoUrl() - but only as a FALLBACK, gated on the
+ *   primary read coming back EMPTY. Here the primary came back NON-EMPTY and
+ *   WRONG, so the gate never opened. Fallback-on-empty was the wrong guard
+ *   because emptiness was never the failure mode.
+ *
+ *   THIS WAS FLAGGED. The v2 design review noted "nothing confirmed says
+ *   get-consigning-container returns a container that is not the one currently
+ *   being consigned". It does. The mitigation chosen then was insufficient;
+ *   this is the actual fix.
+ *
+ *   THE FIX, IN THREE PARTS.
+ *     1. shipment/shipment-container&container_no=<n> is the PRIMARY and ONLY
+ *        verifying read. get-consigning-container is gone from this path
+ *        entirely. A WORKFLOW ENDPOINT MUST NEVER BE USED TO PROVE A WRITE -
+ *        it answers a question about process state, not about a record.
+ *        (get-consigning-container is still intercepted, and still re-issued by
+ *        loadContainers()'s escape hatch: reading the screen's current context
+ *        is what it IS for. Only verification is off-limits.)
+ *     2. THE ROW IS MATCHED BY id, NOT TAKEN AS [0]. The lookup answers with an
+ *        array; only the row whose id equals the container actually written to
+ *        may verify it. An empty response, or rows containing no such id, is a
+ *        GENUINE verification failure and is reported as one - including how
+ *        many rows came back and their ids, so the next person can see what
+ *        Canary7 actually said instead of four lines of "re-read ?".
+ *     3. THE VERIFIED ROW'S status_id IS RECORDED in the success log line, since
+ *        a successful close advances it 7 -> 9. It is NOT a pass/fail condition:
+ *        no confirmed list of legitimate post-close statuses exists, and
+ *        inventing one would manufacture a fresh false negative.
+ *
+ *   CONFIRMED THE SAME DAY - id IS NOT A USABLE FILTER.
+ *   GET shipment/shipment-container?id=1566386 is SILENTLY IGNORED and returns
+ *   an unfiltered page of unrelated containers, exactly as shipment_id does.
+ *   Filter on container_no (or shipment_header_id) and match on id in JS. Do
+ *   not "tidy" the verifying read into an id= query: it would pass the tests
+ *   that use a filtering stub and silently verify against a stranger in
+ *   production.
+ *
+ *   WHAT DID NOT CHANGE. The four-field comparison (the three dimensions plus
+ *   the carried-through weight), weight still asserted unchanged, a failure
+ *   still leaving the modal open with the full raw bodies, a success still
+ *   closing the modal and toasting. Only the source of truth moved.
  *
  * v2.5.0 IS ONE UX ADDITION: A SUCCESS TOAST. Nothing about the route, the
  * interception, the anchor, the write URL or the verification strategy moved,
@@ -257,6 +334,17 @@
  *   and returns an unfiltered page of unrelated containers - never use it.
  *   container_no also works as a direct filter and returns the same single row.
  *
+ *   AND NEITHER IS id. Confirmed live 2026-09-30: ?id=1566386 is silently
+ *   ignored in exactly the same way and returns an unfiltered page of unrelated
+ *   containers. TWO parameters on this endpoint are ignored rather than
+ *   rejected, so a wrong filter here is invisible - it looks like data. Filter
+ *   on container_no or shipment_header_id ONLY, and match id in JS.
+ *
+ *   THIS ENDPOINT IS THE SCRIPT'S SOURCE OF TRUTH (v2.6.0). It is a record
+ *   lookup, and it is what submit() verifies every write against. Confirmed on
+ *   B-83395-2: ?container_no=B-83395-2 returns exactly one row,
+ *   id 1566386, carrying precisely the values that had just been written.
+ *
  * THE ANCHOR                                              [PROBE], [HAR2]
  *
  *   FACT 1. THE SCRIPT WORKS ALL THE WAY UP TO INJECTION.            [HAR2]
@@ -396,6 +484,24 @@
  *  8. The staleness threshold in STALE_ROW_MS (60s) is a judgement call, not a
  *     confirmed figure. Nothing establishes how long a captured consigning row
  *     stays accurate; the warning never blocks.
+ * 11. SUPERSEDED, AND IT COST A FALSE NEGATIVE. Up to v2.5.0 this block carried
+ *     the design review's note that "nothing confirmed says
+ *     get-consigning-container returns a container that is NOT the one
+ *     currently being consigned", and the mitigation chosen was to fall back to
+ *     shipment-container&container_no only when the consigning read came back
+ *     EMPTY. IT IS NOW CONFIRMED THAT IT DOES RETURN A DIFFERENT CONTAINER:
+ *     after close-to-container advanced B-83395-2 (id 1566386) from status 7 to
+ *     9, that endpoint answered with a NON-EMPTY row holding 10.8 / 50 / 35 /
+ *     37 - values belonging to neither the before nor the after state of the
+ *     container written to. The fallback was gated on emptiness and so never
+ *     ran, and a perfectly good write was reported as VERIFY FAILED. v2.6.0
+ *     removes get-consigning-container from the verification path entirely
+ *     rather than adding another guard to it. The entry is kept, not deleted,
+ *     so nobody re-promotes a workflow endpoint to a verifier.
+ * 12. STILL ASSUMED. Nothing confirmed says which status_id values are
+ *     legitimate after close-to-container in every configuration - only that
+ *     7 -> 9 was observed on a successful close. That is exactly why the
+ *     success line RECORDS status_id and nothing anywhere TESTS it.
  *
  * -----------------------------------------------------------------------------
  * TEST DATA (staging, MA-TRL company 46, warehouse 10 Darra - never 9)
@@ -414,7 +520,7 @@
    * ======================================================================== */
 
   const TAG          = '[Edit Dims]';
-  const VERSION      = '2.5.0';                      // keep in step with @version
+  const VERSION      = '2.6.0';                      // keep in step with @version
 
   // Lifted verbatim from malpa-transfer.user.js
   const API_ROOT     = 'https://stgauth.canary7.com';
@@ -701,10 +807,19 @@
     });
   }
 
-  /* The SECOND way to read one container, confirmed in section 5 of the build
-   * prompt: container_no is a working direct filter on shipment-container and
-   * returns the same row. Used only as the verifying re-read's fallback - see
-   * verifyRead(). */
+  /* THE AUTHORITATIVE WAY TO READ ONE CONTAINER, and since v2.6.0 the ONLY
+   * thing submit() verifies a write against.
+   *
+   * shipment/shipment-container is a RECORD LOOKUP and container_no is a
+   * confirmed working filter on it (build prompt section 5; re-confirmed live
+   * against B-83395-2 / id 1566386, which came back as exactly one row holding
+   * exactly what had been written). It was demoted to a "fallback" in v2.5.0
+   * and that was the bug - see the v2.6.0 header block.
+   *
+   * DO NOT ADD id= TO THIS QUERY. Confirmed live: ?id=<n> is SILENTLY IGNORED
+   * by this endpoint and returns an unfiltered page of unrelated containers,
+   * exactly like shipment_id. container_no (or shipment_header_id) filters;
+   * id is matched in JS, in submit(). */
   function containerByNoUrl(containerNo) {
     return apiUrl(ROUTES.list, {
       container_no: containerNo,
@@ -1917,42 +2032,57 @@
       //
       // The re-read is of the SELECTED container - c.container_no - never of the
       // intercepted row. Those differ the moment the operator picks a sibling.
-      const rr = await apiGet(consigningUrl(c.container_no));
-      let fresh = rr.ok ? (asArray(rr.body)[0] || null) : null;
+      /* THE VERIFIER IS shipment/shipment-container&container_no=<n>, AND ONLY
+       * THAT (v2.6.0).
+       *
+       * get-consigning-container USED TO BE THE PRIMARY READ HERE AND CAUSED A
+       * REAL WRITE TO BE REPORTED AS "VERIFY FAILED". It is the consigning
+       * SCREEN'S WORKFLOW ENDPOINT - it answers "which container is being
+       * consigned", not "give me the row for container X". Once
+       * close-to-container has closed the container (status 7 -> 9) it stops
+       * answering for it and returns SOMETHING ELSE ENTIRELY - a non-empty,
+       * plausible-looking row whose figures belong to neither the pre-write nor
+       * the post-write container. A workflow endpoint cannot prove a write, so
+       * it is not on this path at all any more. See the v2.6.0 header block.
+       *
+       * shipment/shipment-container is a RECORD LOOKUP, and container_no is a
+       * confirmed working filter on it. It is asked for directly - no "try the
+       * workflow endpoint first" step to fall back from. */
+      const rr = await apiGet(containerByNoUrl(c.container_no));
+      const rows = rr.ok ? asArray(rr.body) : [];
 
-      // get-consigning-container is the consigning screen's OWN lookup: it
-      // answers "which container is being consigned", not "give me container
-      // X". For a SIBLING container on the same shipment - which the select
-      // legitimately offers - it can come back empty even though the write
-      // landed perfectly, and reporting that as VERIFY FAILED would send an
-      // operator to re-check a container that is already correct.
-      //
-      // shipment-container&container_no=<n> is confirmed (prompt section 5) to
-      // return the same row, so try it before concluding anything.
-      let rr2 = null;
-      if (!fresh) {
-        rr2 = await apiGet(containerByNoUrl(c.container_no));
-        if (rr2.ok) {
-          const rows = asArray(rr2.body);
-          // Filter: the list endpoint answers with an array, and only the row
-          // that actually IS this container may be used to verify it.
-          for (let i = 0; i < rows.length; i++) {
-            if (rows[i] && String(rows[i].container_no) === String(c.container_no)) {
-              fresh = rows[i];
-              break;
-            }
-          }
-        }
+      /* MATCH ON id, NEVER rows[0].
+       *
+       * The endpoint answers with an array and only the row that actually IS
+       * the container just written to may be used to verify it. Taking [0]
+       * would let any other row that happened to come back - a paging artefact,
+       * a re-used container number, a filter Canary7 chose to ignore - stand in
+       * for the real one, which is the whole class of bug v2.6.0 exists to
+       * close.
+       *
+       * AND id IS MATCHED IN JS, NOT ASKED FOR IN THE QUERY. Confirmed live:
+       * ?id=<n> on this endpoint is SILENTLY IGNORED and returns an unfiltered
+       * page of unrelated containers, exactly like shipment_id. Filter on
+       * container_no on the wire; match on id here. */
+      let fresh = null;
+      for (let i = 0; i < rows.length; i++) {
+        if (rows[i] && String(rows[i].id) === String(c.id)) { fresh = rows[i]; break; }
       }
+      const returnedIds = rows.map(function (r) { return r ? r.id : null; });
 
       // VERIFY_FIELDS, so the untouched weight is compared too: it was sent back
       // exactly as Canary7 gave it to us, so it must return exactly as sent. A
       // weight that has moved means the write disturbed a field it was only
       // carrying, and that is a genuine failure - reported, never excused.
+      //
+      // fresh === null (empty response, or rows with no matching id) falls
+      // through compareDims as a failure on every field, which is correct: an
+      // unverifiable write is not a verified one.
       const cmp = compareDims(fresh, submitted);
       State.lastVerify = {
         submitted: submitted, reread: fresh, cmp: cmp,
-        write: wr, verify: rr, verifyFallback: rr2,
+        write: wr, verify: rr,
+        verifyRowCount: rows.length, verifyRowIds: returnedIds,
       };
 
       if (cmp.ok) {
@@ -1961,6 +2091,15 @@
         FIELDS.forEach(function (p) {
           lines.push(p[1] + ': ' + fmt(c[p[0]]) + ' → ' + fmt(dims[p[0]]));
         });
+        /* THE VERIFIED ROW'S status_id, RECORDED - NEVER JUDGED (v2.6.0).
+         * A successful close-to-container advances the container (7 -> 9), so
+         * the status the authoritative read came back with is worth having in
+         * the record when someone later asks what the write actually did.
+         * It is deliberately NOT a pass/fail condition: nothing confirmed says
+         * which statuses are legitimate after every close, and inventing a
+         * whitelist would turn a correct write into a false negative all over
+         * again - which is exactly the bug this version removes. */
+        lines.push('status_id: ' + fmt(fresh && fresh.status_id));
         if (warns.length) lines.push('', 'Warnings:', warns.join('\n'));
         const text = lines.join('\n');
 
@@ -2046,19 +2185,28 @@
       } else {
         const lines = ['VERIFY FAILED - the re-read does not match what was submitted.'];
         lines.push('Container ' + c.container_no);
+
+        /* NO ROW TO COMPARE AGAINST IS ITS OWN KIND OF FAILURE, AND IS SAID SO
+         * (v2.6.0). "submitted 40, re-read ?" four times over tells the next
+         * person nothing about WHY. What did come back - how many rows, and
+         * which ids - is the thing that distinguishes "Canary7 returned
+         * nothing" from "Canary7 returned other containers", and those want
+         * different investigations. */
+        if (!fresh) {
+          lines.push('No row with id ' + c.id + ' came back from the verifying read.');
+          lines.push('Rows returned: ' + rows.length +
+            (rows.length ? ' (ids: ' + returnedIds.join(', ') + ')' : ''));
+        }
+
         cmp.mismatches.forEach(function (m) {
           lines.push(m.field + ': submitted ' + fmt(m.submitted) + ', re-read ' + fmt(m.actual));
         });
         lines.push('');
         lines.push('Write HTTP ' + wr.status + ' (' + wr.kind + ')');
         lines.push('Raw write response: ' + wr.raw);
-        lines.push('Re-read HTTP ' + rr.status + ' (' + rr.kind + ')');
+        lines.push('Re-read (shipment-container&container_no) HTTP ' +
+          rr.status + ' (' + rr.kind + ')');
         lines.push('Raw re-read response: ' + rr.raw);
-        if (rr2) {
-          lines.push('Fallback re-read (shipment-container&container_no) HTTP ' +
-            rr2.status + ' (' + rr2.kind + ')');
-          lines.push('Raw fallback response: ' + rr2.raw);
-        }
         lines.push('');
         lines.push('Not retrying automatically. Check the container in Canary7 before trying again.');
         reportResult(myModal, lines.join('\n'), 'error');
