@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Pack v3
 // @namespace    https://malpa.canary7.com
-// @version      3.8.0
+// @version      3.9.0
 // @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-pack.user.js
 // @downloadURL  https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-pack.user.js
 // @description  High-throughput packing station for Canary7 WMS — optimistic scanning, async API queue, dynamic profiles
@@ -2835,7 +2835,8 @@
    * The workflow does the two steps the Retool app already does:
    *   create-pdf  (template_id + this payload)  ->  download_url
    *   printjobs   (contentType 'pdf_uri', content = download_url)
-   * and resolves pack_desk -> printerId from print_routing.
+   * and chooses the printer itself, by NAME, from PrintNode's live printer
+   * list (v3.9.0). The id from Canary7 print_routing is sent only as a hint.
    */
   async function printErrorSheet(row) {
     if (!ERROR_SHEET_WORKFLOW_URL || !ERROR_SHEET_WORKFLOW_KEY) {
@@ -2849,19 +2850,22 @@
       return null;
     }
 
-    // Resolve the printer here, where there is already an authenticated Canary7
-    // client, rather than making the workflow hold a credential or a map.
+    // v3.9.0 — the PRINTER IS CHOSEN BY NAME IN THE WORKFLOW, not here.
+    //
+    // The workflow lists PrintNode's live printers and picks the one whose
+    // name carries this pack desk (pickPrinter block). That survives a rename:
+    // on 17 Sep WPD-04 was renamed "WPD-04 ZD421", Windows issued a new id,
+    // and the id Canary7 stored went dead. Only the workflow can see live
+    // names — the PrintNode key lives there, never on a bench.
+    //
+    // Canary7 print-routing is still read, but only as a HINT: its id is the
+    // fallback for a desk whose printer does not carry the desk code. A desk
+    // with no Canary7 route is no longer a reason to refuse to print.
     let printer = null;
     try {
       printer = await resolvePackDeskPrinter(row.packDesk);
     } catch (err) {
-      console.warn('[MalpaPack] print-routing lookup failed:', err.message);
-    }
-    if (!printer) {
-      ErroredShipments.setPrinted(row.shipmentHeaderId, 'failed',
-        `no 4x6 print route for ${row.packDesk}`);
-      EventLog.err(`Error sheet NOT printed — no active label print route for ${row.packDesk}.`);
-      return null;
+      console.warn('[MalpaPack] print-routing lookup failed (hint only):', err.message);
     }
 
     // v3.6.0 — NOTHING is looked up here. Print what the row already knows.
@@ -2901,7 +2905,7 @@
         {
           template_id: ERROR_SHEET_TEMPLATE_ID,
           pack_desk: row.packDesk,
-          printer_id: printer.printerId,
+          printer_id: printer ? printer.printerId : null,   // hint / fallback only
           payload,
         },
         'error_sheet_print');
@@ -2936,9 +2940,22 @@
         EventLog.err(`Error sheet failed to print for ${row.shipmentNo} — ${why}.`);
         return res;
       }
+      // The printer the workflow actually used, not the one Canary7 suggested.
+      const usedName = res?.printer_name ?? res?.data?.printer_name
+        ?? printer?.printerName ?? printer?.printerId ?? 'unknown printer';
+      const warning  = res?.warning ?? res?.data?.warning ?? null;
+
+      // "success" means PrintNode accepted the job. If the chosen printer is
+      // offline it queues instead of printing — say so rather than "printed".
+      if (warning) {
+        ErroredShipments.setPrinted(row.shipmentHeaderId, 'queued',
+          `sent to ${usedName} — ${warning}`);
+        EventLog.err(`Error sheet sent to ${usedName} but it is offline — it will print when the printer is back. Check it, or write the details down.`);
+        return res;
+      }
       ErroredShipments.setPrinted(row.shipmentHeaderId, 'done',
-        `printed at ${row.packDesk} (${printer.printerName || printer.printerId})`);
-      EventLog.ok(`Error sheet printed at ${row.packDesk} — ${printer.printerName || printer.printerId}.`);
+        `sent to ${row.packDesk} (${usedName})`);
+      EventLog.ok(`Error sheet sent to ${usedName}.`);
       return res;
     } catch (err) {
       ErroredShipments.setPrinted(row.shipmentHeaderId, 'failed', err.message);
@@ -8291,7 +8308,7 @@ color: #b91c1c;
       // 10–11 Sep, so anyone checking the running build was told the wrong
       // answer with total confidence. GM_info is absent in the Node test
       // harness, hence the literal fallback.
-      VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '3.8.0',
+      VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '3.9.0',
       Session, ShipmentCache, SourceToteCache, Workflow, R, EventLog,
       // v3.7.0 — error log internals, so the pipeline can be inspected from
       // the console on a bench instead of guessed at from null columns.
