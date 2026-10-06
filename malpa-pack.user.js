@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Pack v3
 // @namespace    https://malpa.canary7.com
-// @version      3.9.0
+// @version      3.9.1
 // @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-pack.user.js
 // @downloadURL  https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-pack.user.js
 // @description  High-throughput packing station for Canary7 WMS — optimistic scanning, async API queue, dynamic profiles
@@ -1004,7 +1004,7 @@
     },
     get all() { return this._read(); },
 
-    record({ shipmentNo, shipmentHeaderId, jobId, reason, stage, profile, packDesk, containerNo, sourceTote, userName }) {
+    record({ shipmentNo, shipmentHeaderId, jobId, reason, stage, profile, packDesk, containerNo, sourceTote, userName, companyCode }) {
       const row = {
         shipmentNo:       shipmentNo || '—',
         shipmentHeaderId: shipmentHeaderId || null,
@@ -1022,6 +1022,11 @@
         // before the consign-failure handoff runs, so resolving it here would
         // read an already-emptied cache.
         sourceTote:       sourceTote || null,
+        // Whose shipment it is, for the printed sheet's Client row. Comes off
+        // the close-time snapshot rather than ShipmentCache, which clear()
+        // nulls before the consign-failure handler runs — the same trap the
+        // three fields above are captured early to avoid.
+        companyCode:      companyCode || null,
         // Seeded with whoever is signed in at this station, then upgraded by
         // the inventory-log lookup if that lands. Null when this station did
         // not do the packing — see packedHere in handOffErroredShipment.
@@ -2889,6 +2894,9 @@
       error_time:      fmtSheetTime(row.at),
       pack_desk:       row.packDesk,
       user_name:       userName || '',
+      // The client, for the sheet's Client row. The Retool workflow forwards
+      // `payload` wholesale, so this needed no change at that end.
+      company_code:    row.companyCode || '',
       // The Retool workflow forwards `payload` wholesale
       // (JSON.stringify(startTrigger.data.payload)) rather than enumerating
       // fields, so adding a key here needs no change at that end. The template
@@ -3101,6 +3109,11 @@
       packDesk: packDesk || Session.packLocationCode || null,
       containerNo,
       sourceTote,
+      // `state` is the close-time snapshot the error log already captures and
+      // it carries company_code — so this needed a read, not a new capture.
+      // The live cache is the last resort: on the consign-failure path
+      // ShipmentCache.company has usually been nulled by clear() already.
+      companyCode: state?.company_code || ShipmentCache.company?.company_code || null,
       // Always seeded, including on the consign-only path.
       //
       // That path briefly did NOT seed, on the reasoning that whoever scans an
