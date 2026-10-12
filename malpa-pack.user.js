@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Pack v3
 // @namespace    https://malpa.canary7.com
-// @version      3.9.1
+// @version      3.9.2
 // @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-pack.user.js
 // @downloadURL  https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-pack.user.js
 // @description  High-throughput packing station for Canary7 WMS — optimistic scanning, async API queue, dynamic profiles
@@ -6906,7 +6906,12 @@ color: #b91c1c;
           // not keep scanning while C7 move/close/print work is settling.
           lockScanForFinalising('Final item verified — closing container and printing label…');
           Q.drain().then(() => {
-            updateCloseButtonReady();
+            // v3.9.2 — do NOT call updateCloseButtonReady() here. It sets
+            // btnClose.disabled = false (allDone is true by definition on this
+            // branch), which re-arms both the click and the global-Enter path
+            // for the entire duration of the close that is about to start —
+            // the scan gun's trailing CR then lands on a live Close button.
+            // The close itself owns the button state from here.
             if (Session.phase === 'PACKING') onCloseContainer();
           });
         }
@@ -7121,7 +7126,55 @@ color: #b91c1c;
     });
   }
 
+  /**
+   * v3.9.2 — re-entrancy guard on close.
+   *
+   * `R.btnClose.disabled` is a UI affordance, not a mutex. It stops a second
+   * mouse CLICK and nothing else, and close is reached by four other doors
+   * that never touch the button:
+   *   - onScan()'s all-done branch, which auto-closes after Q.drain()
+   *   - onCartonConfirmScan(), both the suggested-carton and scanned-E-code paths
+   *   - F4
+   *   - Enter on the focused Close button (a click leaves the BUTTON focused,
+   *     so a scan gun's trailing CR lands here)
+   * and the function yields at `await Q.drain()` long before it has committed
+   * anything, so two invocations interleave happily.
+   *
+   * Ecoy 87460 is what that looks like in C7: containers created 11:31:40,
+   * :45 and :47 on 12 Oct for a TWO-UNIT order, two of them empty, each one
+   * consigned as its own piece. Only piece 1 got a tracking number from
+   * AusPost — and piece 1 is the empty one. A sweep of the preceding week
+   * found 29 shipments carrying stray empty containers, 10 of them minted
+   * 0–2 seconds apart, which is not a human pressing a button twice.
+   *
+   * The flag is held across the WHOLE close, including the mid-shipment
+   * `onNewContainer()`. That is deliberate: the window in which the next
+   * container is being minted is exactly where a second trigger produces an
+   * extra empty piece, and onNewContainer re-enables btnClose on its way
+   * through (line ~7487), re-arming the Enter path mid-flight.
+   *
+   * Note this does NOT subsume the piece cap (MAX_PIECES_PER_SHIPMENT). That
+   * catches a close that legitimately runs many times; this catches one close
+   * running twice at once. Different failures, both still worth having.
+   */
+  let _closeInFlight = false;
+
   async function onCloseContainer() {
+    if (_closeInFlight) {
+      console.warn('[MalpaPack] close already in flight — ignoring duplicate trigger');
+      perfMark('close re-entry blocked', perfNow());
+      EventLog.ok('Ignored a duplicate Close — one close is already running.');
+      return;
+    }
+    _closeInFlight = true;
+    try {
+      return await _closeContainer();
+    } finally {
+      _closeInFlight = false;
+    }
+  }
+
+  async function _closeContainer() {
     const t0 = perfNow();
     const genAtClose = _shipmentGen; // v3.3.80 — see _shipmentGen
     if (!Session.outboundContainer) { setStatus('No container open.', 'err'); return; }
@@ -8137,7 +8190,14 @@ color: #b91c1c;
     if (e.key === 'Escape') { closeUI(); return; }
     if (e.key === 'F2')  { e.preventDefault(); R.scanIn && R.scanIn.focus(); }
     if (e.key === 'F3')  { e.preventDefault(); R.toteIn && R.toteIn.focus(); }
-    if (e.key === 'F4')  { e.preventDefault(); onCloseContainer(); }
+    // v3.9.2 — F4 used to fire close unconditionally: no phase check, no
+    // button-state check, nothing. It is the one door that could close a
+    // container the operator had not finished packing. Hold it to the same
+    // bar as Enter below.
+    if (e.key === 'F4') {
+      e.preventDefault();
+      if (Session.phase === 'PACKING' && R.btnClose && !R.btnClose.disabled) onCloseContainer();
+    }
     // Enter fires Close Container only when it's enabled (all items verified)
     if (e.key === 'Enter' && Session.phase === 'PACKING') {
       const active = document.activeElement;
@@ -8361,6 +8421,12 @@ color: #b91c1c;
       fetchConsigningContainer,
       CONSIGNING_PENDING_STATUS_ID,
       createConsignmentPieces,
+      // v3.9.2 — close re-entrancy. `onCloseContainer` is the guarded wrapper;
+      // `_closeContainer` is the body. Tests drive the wrapper and assert the
+      // body runs once, so exporting both is the point, not an oversight.
+      onCloseContainer,
+      onGlobalKey,
+      get closeInFlight() { return _closeInFlight; },
       // empty-parcel recovery
       deleteEmptyContainersForShipment,
       startPostCloseConsigning,
