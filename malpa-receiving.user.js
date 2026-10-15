@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Receiving
 // @namespace    https://malpa.canary7.com
-// @version      2.4.4
+// @version      2.4.5
 // @description  Fast single-screen receiving for Canary7 WMS - TC51 optimised
 // @author       Malpa 3PL
 // @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-receiving.user.js
@@ -1104,6 +1104,63 @@
     });
   }
 
+  // C7 BUG (known upstream, not being fixed): checkin COMMITS the stock to the
+  // bin and only then dies with 'Undefined array key "company"'. The response is
+  // wrong about the outcome, so it must never be read as "nothing was received" -
+  // leaving the line up on that message meant the next pull of the trigger
+  // booked the same stock twice, and with no OVER prompt, because the line still
+  // looked open.
+  //
+  // Matched on the message and tested BEFORE c7Code: whatever code rides along
+  // with it, this is not a refusal. Not every 'Undefined array key' is like
+  // this - the "batch_no" one (see postCheckin) fails before anything is written.
+  const C7_COMMIT_THEN_FAIL = /undefined array key\s+["']?company["']?/i;
+  function isCommitThenFail(err) {
+    return C7_COMMIT_THEN_FAIL.test(String(err?.message || ''));
+  }
+
+  function _qtyOrNull(v) {
+    if (v === null || v === undefined || v === '') return null;
+    const n = Number(v);
+    return isFinite(n) ? n : null;
+  }
+
+  // The line's open quantity as C7 has it now, or null if C7 cannot be asked.
+  // The header is the second opinion: it is what every check-in re-reads anyway,
+  // and a 404 from it means the receipt has closed, so nothing is open.
+  async function openQtyNow(detail, item) {
+    const fresh = await refreshDetail(detail, item).catch(() => null);
+    const open  = _qtyOrNull(fresh?.open_quantity);
+    if (open !== null) return open;
+    try {
+      const header = await fetchReceiptHeader(State.receiptId);
+      if (!header) return 0;
+      const d = (header.receiptDetails || []).find(x => x.id === detail.id);
+      return _qtyOrNull(d?.open_quantity);
+    } catch (e) {
+      return e.notFound ? 0 : null;
+    }
+  }
+
+  // Settle a commit-then-fail from C7's own figures, never by posting again.
+  // Returns the line's open quantity when the stock plainly landed. Otherwise it
+  // rethrows `err`: as-is when the line plainly did not move (so "nothing was
+  // received" is now a checked fact, and trying again is safe), or marked
+  // indeterminate when open_quantity cannot say. It is floored at zero, so a
+  // receive into a line that was already complete moves nothing.
+  async function settleCommitThenFail(err, detail, item, qty, openBefore) {
+    const open = await openQtyNow(detail, item);
+    if (open !== null && openBefore > 0) {
+      if (open <= Math.max(0, openBefore - qty)) {
+        console.warn('[MalpaRecv] C7 reported "' + err.message + '" but the check in landed');
+        return Math.max(0, open);
+      }
+      if (open >= openBefore) throw err;
+    }
+    err.indeterminate = true;
+    throw err;
+  }
+
   // ---------------------------------------------------------------------------
   // 7. AUDIO (chimes + haptics)
   // ---------------------------------------------------------------------------
@@ -2142,10 +2199,24 @@
 
     try {
       let result, recoveredOpen = null;
+      // One POST. A commit-then-fail is settled from C7's figures right here, so
+      // it comes back as the success it was; if it did not land it throws, and
+      // that throw is final. `base` is the open quantity the POST was made against.
+      const post = async (base) => {
+        try {
+          return await postCheckin(c.detail, c.item, c.uom, qty, locRec.id, batchSnap);
+        } catch (e) {
+          if (!isCommitThenFail(e)) throw e;
+          recoveredOpen = await settleCommitThenFail(e, c.detail, c.item, qty, base);
+          return { total: null };
+        }
+      };
       try {
-        result = await postCheckin(c.detail, c.item, c.uom, qty, locRec.id, batchSnap);
+        result = await post(openBefore);
       } catch (firstErr) {
         if (firstErr.code === 'SESSION_EXPIRED') throw firstErr;
+        // Already settled against C7 by post() - never retry it.
+        if (isCommitThenFail(firstErr)) throw firstErr;
         // Deterministic refusal - nothing was written, so surface it now.
         if (firstErr.c7Code) throw firstErr;
 
@@ -2178,7 +2249,7 @@
             if (i >= 0) State.details[i] = { ...State.details[i], ...fresh };
           }
           await new Promise(r => setTimeout(r, 400));
-          result = await postCheckin(c.detail, c.item, c.uom, qty, locRec.id, batchSnap);
+          result = await post(c.detail.open_quantity || 0);
         }
       }
 
@@ -2293,8 +2364,9 @@
       if (navigator.vibrate) navigator.vibrate([60, 30, 60]);
       State.busy = null;
       if (err.indeterminate) {
-        // An over-receive that errored. We cannot tell from open_quantity
-        // whether it landed, and retrying could double it, so say so plainly.
+        // An over-receive that errored, or a C7 commit-then-fail that C7's
+        // figures could not settle. We cannot tell from open_quantity whether
+        // it landed, and retrying could double it, so say so plainly.
         // Tear the line down as well: leaving the check-digit row up and focused
         // means one more pull of the same trigger re-posts the very write we
         // just refused to guess about. Make them re-scan the item deliberately.
@@ -2319,6 +2391,24 @@
         State.logBusy = false;
         State.logErr  = 'History is out of date after a failed check in - ' +
                         'close and reopen History to reload it.';
+      }
+      // If an indeterminate write did land, the open quantities on this
+      // handheld are now too high, and re-scanning the item would book it again
+      // without the OVER prompt. Take C7's figures before handing the form back,
+      // so a repeat is judged against what is really still open.
+      if (err.indeterminate) {
+        State.busy = 'Refreshing receipt...';
+        render();
+        lockForm();
+        const fresh = await refreshReceipt();
+        State.busy = null;
+        // C7 could not be asked either, so assume the write landed: a repeat
+        // that has to get past the OVER prompt is a nuisance, a silent double
+        // receive is not.
+        if (!fresh.ok) {
+          const d = State.details.find(x => x.id === detailId);
+          if (d) d.open_quantity = Math.max(0, (d.open_quantity || 0) - baseQty);
+        }
       }
     } finally {
       // SINGLE EXIT. render() re-asserts the input lock whenever a write is in
