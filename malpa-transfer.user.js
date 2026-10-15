@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Transfer
 // @namespace    https://malpa.canary7.com
-// @version      2.7.0
+// @version      2.7.1
 // @description  Location-to-location stock transfer for Canary7 WMS - TC51 optimised
 // @author       Malpa 3PL
 // @homepageURL  https://github.com/zaynnev/malpa3pl
@@ -86,6 +86,10 @@
  *     the OLDEST and the destination record carries no LP. Confirmed at WDD-02:
  *     it took from o7282 (older), not or7. Such records therefore CANNOT be
  *     addressed individually, so groupRows() MERGES them into one row and warns.
+ *     A call is also capped at what that ONE oldest record holds - more fails
+ *     "quantity not enough" and moves nothing (TCC-B03-S102, Oct 2026: 210 over
+ *     LPs 601 + A refused). moveRow() therefore moves a merged row a record at
+ *     a time, re-reading the bin between calls.
  *  6. Allocated/suspended units cannot be transferred - the cap is
  *     on-hand minus those (movableQty), not on-hand.
  * ========================================================================== */
@@ -97,7 +101,7 @@
   // 0. CONSTANTS
   // ---------------------------------------------------------------------------
   const TAG          = '[MalpaTransfer]';
-  const VERSION      = '2.7.0';   // keep in step with @version in the header
+  const VERSION      = '2.7.1';   // keep in step with @version in the header
   const API_ROOT     = 'https://stgauth.canary7.com';
   const API_BASE     = API_ROOT + '/index.php?r=';
   const WAREHOUSE_ID = 10;                      // 10 = Darra (Malpa's only live WH)
@@ -374,6 +378,33 @@
     return Array.isArray(raw) ? raw : [];
   }
 
+  // What the adjust call identifies stock by: item + uom + batch + status (at
+  // one location). Records that share it differ only by licence plate.
+  function rowKey(r) {
+    const batchNo = (r.batch && r.batch.batch_number) || null;
+    return [r.item_id, r.item_unit_of_measure_id, batchNo || '-',
+            r.inventory_status || 'available'].join('|');
+  }
+
+  /* The records behind one row as they stand in `records`, oldest first - the
+   * order C7 takes from (header note 5). Oldest = created first, by created_at
+   * then id; the sort is stable, so the API's own order breaks any tie. */
+  function stockParts(records, g, fromLocationId) {
+    return records
+      .filter((r) => String(r.location_id) === String(fromLocationId) && rowKey(r) === g.key)
+      .map((r) => {
+        const onHand = Number(r.on_hand_quantity) || 0;
+        return {
+          id: r.id, lp: r.license_plate_no || null, onHand,
+          movable: Math.max(0, onHand - (Number(r.allocated_quantity) || 0) -
+                                       (Number(r.suspended_quantity) || 0)),
+          createdAt: Number(r.created_at) || 0,
+        };
+      })
+      .filter((p) => p.onHand > 0)
+      .sort((a, b) => (a.createdAt - b.createdAt) || (Number(a.id) - Number(b.id)) || 0);
+  }
+
   /* Group records the transfer API cannot tell apart. The adjust call identifies
    * stock by item + location + uom + batch + status, so records differing only by
    * licence plate collapse into one row (see header note 5). */
@@ -388,7 +419,7 @@
       const factor = Number(iuom.factor) || 1;
       const batchNo = (r.batch && r.batch.batch_number) || null;
       const status = r.inventory_status || 'available';
-      const key = [r.item_id, r.item_unit_of_measure_id, batchNo || '-', status].join('|');
+      const key = rowKey(r);
       if (!map.has(key)) {
         map.set(key, {
           key,
@@ -497,6 +528,63 @@
 
   function performTransfer(g, fromId, toId) {
     return apiPost('inventory/inventory/adjust', buildTransferBody(g, fromId, toId));
+  }
+
+  /* Move one row. A merged row (header note 5) is several records, and C7 only
+   * ever takes from the oldest of them: asking for the row's total in one call
+   * failed with "quantity not enough" whenever the total was more than that one
+   * record held - 180 + 18 on two LPs showed as 198, refused 198, took 180 and
+   * left 18 behind. So a merged row goes a record at a time: ask for no more
+   * than one record holds, re-read the bin, repeat.
+   *
+   * The re-read is what keeps this honest. Our idea of "oldest" is only a guess
+   * at C7's; if C7 refuses a size, it is drawing on a different record, so the
+   * next record's size is tried. A refused call moves nothing, so a wrong guess
+   * costs one call, never stock.
+   *
+   * Returns { moved, error }: base units actually moved, and why it stopped
+   * short (null when the whole qty went). Never throws for a merged row - a
+   * failure part way through must still report what already moved. */
+  async function moveRow(g, fromId, toId) {
+    if (g.recordIds.length <= 1) {
+      await performTransfer(g, fromId, toId);
+      return { moved: g.qty, error: null };
+    }
+    let remaining = g.qty, moved = 0;
+    for (let call = 0; remaining > 0; call++) {
+      if (call >= 3 * g.recordIds.length + 3) {         // runaway guard
+        return { moved, error: new Error('stopped after ' + call + ' calls') };
+      }
+      let parts;
+      try {
+        parts = stockParts(await readLocationStock(State.from.location_code), g, fromId);
+      } catch (e) {
+        return { moved, error: e };
+      }
+      // Whole units of the record's UOM only, oldest record's size first.
+      const sizes = [...new Set(parts
+        .map((p) => Math.floor(Math.min(remaining, p.movable) / g.factor) * g.factor)
+        .filter((q) => q > 0))];
+      if (!sizes.length) {
+        return { moved, error: new Error('nothing more here can be moved') };
+      }
+      let lastErr = null, took = 0;
+      for (const q of sizes) {
+        try {
+          await performTransfer(Object.assign({}, g, { qty: q }), fromId, toId);
+          took = q;
+          break;
+        } catch (e) {
+          lastErr = e;
+          if (!/not enough/i.test(String((e && e.message) || e))) break;
+        }
+      }
+      if (!took) return { moved, error: lastErr };
+      moved += took;
+      remaining -= took;
+      Log.ok(g.itemCode + ': moved ' + took + ' (' + moved + ' of ' + g.qty + ')');
+    }
+    return { moved, error: null };
   }
 
   // ---------------------------------------------------------------------------
@@ -1451,8 +1539,8 @@
         // Surface the two things a picker can't infer from the rows alone.
         const notes = [];
         State.rows.filter((r) => r.lps.length > 1).forEach((r) =>
-          notes.push(r.itemCode + ': ' + r.lps.length + ' licence plates merged - Canary7 takes ' +
-            'from the oldest (' + r.lps[0] + ') and the destination gets no LP'));
+          notes.push(r.itemCode + ': ' + r.lps.length + ' licence plates merged - moved one ' +
+            'LP at a time, and the destination gets no LP'));
         State.rows.filter((r) => movableQty(r) < r.onHand).forEach((r) =>
           notes.push(r.itemCode + ': allocated stock, max movable ' + movableQty(r) + ' of ' + r.onHand));
         // Folded: allocated rows are already flagged red in the list itself,
@@ -1561,7 +1649,7 @@
              '  (' + picked.length + ' lines)');
 
     const failures = [];
-    let okCount = 0, failCount = 0;
+    let okCount = 0, failCount = 0, partCount = 0;   // partCount: failed, but some moved
     // Sequential on purpose: C7 resolves stock oldest-record-first, so parallel
     // calls against one bin could race.
     for (const g of picked) {
@@ -1570,17 +1658,28 @@
         ' ×' + g.qty + (g.factor > 1 ? ' (' + sendQty + ' ' + g.uomName + ')' : '');
       if (g.lps.length > 1) {
         Log.warn(g.itemCode + ' spans LPs ' + g.lps.join(', ') +
-          ' - C7 takes from the oldest and the destination gets no LP');
+          ' - moving it a record at a time; the destination gets no LP');
       }
+      let res;
       try {
-        await performTransfer(g, State.from.id, State.to.id);
+        res = await moveRow(g, State.from.id, State.to.id);
+      } catch (e) {
+        res = { moved: 0, error: e };
+      }
+      if (!res.error) {
         okCount++;
         Log.ok(label + ' moved');
-      } catch (e) {
+      } else {
         failCount++;
-        const why = String((e && e.message) || e);
-        failures.push(g.itemCode + (g.batchNo ? ' [' + g.batchNo + ']' : '') + ' - ' + why);
-        Log.err(label + ' FAILED - ' + why);
+        const why = String((res.error && res.error.message) || res.error);
+        // A merged row can stop part way. Say how much went, or the operator
+        // would retry the full qty against what is left.
+        const part = res.moved > 0
+          ? 'moved ' + res.moved + ' of ' + g.qty + ', ' + (g.qty - res.moved) + ' not moved - '
+          : '';
+        if (res.moved > 0) partCount++;
+        failures.push(g.itemCode + (g.batchNo ? ' [' + g.batchNo + ']' : '') + ' - ' + part + why);
+        Log.err(label + ' FAILED - ' + part + why);
       }
     }
 
@@ -1608,13 +1707,19 @@
         State.to.location_code, confirmed);
       Audio.chime('ok');
       buzz('ok');
-    } else if (okCount === 0) {
+    } else if (okCount === 0 && partCount === 0) {
       Status.show('err', 'Transfer failed - nothing moved', failures);
       Audio.chime('error');
       buzz('error');
     } else {
-      Status.show('warn', 'Partly done - ' + okCount + ' moved, ' + failCount + ' failed',
-        failures.concat(['Moved lines are already at ' + State.to.location_code + '.']));
+      // A part-moved line is never "nothing moved" - that would invite a retry
+      // of the full qty on top of what already went.
+      const bits = [];
+      if (okCount) bits.push(okCount + ' moved');
+      if (partCount) bits.push(partCount + ' part moved');
+      if (failCount - partCount) bits.push((failCount - partCount) + ' failed');
+      Status.show('warn', 'Partly done - ' + bits.join(', '),
+        failures.concat(['Moved stock is already at ' + State.to.location_code + '.']));
       Audio.chime('error');
       buzz('error');
     }
@@ -1766,7 +1871,7 @@
   window.__malpaTransfer = {
     VERSION, State, Status, open: openTransfer, close: closeUI,
     apiGet, apiPost, getToken,
-    groupRows, validateRow, movableQty, buildTransferBody,
+    groupRows, stockParts, moveRow, validateRow, movableQty, buildTransferBody,
     resolveLocation, searchLocations, chooseLocation, readLocationStock, injectNav, openQtyPad,
     clearFrom, clearTo, resetAfterTransfer, doTransfer, refreshGo, renderRows, loadFrom, checkTo,
     showOurs, hideOurs, syncTabs, restoreOthers,
