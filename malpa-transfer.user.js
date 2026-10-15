@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Transfer
 // @namespace    https://malpa.canary7.com
-// @version      2.6.1
+// @version      2.7.0
 // @description  Location-to-location stock transfer for Canary7 WMS - TC51 optimised
 // @author       Malpa 3PL
 // @homepageURL  https://github.com/zaynnev/malpa3pl
@@ -97,7 +97,7 @@
   // 0. CONSTANTS
   // ---------------------------------------------------------------------------
   const TAG          = '[MalpaTransfer]';
-  const VERSION      = '2.6.0';   // keep in step with @version in the header
+  const VERSION      = '2.7.0';   // keep in step with @version in the header
   const API_ROOT     = 'https://stgauth.canary7.com';
   const API_BASE     = API_ROOT + '/index.php?r=';
   const WAREHOUSE_ID = 10;                      // 10 = Darra (Malpa's only live WH)
@@ -253,21 +253,38 @@
       this.el.style.display = 'none';
       this.el.innerHTML = '';
       this.el.className = 'mtr-status';
+      this.el.onclick = null;
     },
-    /* kind: ok | err | warn.  lines[] = optional detail, one per row. */
-    show(kind, title, lines) {
+    /* kind: ok | err | warn.  lines[] = optional detail, one per row.
+     * opts.fold: start with the title only and the detail one tap away. */
+    show(kind, title, lines, opts) {
       if (!this.el) return;
-      this.el.className = 'mtr-status mtr-status-' + kind;
+      // A message is never shown into a screen that is hiding the banner.
+      setFullList(false);
+      const list = (lines || []).filter(Boolean);
+      const fold = !!(opts && opts.fold) && list.length > 0;
+      this.el.className = 'mtr-status mtr-status-' + kind +
+        (fold ? ' mtr-foldable mtr-folded' : '');
       this.el.style.display = 'block';
       const mark = kind === 'ok' ? '✓' : (kind === 'err' ? '✗' : '!');
-      let html = '<div class="mtr-status-title">' + mark + ' ' + _esc(title) + '</div>';
-      const list = (lines || []).filter(Boolean);
+      let html = '<div class="mtr-status-title"><span>' + mark + ' ' + _esc(title) + '</span>' +
+        (fold ? '<span class="mtr-status-more"></span>' : '') + '</div>';
       if (list.length) {
         html += '<div class="mtr-status-lines">' +
           list.map((l) => '<div>' + _esc(l) + '</div>').join('') + '</div>';
       }
       this.el.innerHTML = html;
       this.el.scrollTop = 0;
+      this.el.onclick = null;
+      if (fold) {
+        const el = this.el;
+        const more = el.querySelector('.mtr-status-more');
+        const paint = () => {
+          more.textContent = el.classList.contains('mtr-folded') ? 'Show ▸' : 'Hide ▾';
+        };
+        el.onclick = () => { el.classList.toggle('mtr-folded'); el.scrollTop = 0; paint(); };
+        paint();
+      }
     },
   };
 
@@ -566,8 +583,13 @@
 
       /* -- Cards / scan rows -- */
       .mtr-card { background: #fff; border: 1px solid #e1e6ef; margin: 0 0 8px; flex-shrink: 0; }
+      /* Label and the resolved-location message share one line: a line of its
+         own under the input cost the stock list a third of a row per card. */
+      .mtr-card-head {
+        display: flex; align-items: baseline; gap: 8px; padding: 7px 10px 0; min-width: 0;
+      }
       .mtr-card-label {
-        display: block; padding: 7px 10px 0; font-size: 10px; font-weight: 600;
+        display: block; flex-shrink: 0; font-size: 10px; font-weight: 600;
         letter-spacing: .08em; text-transform: uppercase; color: #9faecb;
       }
       .mtr-scanrow { display: flex; gap: 6px; padding: 5px 10px 8px; }
@@ -588,7 +610,12 @@
       .mtr-scanrow button.mtr-clr {
         padding: 0; width: 42px; font-size: 22px; line-height: 1; color: #7d92a3;
       }
-      .mtr-loc-msg { padding: 0 10px 8px; font-size: 12px; font-weight: 500; }
+      /* Truncates rather than wraps. Every failure that lands here is also shown
+         in full in the status banner. */
+      .mtr-loc-msg {
+        margin-left: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+        white-space: nowrap; font-size: 11px; font-weight: 600;
+      }
       .mtr-loc-msg.ok { color: #12833f; }
       .mtr-loc-msg.bad { color: #ff5454; }
 
@@ -601,8 +628,19 @@
         font-size: 12px; font-weight: 600; color: #40607a; position: sticky; top: 0; z-index: 2;
       }
       .mtr-tablehead .mtr-count { margin-left: auto; font-weight: 500; color: #9faecb; }
+      .mtr-tablehead .mtr-full-btn {
+        flex: 0 0 auto; min-height: 30px; padding: 0 10px; background: #fff;
+        border: 1px solid #c3ced8; font: 600 12px Roboto, sans-serif; color: #20455c;
+        cursor: pointer; -webkit-tap-highlight-color: transparent; touch-action: manipulation;
+      }
+      .mtr-tablehead .mtr-full-btn:active { background: #d8ecfa; }
+      /* Full list: the scan cards and the status banner step aside so a mixed
+         location's lines get the whole screen. !important because Status sets
+         the banner's display inline. Any scan or new message ends it. */
+      #mtr-tab-view.mtr-full .mtr-card,
+      #mtr-tab-view.mtr-full .mtr-status { display: none !important; }
       .mtr-row {
-        display: flex; align-items: flex-start; gap: 8px; padding: 8px 10px;
+        display: flex; align-items: flex-start; gap: 8px; padding: 6px 10px;
         border-bottom: 1px solid #edf1f5; background: #fff;
       }
       .mtr-row.mtr-on { background: #f0f8fd; }
@@ -620,7 +658,12 @@
       .mtr-cb { flex: 0 0 auto; width: 26px; height: 26px; margin: 2px 0 0; }
       .mtr-mid { flex: 1; min-width: 0; }
       .mtr-sku { font: 700 15px/1.2 monospace; word-break: break-all; }
-      .mtr-desc { font-size: 12px; color: #9faecb; margin-top: 2px; overflow-wrap: anywhere; }
+      /* One line: a long product name used to wrap to three. The qty keypad
+         shows it in full. */
+      .mtr-desc {
+        font-size: 12px; color: #9faecb; margin-top: 2px;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
       .mtr-meta { margin-top: 4px; display: flex; flex-wrap: wrap; gap: 4px; }
       .mtr-tag {
         font-size: 10px; font-weight: 600; padding: 2px 5px; background: #eef1f5;
@@ -630,13 +673,18 @@
       .mtr-tag.mtr-lp { background: #f0e6ff; color: #5b2ea8; }
       .mtr-tag.mtr-stat { background: #ffe4e0; color: #a3311f; }
       .mtr-right { flex: 0 0 auto; width: 88px; text-align: right; }
+      /* "of 60" / "max 5" rides inside the button rather than on a line below
+         it - that line was what set the height of every row. */
       .mtr-qty {
-        width: 100%; min-height: 46px; font: 700 20px/1 monospace; text-align: right;
-        padding: 10px 8px; border: 2px solid #20a8d8; background: #f0f8fd; color: #20455c;
+        width: 100%; min-height: 46px; display: flex; flex-direction: column;
+        align-items: flex-end; justify-content: center; gap: 3px;
+        font: 700 20px/1 monospace; text-align: right;
+        padding: 5px 8px; border: 2px solid #20a8d8; background: #f0f8fd; color: #20455c;
         cursor: pointer; -webkit-tap-highlight-color: transparent; touch-action: manipulation;
       }
       .mtr-qty:active { background: #d8ecfa; }
-      .mtr-onhand { font-size: 11px; color: #9faecb; margin-top: 3px; }
+      .mtr-onhand { font: 500 11px/1 Roboto, sans-serif; color: #9faecb; }
+      .mtr-onhand.mtr-onhand-max { color: #c5221f; font-weight: 600; }
       .mtr-err { font-size: 11px; color: #ff5454; font-weight: 600; margin-top: 3px; }
       .mtr-empty { padding: 18px 10px; text-align: center; color: #9faecb; font-size: 13px; }
 
@@ -647,6 +695,16 @@
         max-height: 132px; overflow-y: auto; -webkit-overflow-scrolling: touch;
       }
       .mtr-status-title { font: 600 15px/1.3 Roboto, sans-serif; }
+      /* Folded: title only, detail one tap away. Used for the advisory shown on
+         loading a FROM - at full size it squeezed the stock list to nothing. */
+      .mtr-status.mtr-foldable { cursor: pointer; -webkit-tap-highlight-color: transparent; }
+      .mtr-status.mtr-foldable .mtr-status-title { display: flex; align-items: baseline; gap: 8px; }
+      .mtr-status-more {
+        margin-left: auto; flex-shrink: 0; font: 600 12px Roboto, sans-serif;
+        text-decoration: underline;
+      }
+      .mtr-status.mtr-folded { padding-top: 7px; padding-bottom: 7px; }
+      .mtr-status.mtr-folded .mtr-status-lines { display: none; }
       .mtr-status-lines {
         margin-top: 5px; font: 500 12px/1.5 Roboto, sans-serif; opacity: .9;
         overflow-wrap: anywhere;
@@ -965,7 +1023,10 @@
     root.innerHTML = `
       <div style="flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden;padding:8px 8px 0">
         <div class="mtr-card">
-          <span class="mtr-card-label">From location</span>
+          <div class="mtr-card-head">
+            <span class="mtr-card-label">From location</span>
+            <span class="mtr-loc-msg" id="mtr-from-msg"></span>
+          </div>
           <div class="mtr-scanrow">
             <input id="mtr-from" type="text" autocomplete="off"
                    autocorrect="off" autocapitalize="characters" spellcheck="false"
@@ -973,7 +1034,6 @@
             <button id="mtr-from-clr" class="mtr-clr" title="Clear">&times;</button>
             <button id="mtr-from-go">Load</button>
           </div>
-          <div class="mtr-loc-msg" id="mtr-from-msg"></div>
         </div>
 
         <div style="flex:1;min-height:0;display:flex;flex-direction:column;border:1px solid #e1e6ef;
@@ -982,12 +1042,16 @@
             <input type="checkbox" id="mtr-all" class="mtr-cb" title="Select all">
             <span>Select all</span>
             <span class="mtr-count" id="mtr-count"></span>
+            <button type="button" class="mtr-full-btn" id="mtr-full"></button>
           </div>
           <div class="mtr-rows-wrap" id="mtr-rows"></div>
         </div>
 
         <div class="mtr-card">
-          <span class="mtr-card-label">To location</span>
+          <div class="mtr-card-head">
+            <span class="mtr-card-label">To location</span>
+            <span class="mtr-loc-msg" id="mtr-to-msg"></span>
+          </div>
           <div class="mtr-scanrow">
             <input id="mtr-to" type="text" autocomplete="off"
                    autocorrect="off" autocapitalize="characters" spellcheck="false"
@@ -995,7 +1059,6 @@
             <button id="mtr-to-clr" class="mtr-clr" title="Clear">&times;</button>
             <button id="mtr-to-go">Check</button>
           </div>
-          <div class="mtr-loc-msg" id="mtr-to-msg"></div>
         </div>
       </div>
 
@@ -1013,6 +1076,7 @@
     R.tablehead = document.getElementById('mtr-tablehead');
     R.all = document.getElementById('mtr-all');
     R.count = document.getElementById('mtr-count');
+    R.full = document.getElementById('mtr-full');
     R.go = document.getElementById('mtr-go');
     Status.setEl(document.getElementById('mtr-status'));
 
@@ -1067,11 +1131,40 @@
       renderRows();
       Log.info(on ? 'All ' + State.rows.length + ' lines selected' : 'Selection cleared');
     });
+    R.full.addEventListener('click', () => {
+      setFullList(!R._full);
+      // Do not leave focus on the button: the Enter that ends the next scan
+      // would press it again.
+      R.full.blur();
+    });
+    setFullList(false);
     R.go.addEventListener('click', doTransfer);
 
     Audio.init();
     renderRows();
     setTimeout(() => { R.from.focus(); measureHeight(); }, 80);
+  }
+
+  /* Full list: hide both scan cards and the banner so a busy mixed location's
+   * lines get the whole screen. The way back has to be obvious and automatic:
+   * the button, a scan (see onGlobalKey), any Status message, or the list
+   * emptying all return to the normal view. */
+  function setFullList(on) {
+    const panel = document.getElementById('mtr-tab-view');
+    R._full = !!on && State.rows.length > 0;
+    if (panel) panel.classList.toggle('mtr-full', R._full);
+    if (R.full) {
+      R.full.textContent = R._full ? '⤡ Scan fields' : '⤢ Full list';
+      R.full.setAttribute('aria-pressed', R._full ? 'true' : 'false');
+    }
+    // Let go of a scan field that has just been hidden, so the scanner's keys
+    // reach onGlobalKey rather than typing into a field nobody can see - and
+    // note which one it was, since that is where the next scan must go.
+    const ae = document.activeElement;
+    if (R._full && ae && (ae === R.from || ae === R.to)) {
+      R._armed = ae.id;
+      ae.blur();
+    }
   }
 
   function canGo() {
@@ -1102,6 +1195,7 @@
     if (R.tablehead) R.tablehead.style.display = State.rows.length ? 'flex' : 'none';
 
     if (!State.rows.length) {
+      setFullList(false);
       const d = document.createElement('div');
       d.className = 'mtr-empty';
       d.textContent = State.from
@@ -1183,12 +1277,11 @@
       qty.className = 'mtr-qty';
       qty.textContent = String(g.qty);
       qty.addEventListener('click', () => openQtyPad(g));
-      const oh = document.createElement('div');
-      oh.className = 'mtr-onhand';
+      const oh = document.createElement('span');
+      oh.className = 'mtr-onhand' + (hasAlloc ? ' mtr-onhand-max' : '');
       oh.textContent = hasAlloc ? 'max ' + movableQty(g) : 'of ' + g.onHand;
-      if (hasAlloc) oh.style.color = '#c5221f';
+      qty.appendChild(oh);
       right.appendChild(qty);
-      right.appendChild(oh);
 
       row.appendChild(cb);
       row.appendChild(mid);
@@ -1362,7 +1455,13 @@
             'from the oldest (' + r.lps[0] + ') and the destination gets no LP'));
         State.rows.filter((r) => movableQty(r) < r.onHand).forEach((r) =>
           notes.push(r.itemCode + ': allocated stock, max movable ' + movableQty(r) + ' of ' + r.onHand));
-        if (notes.length && !quiet) Status.show('warn', 'Check these lines before moving', notes);
+        // Folded: allocated rows are already flagged red in the list itself,
+        // and at full size this banner left the list no room at all.
+        const flagged = State.rows.filter((r) => r.lps.length > 1 || movableQty(r) < r.onHand).length;
+        if (notes.length && !quiet) {
+          Status.show('warn', 'Check ' + flagged + ' line' + (flagged === 1 ? '' : 's') +
+            ' before moving', notes, { fold: true });
+        }
         if (!quiet && R.to) setTimeout(() => R.to.focus(), 60);
       }
     } catch (e) {
@@ -1544,6 +1643,8 @@
     if (State.busy) return;
     // ...nor while a sheet is open (qty keypad, wildcard picker).
     if (document.getElementById('mtr-pad') || document.getElementById('mtr-pick')) return;
+    // ...nor into a field the full list is hiding - onGlobalKey routes scans then.
+    if (R._full) return;
     const id = R._armed === 'mtr-to' ? 'mtr-to' : 'mtr-from';
     const el = document.getElementById(id);
     if (!el || !document.contains(el)) return;
@@ -1637,8 +1738,26 @@
   }
 
   function onGlobalKey(e) {
-    if (!document.getElementById('mtr-tab-view')) return;
-    if (e.key === 'Escape') { e.preventDefault(); closeUI(); }
+    const panel = document.getElementById('mtr-tab-view');
+    if (!panel) return;
+    if (e.key === 'Escape') { e.preventDefault(); closeUI(); return; }
+    // A scan while the full list is up. The scan fields are hidden, so nothing
+    // holds focus and the keys would be lost: bring the fields back and hand
+    // this first character to the armed one ourselves, as replaceOnNextType
+    // would have. The rest of the scan, Enter included, then lands normally.
+    if (!R._full || panel.style.display === 'none') return;
+    if (!e.key || e.key.length !== 1 || e.key === ' ' || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (document.getElementById('mtr-pad') || document.getElementById('mtr-pick')) return;
+    // Still holding focus from before it was hidden: it takes the key itself.
+    if (e.target === R.from || e.target === R.to) { setFullList(false); return; }
+    if (e.target && e.target.tagName === 'INPUT' && e.target.type === 'text') return;
+    const el = R._armed === 'mtr-to' ? R.to : R.from;
+    if (!el) return;
+    e.preventDefault();
+    setFullList(false);
+    if (el.dataset.committed === '1') { el.value = ''; delete el.dataset.committed; }
+    el.value += e.key;
+    el.focus();
   }
 
   // ---------------------------------------------------------------------------
