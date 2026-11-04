@@ -109,7 +109,7 @@
   // Card 581 maps shipment number → expected carton label, then we map that
   // label to a Canary7 container type for dimensions/scan confirmation.
   const PACK_PROMPT_LABELS_URL = 'https://metrics.malpasoft.com/api/card/581/query';
-  const PACK_PROMPT_LABELS_API_KEY = 'mb_N5fatrQAS8lmgPylcQ/uRBe9OfC/cBj8zPzGQRf0H14=';
+  const PACK_PROMPT_LABELS_API_KEY = 'mb_xjGqmq4S/Ckn49W+J8nZqS971EbpWUrz0DKmRRIlkKQ=';
 
   const PERF = { enabled: true };
 
