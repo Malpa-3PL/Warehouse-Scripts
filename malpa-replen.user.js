@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Malpa C7 - Replen Early Qty
 // @namespace    malpa
-// @version      4.8.1
-// @description  Shows replen qty + To Location before scanning (matched to the on-screen job, profile-scoped); keeps Confirm Units editable; blocks over-moves against LIVE on-hand at the actual execute call, not just the Next button.
+// @version      4.9.1
+// @description  Shows replen qty + To Location before scanning, with live on-hand (base units) in brackets beside From and To Location (matched to the on-screen job, profile-scoped); keeps Confirm Units editable; blocks over-moves against LIVE on-hand at the actual execute call, not just the Next button.
 // @match        https://*.canary7.com/*
 // @grant        none
 // @homepageURL  https://github.com/zaynnev/malpa3pl
@@ -45,6 +45,18 @@
 //    (v4.7 compared the raw entered figure against available_quantity with no
 //    conversion — under-blocking on any factor > 1 UOM.)
 //
+//  * LOCATION TOTALS (v4.9, re-probed 2026-11-23):
+//      GET index.php?r=inventory/inventory&item_code=<code>&location_code=<code>
+//    location_code is an EXACT match in this combination ("A16-B07" -> [],
+//    "A16-B07-S302" -> its records), so the response is already scoped to the
+//    bin. One bin can hold several records of the same item in different UOMs
+//    (A16-B07-S302: 16 + 96), and on_hand_quantity is BASE units on all of
+//    them, so the bracketed figure is the SUM, in base units (Each).
+//    The guard's from-location read and the bracketed total are the SAME call
+//    (fetchBin, de-duplicated), and it is first fired at assign-replenishment-
+//    job time — before C7 draws the job — so the figure is usually ready by
+//    the time the screen is.
+//
 //  * get-unallocated-inventory returns available = on_hand - allocated -
 //    suspended (verified: inventory 10439, on_hand 1101 / alloc 0 / susp 0 ->
 //    available_quantity 1101). Still fetched, for the warning line only.
@@ -54,12 +66,22 @@
   'use strict';
 
   const TAG = '[Malpa Replen]';
-  const VERSION = '4.8';
+  const VERSION = '4.9';
   const QTY_ID = 'malpa-qty-line';
   const ERR_ID = 'malpa-qty-error';
+  const FROM_OH_ID = 'malpa-from-oh';
+  const TO_OH_ID = 'malpa-to-oh';
+  // Brand coral from the Malpa Portal tokens (--brand, light). Used for all of
+  // OUR text on the screen; C7's own text keeps its colours.
+  const BRAND = '#f26247';
+  const OURS = 'color:' + BRAND + ';';
   const API = 'https://stgauth.canary7.com/index.php?r=';
   const COMMIT = 'execute-replenishment-job';
   const POLL_MS = 2500;          // how often the live on-hand figure is refreshed
+  // Background preload of the whole job pool's bins (display figures only).
+  const PRELOAD_TTL = 60000;     // a bin fetched within this long is not re-queued
+  const PRELOAD_CONC = 3;        // max preload requests in flight at once
+  const PRELOAD_MAX_JOBS = 50;   // only the first N jobs of a pool (pool order = work order)
 
   const jobsById = {};           // get-replenishment-jobs rows for the CURRENT profile
   let currentJobId = null;       // job_id from the latest assign-replenishment-job
@@ -77,6 +99,13 @@
     lastQty: null,               // last quantity the operator had in the field
     polling: false
   };
+
+  // Whole-bin on-hand for the bracketed display, keyed by item|location so a
+  // figure fetched early (at assign) or for a previous job shows instantly.
+  //   { total: <base units> | null, at: <ms>, failed: bool }
+  const binCache = {};
+  const binInFlight = {};        // same key -> the pending Promise (no duplicate calls)
+  const binKey = (item, loc) => item + '|' + loc;
 
   console.log(TAG, 'script loaded v' + VERSION);
 
@@ -98,6 +127,24 @@
     const haveEntered = Math.floor(Number(onHand) / factor);
     return 'Only ' + haveEntered + ' on hand at ' + (s.where || 'the from-location') +
            ' — you entered ' + qty + '. Reduce the quantity.';
+  }
+
+  // Sum on_hand_quantity (base units) over every record returned for a bin.
+  function sumOnHand(rows) {
+    if (!Array.isArray(rows)) return null;
+    let t = 0;
+    for (const r of rows) {
+      const n = Number(r && r.on_hand_quantity);
+      if (isFinite(n)) t += n;
+    }
+    return t;
+  }
+
+  // What goes in the brackets: '(112)', '(?)' on failure, '(…)' while loading.
+  function bracketText(entry) {
+    if (entry && entry.total != null && isFinite(Number(entry.total))) return '(' + Number(entry.total) + ')';
+    if (entry && entry.failed) return '(?)';
+    return '(…)';
   }
 
   function isCommitUrl(u) {
@@ -125,6 +172,55 @@
     }
     data.forEach(j => { if (j && j.id != null) jobsById[j.id] = j; });
     console.log(TAG, 'cached', data.length, 'jobs (profile', profileId + ', total', Object.keys(jobsById).length + ')');
+    preloadPool(data);
+  }
+
+  // ---- Background preload. When C7 fetches the job pool we queue every job's
+  // from- and to-bin and fetch them a few at a time, so the bracketed figures
+  // are already in binCache by the time the operator reaches each job. A new
+  // pool REPLACES the queue (it reflects the latest work order); bins fetched
+  // within PRELOAD_TTL are skipped. Display only: the guard never trusts the
+  // cache — it reads live through refreshOnHand.
+  let preloadQueue = [];
+  let preloadActive = 0;
+
+  function preloadPool(rows) {
+    if (!Array.isArray(rows)) return;
+    const now = Date.now();
+    const seen = new Set();
+    const q = [];
+    // The assigned job first, then pool order.
+    const ordered = rows.slice(0, PRELOAD_MAX_JOBS);
+    const cur = ordered.findIndex(r => r && currentJobId != null && (r.job_id === currentJobId || (r.job && r.job.id === currentJobId)));
+    if (cur > 0) ordered.unshift(ordered.splice(cur, 1)[0]);
+    for (const r of ordered) {
+      const it = r && r.item && r.item.item_code;
+      if (!it) continue;
+      for (const loc of [r.fromLocation && r.fromLocation.location_code, r.toLocation && r.toLocation.location_code]) {
+        if (!loc) continue;
+        const k = binKey(it, loc);
+        if (seen.has(k)) continue;
+        seen.add(k);
+        const c = binCache[k];
+        if (c && !c.failed && now - c.at < PRELOAD_TTL) continue;
+        q.push([it, loc]);
+      }
+    }
+    preloadQueue = q;
+    if (q.length) console.log(TAG, 'preloading', q.length, 'bins for', ordered.length, 'jobs');
+    pumpPreload();
+  }
+
+  function pumpPreload() {
+    while (preloadActive < PRELOAD_CONC && preloadQueue.length) {
+      const [it, loc] = preloadQueue.shift();
+      preloadActive++;
+      fetchBin(it, loc).catch(() => {}).then(() => {
+        preloadActive--;
+        try { if (onReplenExecScreen()) paintTotals(); } catch (e) {}
+        pumpPreload();
+      });
+    }
   }
 
   function noteAssign(url) {
@@ -135,12 +231,24 @@
       resetStock();
       const l = document.getElementById(QTY_ID);
       if (l) l.remove(); // force redraw for the new job
+      // PREFETCH: the assign call goes out before C7 draws the job, so start the
+      // stock lookup now, in parallel with C7's own load, instead of waiting for
+      // the screen to render and match. setTimeout lets C7 finish setting this
+      // request's headers first, so the auth token is current.
+      setTimeout(() => {
+        try {
+          const id = currentJobId;
+          const r = Object.values(jobsById).find(x => x.job_id === id || (x.job && x.job.id === id));
+          if (r) { console.log(TAG, 'prefetching stock for assigned job', id); refreshTotals(r); refreshOnHand(r); }
+        } catch (e) {}
+      }, 0);
     }
   }
 
   function resetStock() {
     R.invId = null; R.onHand = null; R.allocated = null; R.suspended = null;
     R.fetchedAt = 0; R.factor = 1; R.lastQty = null;
+    const f = document.getElementById(FROM_OH_ID); if (f) f.remove();
   }
 
   const origOpen = XMLHttpRequest.prototype.open;
@@ -259,12 +367,8 @@
     const locCode = row.fromLocation && row.fromLocation.location_code;
     if (invId == null || !itemCode || !locCode) return Promise.resolve(null);
 
-    return apiGet('inventory/inventory', {
-      item_code: itemCode,
-      location_code: locCode,
-      'per-page': 200,
-      fields: 'id,on_hand_quantity,allocated_quantity,suspended_quantity,item_unit_of_measure_id,location_id'
-    }).then(rows => {
+    // Shares the request (and the cache) with the bracketed from-location total.
+    return fetchBin(itemCode, locCode).then(rows => {
       // location_code is a PREFIX match and one bin can hold several records
       // (uom / batch / LP), so match the exact inventory id from the job.
       const rec = Array.isArray(rows) ? rows.find(x => String(x.id) === String(invId)) : null;
@@ -283,6 +387,44 @@
     });
   }
 
+  // ONE inventory call per item+bin, shared by the guard (from-location) and the
+  // bracketed totals (from + to). A second caller for the same bin while one is
+  // in flight gets the same Promise, so each poll costs 2 calls, not 3.
+  // Records the whole-bin total in binCache; resolves to the raw rows.
+  function fetchBin(itemCode, locCode) {
+    const k = binKey(itemCode, locCode);
+    if (binInFlight[k]) return binInFlight[k];
+    const p = apiGet('inventory/inventory', {
+      item_code: itemCode,
+      location_code: locCode,
+      'per-page': 200,
+      fields: 'id,on_hand_quantity,allocated_quantity,suspended_quantity,item_unit_of_measure_id,location_id'
+    }).then(rows => {
+      binCache[k] = { total: sumOnHand(rows), at: Date.now(), failed: false };
+      return rows;
+    }, err => {
+      const prev = binCache[k];
+      // Keep a figure we already had; only show (?) if we never had one.
+      if (!prev || prev.total == null) binCache[k] = { total: null, at: Date.now(), failed: true };
+      throw err;
+    });
+    binInFlight[k] = p;
+    const done = () => { if (binInFlight[k] === p) delete binInFlight[k]; };
+    p.then(done, done);
+    return p;
+  }
+
+  // Refresh both bracketed totals for a job row, then repaint.
+  function refreshTotals(row) {
+    const itemCode = row.item && row.item.item_code;
+    const fromCode = row.fromLocation && row.fromLocation.location_code;
+    const toCode = row.toLocation && row.toLocation.location_code;
+    const one = loc => (itemCode && loc ? fetchBin(itemCode, loc).catch(err => {
+      console.warn(TAG, 'bin total failed for', itemCode, '@', loc, err);
+    }) : Promise.resolve());
+    return Promise.all([one(fromCode), one(toCode)]).then(() => paintTotals());
+  }
+
   function startPolling() {
     if (R.polling) return;
     R.polling = true;
@@ -292,6 +434,7 @@
         const row = currentJob();
         if (!row) return;
         refreshOnHand(row);
+        refreshTotals(row);
       } catch (e) { console.warn(TAG, 'poll error', e); }
     }, POLL_MS);
     console.log(TAG, 'on-hand poller running every', POLL_MS + 'ms');
@@ -540,6 +683,45 @@
   function removeQtyLine() {
     const l = document.getElementById(QTY_ID);
     if (l) l.remove();
+    const f = document.getElementById(FROM_OH_ID);
+    if (f) f.remove();
+  }
+
+  // Set text only when it changes: sync() runs from a MutationObserver, so an
+  // unconditional write would retrigger it forever.
+  function setText(el, t) { if (el.textContent !== t) el.textContent = t; }
+
+  // Bracketed whole-bin on-hand beside From Location (C7's element — we only
+  // append a span after its <strong>, never touch its own nodes) and beside our
+  // own To Location line.
+  function paintTotals() {
+    const row = currentJob();
+    const item = row && row.item && row.item.item_code;
+    const fromCode = row && row.fromLocation && row.fromLocation.location_code;
+    const toCode = row && row.toLocation && row.toLocation.location_code;
+    const fromTxt = item && fromCode ? bracketText(binCache[binKey(item, fromCode)]) : '';
+    const toTxt = item && toCode ? bracketText(binCache[binKey(item, toCode)]) : '';
+
+    // From: only when the value sits in a <strong>. Without one, screenKeys()
+    // reads the code from the element's text, and our span would corrupt it.
+    const fromEl = findByLabel('From Location :');
+    const strong = fromEl && fromEl.querySelector('strong');
+    let span = document.getElementById(FROM_OH_ID);
+    if (!fromTxt || !strong) {
+      if (span) span.remove();
+    } else {
+      if (!span || span.previousSibling !== strong) {
+        if (span) span.remove();
+        span = document.createElement('span');
+        span.id = FROM_OH_ID;
+        span.style.cssText = OURS + 'font-weight:bold;margin-left:6px;';
+        strong.parentNode.insertBefore(span, strong.nextSibling);
+      }
+      setText(span, fromTxt);
+    }
+
+    const toSpan = document.getElementById(TO_OH_ID);
+    if (toSpan) setText(toSpan, toTxt);
   }
 
   function onReplenExecScreen() {
@@ -570,8 +752,15 @@
       if (R.invId == null || String(R.invId) !== String(invIdOf(row))) refreshOnHand(row);
 
       const key = String(row.id);
+      // No figure for this job's bins yet (prefetch missed, e.g. page reload
+      // mid-job): fetch now. fetchBin dedups, so this is free if one is pending.
+      const it = row.item && row.item.item_code;
+      const fc = row.fromLocation && row.fromLocation.location_code;
+      const tc = row.toLocation && row.toLocation.location_code;
+      if (it && ((fc && !binCache[binKey(it, fc)]) || (tc && !binCache[binKey(it, tc)]))) refreshTotals(row);
+
       const existing = document.getElementById(QTY_ID);
-      if (existing && existing.dataset.key === key && document.contains(existing)) return;
+      if (existing && existing.dataset.key === key && document.contains(existing)) { paintTotals(); return; }
       if (existing) existing.remove();
 
       const qty = qtyOf(row);
@@ -584,9 +773,11 @@
       line.dataset.key = key;
       line.style.display = 'contents';
       line.innerHTML =
-        '<div class="form-group ng-star-inserted">Qty to move : <strong>' + esc(qty) + ' × ' + esc(uom) + '</strong></div>' +
-        (toLoc ? '<div class="form-group ng-star-inserted">To Location : <strong>' + esc(toLoc) + '</strong></div>' : '');
+        '<div class="form-group ng-star-inserted" style="' + OURS + '">Qty to move : <strong>' + esc(qty) + ' × ' + esc(uom) + '</strong></div>' +
+        (toLoc ? '<div class="form-group ng-star-inserted" style="' + OURS + '">To Location : <strong>' + esc(toLoc) + '</strong>' +
+                 '<span id="' + TO_OH_ID + '" style="font-weight:bold;margin-left:6px;"></span></div>' : '');
       anchor.parentNode.insertBefore(line, anchor.nextSibling);
+      paintTotals();
 
       console.log(TAG, 'Qty line added:', qty, uom, 'to', toLoc, '(job', row.job_id + ', item', (row.item && row.item.item_code) + ')');
     } catch (e) {
@@ -595,7 +786,7 @@
   }
 
   // Debug handle for the on-device console.
-  window.__malpaReplen = { R, jobsById, currentJob, refreshOnHand, overMoveReason, VERSION };
+  window.__malpaReplen = { R, jobsById, currentJob, refreshOnHand, refreshTotals, overMoveReason, sumOnHand, bracketText, binCache, VERSION };
 
   new MutationObserver(sync).observe(document.body, { childList: true, subtree: true });
   setInterval(sync, 600);
