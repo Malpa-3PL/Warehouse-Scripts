@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Receiving
 // @namespace    https://malpa.canary7.com
-// @version      2.4.5
+// @version      2.5.0
 // @description  Fast single-screen receiving for Canary7 WMS - TC51 optimised
 // @author       Malpa 3PL
 // @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-receiving.user.js
@@ -247,6 +247,12 @@
     })(),
     lastLocation: null,
 
+    // Keep Item: after a check in, start the next line on the same item (and
+    // UoM) instead of going back to the item scan. { itemId, uomId } or null.
+    keepItem: (() => {
+      try { return sessionStorage.getItem('mrc_keepitem') === '1'; } catch (_) { return false; }
+    })(),
+    lastItem: null,
 
     done: 0,
     failedItems: [],
@@ -267,6 +273,7 @@
       this.header = null; this.receiptId = ''; this.details = [];
       this.itemsById = {}; this.refMap = {}; this.cur = null;
       this.done = 0; this.failedItems = [];
+      this.lastItem = null;   // item ids belong to the receipt just left
       this.err = ''; this.fb = ''; this.busy = null; this.notice = '';
       this.logOpen = false; this.logRows = null; this.logBusy = false; this.logErr = '';
     },
@@ -298,6 +305,46 @@
       }
       #mrc-root *, #mrc-root *::before, #mrc-root *::after { box-sizing:border-box; }
 
+      /* ---- Malpa design tokens (2.5.0) ----
+         Copied from the Malpa portal's tokens.css (light theme - Canary7 has no
+         dark mode). They style ONLY the text this script adds itself: hints,
+         feedback, banners, the keep rows and the suggested location. C7's own
+         form chrome (labels, inputs, buttons) keeps C7's look on purpose.
+         Inter is self-hosted on the portal and cannot be loaded here, so the
+         stack falls through to system-ui - Roboto on the TC51s. */
+      #mrc-root {
+        --mrc-font:'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+        --mrc-text:#14153f; --mrc-muted:#5f6372;
+        --mrc-ok-bg:#def4e6;   --mrc-ok-fg:#186a3c;
+        --mrc-warn-bg:#fbeecf; --mrc-warn-fg:#855400;
+        --mrc-crit-bg:#fde2de; --mrc-crit-fg:#a3261a;
+        --mrc-info-bg:#e0eafc; --mrc-info-fg:#2a4f9e;
+        --mrc-brand-on-subtle:#a52f19;
+        --mrc-pill-ring:rgb(20 21 63 / .1);
+        --mrc-t-xs:11px; --mrc-t-sm:13px; --mrc-t-base:14px;
+        --mrc-fw-medium:500; --mrc-fw-semibold:600; --mrc-lh:1.45;
+        --mrc-r-sm:6px; --mrc-r-pill:999px; --mrc-h-badge:20px;
+      }
+      .mrc-static, .mrc-fb, .mrc-banner, .mrc-warn-red, .mrc-keep-txt, .mrc-keep-sub,
+      .mrc-card-meta, .mrc-hist-empty, .mrc-sub, .mrc-pill, .mrc-req {
+        font-family:var(--mrc-font);
+      }
+      .mrc-pill {
+        display:inline-flex; align-items:center; height:var(--mrc-h-badge);
+        padding:0 8px; border-radius:var(--mrc-r-pill);
+        font-size:var(--mrc-t-sm); font-weight:var(--mrc-fw-semibold);
+        box-shadow:inset 0 0 0 1px var(--mrc-pill-ring); vertical-align:1px;
+      }
+      .mrc-pill.info { background:var(--mrc-info-bg); color:var(--mrc-info-fg); }
+      .mrc-pill.crit { background:var(--mrc-crit-bg); color:var(--mrc-crit-fg); }
+      .mrc-sub { font-size:var(--mrc-t-xs); color:var(--mrc-muted); }
+      .mrc-req {
+        margin-left:4px; font-size:var(--mrc-t-xs); font-weight:var(--mrc-fw-medium);
+        color:var(--mrc-crit-fg); text-transform:uppercase; letter-spacing:.03em;
+      }
+      .mrc-sugg { padding-top:4px; }
+      .mrc-spin.sm { width:11px; height:11px; border-width:2px; margin-right:4px; }
+
       /* ---- card ---- */
       .mrc-card {
         flex:1; min-height:0; display:flex; flex-direction:column;
@@ -309,7 +356,7 @@
         padding:.4rem .75rem; background:#f9f9fa; border-bottom:1px solid #e1e6ef;
       }
       .mrc-card-meta {
-        flex:1; font-size:12px; color:#374767; font-weight:500;
+        flex:1; font-size:12px; color:var(--mrc-text); font-weight:var(--mrc-fw-medium);
         white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
       }
       .mrc-prog { height:2px; background:#e1e6ef; flex-shrink:0; }
@@ -349,7 +396,7 @@
       /* Quantity alone is double size - it is the number being checked. */
       .mrc-hist td.q { font-size:24px; font-weight:500; color:#b5551d; line-height:1.1; }
       .mrc-hist td.t { color:#5d7d9a; font-variant-numeric:tabular-nums; }
-      .mrc-hist-empty { padding:12px; font-size:12px; color:#9faecb; text-align:center; }
+      .mrc-hist-empty { padding:12px; font-size:12px; color:var(--mrc-muted); text-align:center; }
 
       .mrc-card-body {
         flex:1; min-height:0; overflow-y:auto; -webkit-overflow-scrolling:touch;
@@ -441,28 +488,37 @@
         overflow:hidden; white-space:nowrap; text-overflow:ellipsis;
       }
 
-      .mrc-static { font-size:13px; color:#374767; padding:3px 0; line-height:1.35; }
-      .mrc-static b { font-weight:500; }
-      .mrc-static .v { color:#b5551d; }
+      .mrc-static {
+        font-size:var(--mrc-t-sm); color:var(--mrc-text); padding:3px 0; line-height:var(--mrc-lh);
+      }
+      .mrc-static b { font-weight:var(--mrc-fw-medium); }
+      /* Item description and suggested location: same orange, bold. */
+      .mrc-static .v { color:var(--mrc-brand-on-subtle); font-weight:var(--mrc-fw-semibold); }
 
-      .mrc-fb { font-size:13px; font-weight:500; min-height:17px; padding-top:3px; }
-      .mrc-fb.ok { color:#4a9c2d; } .mrc-fb.err { color:#e03131; } .mrc-fb.dim { color:#9faecb; }
+      .mrc-fb {
+        font-size:var(--mrc-t-sm); font-weight:var(--mrc-fw-medium); min-height:17px; padding-top:3px;
+      }
+      .mrc-fb.ok { color:var(--mrc-ok-fg); } .mrc-fb.err { color:var(--mrc-crit-fg); }
+      .mrc-fb.dim { color:var(--mrc-muted); }
 
       .mrc-warn-red {
-        font-size:12px; font-weight:500; color:#e03131; padding:2px 0 4px; letter-spacing:.01em;
+        font-size:12px; font-weight:var(--mrc-fw-semibold); color:var(--mrc-crit-fg);
+        padding:2px 0 4px; letter-spacing:.01em;
       }
       .mrc-banner {
-        padding:7px 10px; margin:0 0 .5rem; background:#fff5f5; border:1px solid #ffcdd2;
-        color:#c62828; font-size:12px; line-height:1.4;
+        padding:7px 10px; margin:0 0 .5rem; border-radius:var(--mrc-r-sm);
+        background:var(--mrc-crit-bg); border:1px solid transparent;
+        color:var(--mrc-crit-fg); font-size:12px; line-height:var(--mrc-lh);
       }
-      .mrc-banner.info { background:#f0f8fd; border-color:#b8e4f5; color:#1a7fa8; }
+      .mrc-banner.info { background:var(--mrc-info-bg); color:var(--mrc-info-fg); }
       .mrc-banner.ok {
-        background:#f1f9ec; border-color:#c6e5b3; color:#3d7a22;
-        font-size:14px; font-weight:500;
+        background:var(--mrc-ok-bg); color:var(--mrc-ok-fg);
+        font-size:var(--mrc-t-base); font-weight:var(--mrc-fw-medium);
       }
 
       /* ---- keep location: ONLY the box is a hit target, not the whole row ---- */
       .mrc-keep { display:flex; align-items:center; gap:8px; padding:7px 0 2px; }
+      .mrc-keep + .mrc-keep { padding-top:6px; }
       .mrc-keep-box {
         width:24px; height:24px; border:1px solid #9faecb; flex-shrink:0;
         display:flex; align-items:center; justify-content:center;
@@ -471,8 +527,10 @@
       }
       .mrc-keep-box:active { border-color:#20a8d8; }
       .mrc-keep.on .mrc-keep-box { border-color:#20a8d8; background:#20a8d8; }
-      .mrc-keep-txt { font-size:13px; color:#374767; }
-      .mrc-keep-sub { font-size:12px; color:#9faecb; }
+      .mrc-keep-txt { font-size:var(--mrc-t-sm); color:var(--mrc-text); }
+      /* Was #9faecb (~2.3:1, below AA) - the sub text says which item/bin is
+         locked in, so it carries meaning and gets the muted token instead. */
+      .mrc-keep-sub { font-size:12px; color:var(--mrc-muted); }
 
       /* ---- buttons ----
          These sit INSIDE the form, below the last field, rather than pinned to
@@ -1073,6 +1131,10 @@
       // Fail locally, before any request: never post a batch item with no batch.
       throw new Error('Batch number is required');
     }
+    if (isBatch(item) && !_validExpiry(c.expiry)) {
+      // Same rule for the expiry: a batch-tracked line never goes out without one.
+      throw new Error('Expiry date is required');
+    }
     // Batch-tracked items MUST carry batch_no and batch_expiry. C7's PHP reads
     // $body['batch_no'] directly, so leaving the key out fails with
     // 'Undefined array key "batch_no"' before anything is written. Key names are
@@ -1515,6 +1577,7 @@
           </div>`;
         rows += `<div class="mrc-static"><b>Item Description :</b>
           <span class="v">${_esc(c.item.description || '')}</span></div>`;
+        rows += `<div class="mrc-static mrc-sugg" id="mrc-sugg">${suggHtml(c)}</div>`;
         // Receiving beyond a satisfied line is allowed, but never silently.
         if (c.overLine) {
           rows += `<div class="mrc-banner">This line is already fully received.
@@ -1540,8 +1603,9 @@
           `<input id="mrc-batch" class="mrc-fc" type="text" autocomplete="off"
              autocorrect="off" autocapitalize="characters" spellcheck="false"
              placeholder="Scan or type batch" value="${_esc(c.batchNo || '')}"/>`);
-        rows += fieldRow('Expiry Date',
-          `<input id="mrc-expiry" class="mrc-fc" type="date" value="${_esc(_toDateInput(c.expiry))}"/>`);
+        rows += fieldRow('Expiry Date <span class="mrc-req">required</span>',
+          `<input id="mrc-expiry" class="mrc-fc${c.wantExpiry ? ' nolocation' : ''}" type="date"
+             required value="${_esc(_toDateInput(c.expiry))}"/>`);
       } else if (c.batchNo) {
         rows += doneRow('Batch', c.batchNo + (c.expiry ? '  exp ' + _toDateInput(c.expiry) : ''),
           { editId: 'mrc-edit-batch' });
@@ -1588,16 +1652,21 @@
       }
     }
 
-    // -- keep location -------------------------------------------------------
+    // -- keep item / keep location -------------------------------------------
     if (hasRcpt) {
-      const on = State.keepLocation, last = State.lastLocation?.location_code;
-      rows += `<div class="mrc-keep${on ? ' on' : ''}">
-        <span class="mrc-keep-box" id="mrc-keep-box" role="checkbox"
-          aria-checked="${on}" aria-label="Keep Location">${on ? '&#10003;' : ''}</span>
-        <span class="mrc-keep-txt">Keep Location</span>
-        <span class="mrc-keep-sub">${on ? (last ? _esc(last) : 'locks in the next bin')
-                                        : 'uses suggested bin'}</span>
+      const keepRow = (id, on, label, sub) => `<div class="mrc-keep${on ? ' on' : ''}">
+        <span class="mrc-keep-box" id="${id}" role="checkbox"
+          aria-checked="${on}" aria-label="${label}">${on ? '&#10003;' : ''}</span>
+        <span class="mrc-keep-txt">${label}</span>
+        <span class="mrc-keep-sub">${_esc(sub)}</span>
       </div>`;
+      const ki = State.keepItem;
+      const keptCode = State.lastItem ? State.itemsById[State.lastItem.itemId]?.item_code : '';
+      rows += keepRow('mrc-keepitem-box', ki, 'Keep Item',
+        ki ? (keptCode || 'locks in the next item') : 'scan each item');
+      const on = State.keepLocation, last = State.lastLocation?.location_code;
+      rows += keepRow('mrc-keep-box', on, 'Keep Location',
+        on ? (last || 'locks in the next bin') : 'uses suggested bin');
     }
 
     // The primary button always performs the CURRENT step, so no stage can dead
@@ -1657,6 +1726,17 @@
     setTimeout(measureHeight, 20);
   }
 
+  // A real calendar date in YYYY-MM-DD (or anything _toDateInput can turn into
+  // one). Rejects '', half-typed values and impossible dates like 2026-02-31.
+  function _validExpiry(v) {
+    const s = _toDateInput(v);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+    const [y, m, d] = s.split('-').map(Number);
+    if (y < 2000 || y > 2100) return false;
+    const dt = new Date(Date.UTC(y, m - 1, d));
+    return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+  }
+
   function _toDateInput(v) {
     if (!v) return '';
     const s = String(v);
@@ -1687,8 +1767,10 @@
       }, 40);
       return;
     }
-    const id = { receipt: 'mrc-receipt', item: 'mrc-item', qty: 'mrc-qty',
-                 batch: 'mrc-batch', location: 'mrc-loc', checkdigit: 'mrc-cd' }[stage];
+    let id = { receipt: 'mrc-receipt', item: 'mrc-item', qty: 'mrc-qty',
+               batch: 'mrc-batch', location: 'mrc-loc', checkdigit: 'mrc-cd' }[stage];
+    // Batch already in, expiry missing: put the cursor on the date instead.
+    if (stage === 'batch' && State.cur?.wantExpiry && State.cur.batchNo) id = 'mrc-expiry';
     if (!id) return;
     setTimeout(() => {
       const el = document.getElementById(id);
@@ -1753,6 +1835,18 @@
       State.keepLocation = !State.keepLocation;
       try { sessionStorage.setItem('mrc_keeploc', State.keepLocation ? '1' : '0'); } catch (_) {}
       if (State.keepLocation && State.cur?.location) State.lastLocation = State.cur.location;
+      if (navigator.vibrate) navigator.vibrate([20]);
+      if (State.cur && stage === 'qty') prefetchSuggestion(State.cur);   // kept <-> rule
+      render();
+    });
+
+    document.getElementById('mrc-keepitem-box')?.addEventListener('click', () => {
+      State.keepItem = !State.keepItem;
+      try { sessionStorage.setItem('mrc_keepitem', State.keepItem ? '1' : '0'); } catch (_) {}
+      // Switching on mid-line locks in the item on screen; switching off forgets it.
+      State.lastItem = State.keepItem && State.cur
+        ? { itemId: State.cur.item.id, uomId: State.cur.uom.id }
+        : (State.keepItem ? State.lastItem : null);
       if (navigator.vibrate) navigator.vibrate([20]);
       render();
     });
@@ -1822,16 +1916,23 @@
     onEnter(eIn, () => submitBatch());
     // Hold onto a picked date immediately. Without this it lived only in the DOM
     // and was lost on the next re-render, so the step could never be satisfied.
-    eIn?.addEventListener('change', () => {
-      if (State.cur) State.cur.expiry = eIn.value;
-    });
+    const keepExpiry = () => {
+      if (!State.cur) return;
+      State.cur.expiry = eIn.value;
+      if (eIn.value) { State.cur.wantExpiry = false; eIn.classList.remove('nolocation'); }
+    };
+    eIn?.addEventListener('change', keepExpiry);
+    eIn?.addEventListener('input', keepExpiry);
+    // Same for the batch field, so a re-render cannot lose a typed batch.
+    bIn?.addEventListener('input', () => { if (State.cur) State.cur.batchNo = bIn.value; });
 
     const uom = document.getElementById('mrc-uom');
     uom?.addEventListener('change', () => {
       const c = State.cur;
       const nu = (c.item.itemUnitOfMeasures || []).find(u => String(u.id) === uom.value);
       // Switching pack size restarts the count at one pack of the new UoM.
-      if (nu) { c.uom = nu; c.qty = nu.factor || 1; say('', 'dim'); render(); }
+      // The locating rule is asked per UoM, so the preview is re-asked too.
+      if (nu) { c.uom = nu; c.qty = nu.factor || 1; say('', 'dim'); prefetchSuggestion(c); render(); }
     });
 
     // Live pack-count readout while typing the quantity.
@@ -1864,9 +1965,27 @@
   // 10. STEP HANDLERS
   // ---------------------------------------------------------------------------
 
+  // The receipt numbers to try, best first.
+  //
+  // 2.5.0: receipt numbers legitimately contain symbols - live examples are
+  // "Ret-#12084", "DD48519##1" and "Ret-Returns #18 Box 2". The old code ran
+  // every receipt through _normaliseScan, which rewrites # -> 3, ! -> 1 and so
+  // on (the TC51 stuck-shift repair), and upper-cased it, so "Ret-#12084" was
+  // looked up as "RET-312084" and never found. The value exactly as scanned is
+  // now tried first; the shift repair is only a fallback for a genuinely
+  // mangled scan. Control characters (GS separators, scanner prefixes) are
+  // stripped - they are never part of a receipt number.
+  function receiptCandidates(raw) {
+    const exact = String(raw || '').replace(/[\u0000-\u001f\u007f]/g, '').trim();
+    if (!exact) return [];
+    const out = [exact, exact.toUpperCase(), _normaliseScan(exact).toUpperCase()];
+    return [...new Set(out)];
+  }
+
   async function loadReceipt(raw) {
-    const id = _normaliseScan(String(raw || '').trim()).toUpperCase();
-    if (!id) return;
+    const tries = receiptCandidates(raw);
+    if (!tries.length) return;
+    let id = tries[0];
     State.busy = 'Loading receipt...';
     State.err = ''; State.fb = ''; State.notice = '';
     State.receiptId = id;
@@ -1875,7 +1994,14 @@
       await loadProfile();
       if (!State.profile) throw new Error('No Putaway receiving profile available');
 
-      const header = await fetchReceiptHeader(id).catch(e => { if (e.notFound) return null; throw e; });
+      let header = null;
+      for (const cand of tries) {
+        header = await fetchReceiptHeader(cand).catch(e => { if (e.notFound) return null; throw e; });
+        if (header) { id = cand; break; }
+      }
+      // Every later call (refresh, checkin's receipt_id) must use the spelling
+      // that actually matched.
+      State.receiptId = header?.receipt_num ? String(header.receipt_num) : id;
       State.busy = null;
       if (!header) {
         State.header = null;
@@ -1934,6 +2060,15 @@
     if (!uom) uom = defaultUomFor(item);
     if (!uom) { reject('Item has no unit of measure'); return; }
 
+    startLine(item, detail, uom, complete);
+    say(complete ? 'Item verified - line already complete' : 'Item verified', 'ok');
+    Audio.chime(complete ? 'warn' : 'item_ok');
+    flash('ok');
+    render();
+  }
+
+  // Open a line on an item. Shared by a fresh scan and by Keep Item.
+  function startLine(item, detail, uom, complete) {
     State.cur = {
       detail, item, uom,
       // One scan = one pack. Scanning again on the quantity row adds another
@@ -1943,11 +2078,57 @@
       expiry:  detail.expected_batch_expiry || '',
       qtyDone: false, batchDone: false, overLine: complete,
       location: null, suggested: null, locResolved: false, viaKeep: false,
+      preSugg: undefined,   // undefined = still asking, null = no home
     };
-    say(complete ? 'Item verified - line already complete' : 'Item verified', 'ok');
-    Audio.chime(complete ? 'warn' : 'item_ok');
-    flash('ok');
-    render();
+    prefetchSuggestion(State.cur);
+  }
+
+  // After a check in, with Keep Item on: re-open the same item on its next open
+  // line. Returns the item code if it did, or null (and why, via say()) if not.
+  // Deliberately refuses an item whose lines are all received - silently
+  // carrying on would make every further scan an over-receive.
+  function retainItem(kept) {
+    if (!kept) return null;
+    const item = State.itemsById[kept.itemId];
+    if (!item) return null;
+    if (itemIsComplete(kept.itemId)) return null;
+    const detail = openDetailForItem(kept.itemId);
+    if (!detail) return null;
+    const uom = (item.itemUnitOfMeasures || []).find(u => u.id === kept.uomId) || defaultUomFor(item);
+    if (!uom) return null;
+    startLine(item, detail, uom, false);
+    return item.item_code;
+  }
+
+  // The locating rule's answer for this line, asked as soon as the item is
+  // known so it can be shown under the description. It is a preview only:
+  // beginLocation() asks again with the real quantity and batch, and that
+  // answer is the one used. Patched in place - a full render() here would wipe
+  // a quantity the operator is half way through typing.
+  async function prefetchSuggestion(c) {
+    if (!c || !State.profile || !State.header) return;
+    if (State.keepLocation && State.lastLocation) return;   // shown as kept instead
+    const token = (c._suggTok = (c._suggTok || 0) + 1);
+    c.preSugg = undefined;
+    const loc  = await fetchSuggestedLocation(c.detail, c.item, c.uom, c.uom.factor || 1,
+                                              c.batchNo || '');
+    if (State.cur !== c || c._suggTok !== token) return;     // operator moved on
+    const code = String(loc?.location_code || '').trim();
+    c.preSugg = (!loc || !loc.id || NO_LOCATION_TOKENS.includes(code.toLowerCase())) ? null : loc;
+    const el = document.getElementById('mrc-sugg');
+    if (el) el.innerHTML = suggHtml(c);
+  }
+
+  function suggHtml(c) {
+    const lbl = '<b>Suggested Location :</b> ';
+    if (State.keepLocation && State.lastLocation) {
+      return lbl + `<span class="v">${_esc(State.lastLocation.location_code)}</span>` +
+        ` <span class="mrc-sub">kept</span>`;
+    }
+    if (c.preSugg === undefined) return lbl + '<span class="mrc-sub"><span class="mrc-spin sm"></span>finding...</span>';
+    // Kept red, not orange: this is a warning, not a value.
+    if (c.preSugg === null) return lbl + '<span class="mrc-pill crit">No existing location</span>';
+    return lbl + `<span class="v">${_esc(c.preSugg.location_code)}</span>`;
   }
 
   function submitQty(raw) {
@@ -2020,17 +2201,39 @@
     // Fall back to state: on Android the picker can commit a value without the
     // element still being in the DOM we read from.
     const e = (document.getElementById('mrc-expiry')?.value || c.expiry || '').trim();
+    // Hold what has been entered so far, so a rejection's re-render does not
+    // wipe a batch number the operator has already scanned.
+    c.batchNo = b; c.expiry = e;
     if (!b) { reject('Batch number is required'); return; }
-    // Expiry is not blocked on - C7 accepts a null expiry, and refusing to move
-    // on because a picker was dismissed is exactly the trap being fixed here.
+    // Expiry IS enforced on batch-tracked items (2.5.0). C7 itself accepts a
+    // null expiry, which is how blank expiries were reaching stock. The Next
+    // button is always live on this row, so a dismissed Android date picker can
+    // no longer trap the operator - they pick a date and press Next.
+    if (!e) {
+      c.wantExpiry = true;
+      reject('Expiry date is required for batch-tracked items');
+      return;
+    }
+    if (!_validExpiry(e)) {
+      c.wantExpiry = true;
+      reject('Expiry date is not a valid date');
+      return;
+    }
+    c.wantExpiry = false;
+    const expired = _toDateInput(e) < new Date().toISOString().slice(0, 10);
     if (c.detail.expected_batch_no &&
         String(c.detail.expected_batch_no).trim().toLowerCase() !== b.toLowerCase()) {
       Audio.chime('warn');
       say(`Expected batch ${c.detail.expected_batch_no}`, 'err');
+    } else if (expired) {
+      // Allowed (returns can be out of date) but never silent - it is also
+      // what a mistyped year looks like.
+      Audio.chime('warn');
+      say(`Expiry ${_toDateInput(e)} is in the past - check the date`, 'err');
     } else {
       say('', 'dim');
     }
-    c.batchNo = b; c.expiry = e; c.batchDone = true;
+    c.batchDone = true;
     beginLocation();
   }
 
@@ -2180,6 +2383,11 @@
       reject('Batch number is required');
       return;
     }
+    if (isBatch(c.item) && !_validExpiry(c.expiry)) {
+      c.batchDone = false; c.wantExpiry = true;
+      reject('Expiry date is required for batch-tracked items');
+      return;
+    }
     _writeInFlight = true;
 
     State.busy = 'Checking in...';
@@ -2196,6 +2404,7 @@
     const baseQty    = qty;                       // quantity is already base units
     const openBefore = c.detail.open_quantity || 0;
     const batchSnap  = { batchNo: c.batchNo, expiry: c.expiry };
+    const itemSnap   = { itemId: c.item.id, uomId: c.uom.id };
 
     try {
       let result, recoveredOpen = null;
@@ -2355,6 +2564,18 @@
                        `Scan the next receipt.`;
       } else {
         say(`Checked in ${qty} ${uomLabel} to ${locRec.location_code}`, 'ok');
+        // Keep Item: straight back to the quantity row on the same item, judged
+        // against the open quantities C7 has just given us. Batch and expiry
+        // are NOT carried over - each line's batch is entered and confirmed.
+        if (State.keepItem) {
+          State.lastItem = itemSnap;
+          const msg  = `Checked in ${qty} ${uomLabel} to ${locRec.location_code}`;
+          const code = retainItem(itemSnap);
+          if (code) say(`${msg} - ${code} kept`, 'ok');
+          else if (itemIsComplete(itemSnap.itemId)) {
+            say(`${msg} - item fully received, scan the next item`, 'ok');
+          }
+        }
       }
       flash('ok');
       // The unlock render lives in the finally - single exit, see below.
