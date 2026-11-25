@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Receiving
 // @namespace    https://malpa.canary7.com
-// @version      2.5.0
+// @version      2.6.0
 // @description  Fast single-screen receiving for Canary7 WMS - TC51 optimised
 // @author       Malpa 3PL
 // @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-receiving.user.js
@@ -337,6 +337,31 @@
       }
       .mrc-pill.info { background:var(--mrc-info-bg); color:var(--mrc-info-fg); }
       .mrc-pill.crit { background:var(--mrc-crit-bg); color:var(--mrc-crit-fg); }
+      .mrc-pill.ok   { background:var(--mrc-ok-bg);   color:var(--mrc-ok-fg); }
+
+      /* 2.6.0 item picker: the receipt's lines under the item field. Inline (not
+         floating) so it can never be clipped by the card's overflow. */
+      .mrc-ipick {
+        margin-top:4px; border:1px solid #e1e6ef; background:#fff; max-height:42vh;
+        overflow-y:auto; -webkit-overflow-scrolling:touch; overscroll-behavior:contain;
+      }
+      .mrc-ipick[hidden] { display:none; }
+      .mrc-ipick-row {
+        display:flex; align-items:center; gap:8px; width:100%; text-align:left;
+        border:0; border-bottom:1px solid #eef1f5; background:#fff; padding:7px 10px;
+        min-height:46px; font-family:var(--mrc-font); cursor:pointer;
+        -webkit-tap-highlight-color:transparent; touch-action:manipulation;
+      }
+      .mrc-ipick-row:last-child { border-bottom:0; }
+      .mrc-ipick-row:active { background:#e8f6fb; }
+      .mrc-ipick-row:disabled { opacity:.55; cursor:default; }
+      .mrc-ipick-main { flex:1; min-width:0; }
+      .mrc-ipick-code, .mrc-ipick-desc {
+        display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+      }
+      .mrc-ipick-code { font-size:15px; font-weight:600; color:#374767; }
+      .mrc-ipick-desc { font-size:var(--mrc-t-xs); color:var(--mrc-muted); }
+      .mrc-ipick-empty { padding:8px 10px; font-size:var(--mrc-t-sm); color:var(--mrc-muted); font-family:var(--mrc-font); }
       .mrc-sub { font-size:var(--mrc-t-xs); color:var(--mrc-muted); }
       .mrc-req {
         margin-left:4px; font-size:var(--mrc-t-xs); font-weight:var(--mrc-fw-medium);
@@ -1013,6 +1038,51 @@
     try { return await apiGet(path); } catch (_) { return null; }
   }
 
+  // 2.6.0 - SUGGESTION FOR ANY UoM.
+  // Permanent locations are set up per UoM (the PermanentLocation export carries
+  // the UoM name, almost always "Each"), and the locating rule is asked per UoM.
+  // So a multi-UoM client (Roadtrip Essentials) scanned on its carton barcode got
+  // 'NEW' back and no suggestion, although the item plainly has a home. Ask with
+  // the UoM on screen first; if that finds nothing, ask with the item's other
+  // UoMs (base unit first), then fall back to the item's permanent location.
+  // Resolves to { loc, viaUom } - viaUom is the UoM that found it, or null when
+  // the chosen UoM found it itself - or null when the item has no home at all.
+  function _isHome(loc) {
+    const code = String(loc?.location_code || '').trim();
+    return !!(loc && loc.id && !NO_LOCATION_TOKENS.includes(code.toLowerCase()));
+  }
+
+  async function findSuggestedLocation(c, qty) {
+    const batchNo = c.batchNo || '';
+    const first = await fetchSuggestedLocation(c.detail, c.item, c.uom, qty, batchNo);
+    if (_isHome(first)) return { loc: first, viaUom: null };
+
+    const base   = defaultUomFor(c.item);
+    const others = (c.item.itemUnitOfMeasures || [])
+      .filter(u => u.id !== c.uom.id)
+      .sort((a, b) => (a === base ? -1 : b === base ? 1 : (a.factor || 1) - (b.factor || 1)));
+    for (const u of others) {
+      const f = u.factor || 1;
+      // Same base quantity where it fits the pack size, otherwise one pack.
+      const q = qty > 0 && qty % f === 0 ? qty : f;
+      const loc = await fetchSuggestedLocation(c.detail, c.item, u, q, batchNo);
+      if (_isHome(loc)) return { loc, viaUom: u };
+    }
+
+    // Last resort: the permanentLocation hung off the verify call. Its shape is
+    // not pinned down (object, array, or a join row with a nested location), so
+    // take only its code and look the bin up properly - the check-digit row
+    // needs the full location record.
+    let p = c.item.permanentLocation;
+    if (Array.isArray(p)) p = p[0];
+    const code = String(p?.location_code || p?.location?.location_code || '').trim();
+    if (code && !NO_LOCATION_TOKENS.includes(code.toLowerCase())) {
+      const loc = await resolveLocation(code).catch(() => null);
+      if (_isHome(loc)) return { loc, viaUom: base || null };
+    }
+    return null;
+  }
+
   // ---- receipt history (receipt containers) ---------------------------------
   //
   // Sourced from receiving/receipt-container on the legacy monolith, keyed by
@@ -1546,7 +1616,8 @@
       rows += fieldRow('Enter Item Code or Reference',
         `<input id="mrc-item" class="mrc-fc big" type="text" autocomplete="off"
            autocorrect="off" autocapitalize="characters" spellcheck="false"
-           placeholder="Scan item"/>`);
+           placeholder="Scan, or tap to pick from the receipt"/>`,
+        `<div id="mrc-ipick" class="mrc-ipick" role="listbox" hidden></div>`);
     }
 
     // -- uom + quantity ------------------------------------------------------
@@ -1628,7 +1699,8 @@
     } else if (hasLoc) {
       rows += `<div class="mrc-done">
         <span class="mrc-done-lbl">Location :</span>
-        <span class="mrc-done-val">${_esc(c.location.location_code)}${c.viaKeep ? '  (kept)' : ''}</span>
+        <span class="mrc-done-val">${_esc(c.location.location_code)}${c.viaKeep ? '  (kept)'
+          : (c.locVia && c.location === c.suggested ? `  (${_esc(uomName(c.locVia))} home)` : '')}</span>
         <button class="mrc-pencil" id="mrc-edit-loc" title="Change location"
           aria-label="Change location">&#9998;</button>
       </div>`;
@@ -1926,6 +1998,29 @@
     // Same for the batch field, so a re-render cannot lose a typed batch.
     bIn?.addEventListener('input', () => { if (State.cur) State.cur.batchNo = bIn.value; });
 
+    // 2.6.0 item picker. Opened by a deliberate tap or by typing - NOT by focus,
+    // because focusStage() focuses this field on every render and a list
+    // popping open on every scan would bury the screen.
+    const itemIn = document.getElementById('mrc-item');
+    const ipick  = document.getElementById('mrc-ipick');
+    if (itemIn && ipick) {
+      itemIn.addEventListener('click', () => showItemPicker(itemIn.value));
+      itemIn.addEventListener('input', () => showItemPicker(itemIn.value));
+      itemIn.addEventListener('blur',  () => setTimeout(() => {
+        if (document.activeElement !== itemIn) hideItemPicker();
+      }, 300));
+      // Keep focus (and the keyboard) in the field while a row is tapped.
+      const keep = (e) => e.preventDefault();
+      ipick.addEventListener('pointerdown', keep);
+      ipick.addEventListener('mousedown', keep);
+      ipick.addEventListener('click', (e) => {
+        const b = e.target.closest('[data-item-id]');
+        if (!b || b.disabled) return;
+        hideItemPicker();
+        pickItem(Number(b.dataset.itemId));
+      });
+    }
+
     const uom = document.getElementById('mrc-uom');
     uom?.addEventListener('change', () => {
       const c = State.cur;
@@ -2048,15 +2143,28 @@
       return;
     }
     const item = State.itemsById[hit.itemId];
-    const detail = openDetailForItem(hit.itemId);
     if (!item)   { reject('Item data missing - rescan'); return; }
+    beginItem(item, hit.uomId);
+  }
+
+  // A row tapped in the item picker. The base UoM is selected (the operator has
+  // not scanned a pack barcode) and stays editable on the next row.
+  function pickItem(itemId) {
+    const item = State.itemsById[itemId];
+    if (!item) { reject('Item data failed to load - use C7 for this line'); return; }
+    beginItem(item, null);
+  }
+
+  // Shared by a scan and by the picker.
+  function beginItem(item, uomId) {
+    const detail = openDetailForItem(item.id);
     // Only a genuine absence from the receipt is refused now. A line that is
     // merely finished is allowed through as an over-receive.
     if (!detail) { reject('No line for this item on the receipt'); return; }
-    const complete = itemIsComplete(hit.itemId);
+    const complete = itemIsComplete(item.id);
 
     // Auto-select the UoM the scanned reference belongs to; still editable.
-    let uom = hit.uomId ? (item.itemUnitOfMeasures || []).find(u => u.id === hit.uomId) : null;
+    let uom = uomId ? (item.itemUnitOfMeasures || []).find(u => u.id === uomId) : null;
     if (!uom) uom = defaultUomFor(item);
     if (!uom) { reject('Item has no unit of measure'); return; }
 
@@ -2065,6 +2173,61 @@
     Audio.chime(complete ? 'warn' : 'item_ok');
     flash('ok');
     render();
+  }
+
+  // The receipt's items for the picker, filtered by code, description or any
+  // barcode. One row per item (lines summed), open items first, then items whose
+  // code starts with what was typed, then receipt line order.
+  function pickerEntries(q) {
+    const key = String(q || '').trim().toLowerCase();
+    const byItem = new Map();
+    for (const d of State.details) {
+      if (d.item_id == null) continue;
+      let e = byItem.get(d.item_id);
+      if (!e) {
+        const item = State.itemsById[d.item_id];
+        e = {
+          itemId: d.item_id, loaded: !!item,
+          code: String(item?.item_code || d.item?.item_code || ''),
+          desc: String(item?.description || d.item?.description || ''),
+          refs: item ? refsForItem(item) : [],
+          open: 0, line: d.line_number || 0,
+        };
+        byItem.set(d.item_id, e);
+      }
+      e.open += Math.max(0, d.open_quantity || 0);
+    }
+    let list = [...byItem.values()];
+    if (key) {
+      list = list.filter(e => e.code.toLowerCase().includes(key) ||
+        e.desc.toLowerCase().includes(key) || e.refs.some(r => r.includes(key)));
+    }
+    const starts = (e) => key && e.code.toLowerCase().startsWith(key) ? 1 : 0;
+    list.sort((a, b) => ((b.open > 0) - (a.open > 0)) || (starts(b) - starts(a)) || (a.line - b.line));
+    return list;
+  }
+
+  function showItemPicker(q) {
+    const box = document.getElementById('mrc-ipick');
+    if (!box || !State.header || State.cur) return;
+    const list = pickerEntries(q);
+    box.innerHTML = list.length ? list.map(e => `
+      <button type="button" class="mrc-ipick-row" role="option" data-item-id="${_esc(e.itemId)}"
+        ${e.loaded ? '' : 'disabled'}>
+        <span class="mrc-ipick-main">
+          <span class="mrc-ipick-code">${_esc(e.code)}</span>
+          <span class="mrc-ipick-desc">${_esc(e.loaded ? e.desc : 'Could not load - use C7')}</span>
+        </span>
+        ${e.open > 0 ? `<span class="mrc-pill info">${_esc(e.open)} open</span>`
+                     : `<span class="mrc-pill ok">done</span>`}
+      </button>`).join('')
+      : `<div class="mrc-ipick-empty">${String(q || '').trim() ? 'Nothing on this receipt matches' : 'No lines'}</div>`;
+    box.hidden = false;
+  }
+
+  function hideItemPicker() {
+    const box = document.getElementById('mrc-ipick');
+    if (box) box.hidden = true;
   }
 
   // Open a line on an item. Shared by a fresh scan and by Keep Item.
@@ -2109,12 +2272,11 @@
     if (!c || !State.profile || !State.header) return;
     if (State.keepLocation && State.lastLocation) return;   // shown as kept instead
     const token = (c._suggTok = (c._suggTok || 0) + 1);
-    c.preSugg = undefined;
-    const loc  = await fetchSuggestedLocation(c.detail, c.item, c.uom, c.uom.factor || 1,
-                                              c.batchNo || '');
+    c.preSugg = undefined; c.preVia = null;
+    const hit = await findSuggestedLocation(c, c.uom.factor || 1);
     if (State.cur !== c || c._suggTok !== token) return;     // operator moved on
-    const code = String(loc?.location_code || '').trim();
-    c.preSugg = (!loc || !loc.id || NO_LOCATION_TOKENS.includes(code.toLowerCase())) ? null : loc;
+    c.preSugg = hit ? hit.loc : null;
+    c.preVia  = hit ? hit.viaUom : null;
     const el = document.getElementById('mrc-sugg');
     if (el) el.innerHTML = suggHtml(c);
   }
@@ -2128,7 +2290,13 @@
     if (c.preSugg === undefined) return lbl + '<span class="mrc-sub"><span class="mrc-spin sm"></span>finding...</span>';
     // Kept red, not orange: this is a warning, not a value.
     if (c.preSugg === null) return lbl + '<span class="mrc-pill crit">No existing location</span>';
-    return lbl + `<span class="v">${_esc(c.preSugg.location_code)}</span>`;
+    return lbl + `<span class="v">${_esc(c.preSugg.location_code)}</span>` + viaHtml(c.preVia);
+  }
+
+  // Says when the bin came from another UoM's home, so a carton going into an
+  // Each bin is a known thing rather than a surprise.
+  function viaHtml(u) {
+    return u ? ` <span class="mrc-sub">(${_esc(uomName(u))} home)</span>` : '';
   }
 
   function submitQty(raw) {
@@ -2251,20 +2419,20 @@
 
     c.locResolved = false;
     c.locManual   = false;   // this is the rule's answer, not the operator's
+    c.locVia      = null;
     render();
-    const loc  = await fetchSuggestedLocation(c.detail, c.item, c.uom, c.qty, c.batchNo);
-    const code = String(loc?.location_code || '').trim();
-    // 'NEW' (or nothing) means the item has no existing home - suggest nothing.
-    const none = !loc || !loc.id || NO_LOCATION_TOKENS.includes(code.toLowerCase());
+    // Any UoM's home counts (2.6.0). Nothing at all - every UoM came back 'NEW'
+    // and there is no permanent location - means suggest nothing.
+    const hit = await findSuggestedLocation(c, c.qty);
+    if (State.cur !== c || c.locResolved) return;   // operator moved on meanwhile
 
     c.locResolved = true;
-    if (none) {
+    if (!hit) {
       c.location = null; c.suggested = null;
-      render();
     } else {
-      c.location = loc; c.suggested = loc;
-      render();
+      c.location = hit.loc; c.suggested = hit.loc; c.locVia = hit.viaUom;
     }
+    render();
   }
 
   async function submitLocation(raw) {
