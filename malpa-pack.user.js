@@ -1,10 +1,10 @@
 // ==UserScript==
-// @name         Malpa Pack v4
+// @name         Malpa Pack v5
 // @namespace    https://malpa.canary7.com
-// @version      4.0.0-nl.9.1
+// @version      5.0.0-nl.10
 // @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-pack.user.js
 // @downloadURL  https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-pack.user.js
-// @description  Packing station for Canary7 WMS. v4 = 3.9.2 + NetLog recorder + SIBP print-first (print-OFF SIBP profile only) + early packing / units counter / focus keeper / long-order list + unfinished-tote guard / SIBP orders left / abort + are-you-sure on de-scan and manual close / wrong-item alarm / finishing-order card / split label queue + full reset when the profile changes.
+// @description  Packing station for Canary7 WMS. v4 = 3.9.2 + NetLog recorder + SIBP print-first (print-OFF SIBP profile only) + early packing / units counter / focus keeper / long-order list + unfinished-tote guard / SIBP orders left / abort + are-you-sure on de-scan and manual close / wrong-item alarm / finishing-order card / split label queue + full reset when the profile changes + v5: self-heal an unassigned job, no stranded boxes, open-box rescue.
 // @author       Malpa 3PL
 // @match        https://*.canary7.com/*
 // @grant        GM_xmlhttpRequest
@@ -53,7 +53,7 @@
 // ═════════════════════════════════════════════════════════════════════════════
 const __NL = (function () {
   'use strict';
-  const VERSION = '4.0.0-nl.9.1';
+  const VERSION = '5.0.0-nl.10';
   const ORIG = {
     fetch: (typeof fetch === 'function') ? fetch : null,
     gm: (typeof GM_xmlhttpRequest === 'function') ? GM_xmlhttpRequest : undefined,
@@ -1176,12 +1176,18 @@ const __NL = (function () {
     }
   }
 
-  async function apiGet(path) {
+  async function apiGet(path, _jrRetry) {
     await waitForSession();
     const res = await fetch(API_BASE + path, { method: 'GET', headers: mkHeaders() });
     if (res.status === 401) throw new Error('Session expired — please log in again.');
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
+      // v5.0.0 (JR) — "This job is already unassigned" on a move: someone took
+      // the pack job off this packer in C7. Take it back (only if nobody else
+      // owns it) and retry once.
+      if (!_jrRetry && typeof JR !== 'undefined' && JR && JR.matches(path, body)) {
+        if (await JR.reclaim('move')) return apiGet(path, true);
+      }
       const e = new Error(`${body.message || `API error ${res.status}`} [${res.status}]`);
       e._body = body; e._status = res.status; // v3.3.84: carry full body so the consign path can surface real server detail
       e._url = API_BASE + path; e._method = 'GET';   // v3.7.0: for the error log
@@ -2698,6 +2704,8 @@ const __NL = (function () {
     const c = Session.outboundContainer;
     const phase = Session.phase;
     if (!c?.id) return;
+    // v5.0.0 (SG) — never try to delete a box that holds stock (SBDC#71868).
+    if (typeof SG !== 'undefined' && SG && SG.units() > 0) return;
     // Only abandon if we were mid-pack and never closed
     if (phase === 'PACKING' || phase === 'CHOOSE_BOX') {
       deleteAbandonedContainer(c.id);
@@ -2824,8 +2832,13 @@ const __NL = (function () {
       `&weight=${weight}&length=${length}&width=${width}&height=${height}` +
       `&expand=shipmentHeader`;
 
-    const res = await fetch(url, { method: 'GET', headers: mkHeaders() });
-    const body = await res.json().catch(() => ({}));
+    let res = await fetch(url, { method: 'GET', headers: mkHeaders() });
+    let body = await res.json().catch(() => ({}));
+    // v5.0.0 (JR) — same self-heal as apiGet, for the close.
+    if (!res.ok && typeof JR !== 'undefined' && JR && JR.matches('close-to-container', body) && await JR.reclaim('close')) {
+      res = await fetch(url, { method: 'GET', headers: mkHeaders() });
+      body = await res.json().catch(() => ({}));
+    }
 
     if (res.status === 401) throw new Error('Session expired — please log in again.');
 
@@ -3791,6 +3804,7 @@ const __NL = (function () {
   }) {
     if (_handoffInFlight) return null;
     _handoffInFlight = true;
+    try { if (typeof OB !== 'undefined' && OB) OB.forgetNo(containerNo); } catch (_) {}   // v5.0.0
 
     // Record FIRST — before any network call — so the shipment is never lost to
     // a failed request or a page reload.
@@ -8365,6 +8379,7 @@ color: #b91c1c;
   // ─────────────────────────────────────────────────────────────────────────────
 
   function onFullReset() {
+    if (typeof SG !== 'undefined' && SG && SG.refuse('reset')) return;   // v5.0.0
     // If an outbound container was created but never closed, delete it from C7
     // so it doesn't appear as an empty orphan at consigning time.
     maybeDeleteAbandonedContainer();
@@ -8613,6 +8628,11 @@ color: #b91c1c;
       }
     }, 150);
 
+    // v5.0.0 — after a hand-off this said "Shipment complete" (SBDC#71921).
+    if (_handoffBannerNodes) {
+      setStatus('⛔ Last order NOT finished — it has gone to Exceptions. Follow the red popup, then scan the next tote.', 'err');
+      return;
+    }
     setStatus(retained
       ? '✓ Shipment complete — retained tote queued. Waiting for close/consigning calls…'
       : '✓ Shipment complete — scan next tote to begin.', 'ok');
@@ -8993,6 +9013,7 @@ color: #b91c1c;
   }
 
   function closeUI() {
+    if (typeof SG !== 'undefined' && SG && SG.refuse('close')) return;   // v5.0.0
     // Clean up any open outbound container that was never closed
     maybeDeleteAbandonedContainer();
     resetRetainedToteState();
@@ -11162,6 +11183,244 @@ color: #b91c1c;
     return { begin, failFromScript, get job() { return job; } };
   })();
 
+
+  // ═════════════════════════════════════════════════════════════════════════════
+  //  v5.0.0 (25 Nov 2026) — WPD-08 incidents SBDC#71868 and SBDC#71921
+  //  `var` on purpose: apiGet/closeUI/onFullReset reference these by name and
+  //  must see `undefined`, not a TDZ error, if called before this runs.
+  // ═════════════════════════════════════════════════════════════════════════════
+
+  // ── JR: take an unassigned pack job back for this packer ──────────────────────
+  var JR = (() => {
+    const log = (e, d) => { try { if (typeof __NL !== 'undefined' && __NL) __NL.event(e, d); } catch (_) {} };
+    const RE = /already unassigned/i;
+    const tries = new Map();          // shipmentNo -> attempts
+    let inflight = null;
+    function matches(path, body) {
+      return /move-into-container-v2|close-to-container/.test(String(path || '')) && RE.test(String((body && body.message) || ''));
+    }
+    function reclaim(why) {
+      if (inflight) return inflight;  // several moves fail at once: one reclaim for all of them
+      const sh = ShipmentCache.shipmentHeader || {};
+      const shipNo = sh.shipment_number || null;
+      const me = currentOperatorWmsId();
+      if (!shipNo || !me) { log('v5_reclaim_skip', { why, shipmentNo: shipNo, me: me || null }); return Promise.resolve(false); }
+      const n = tries.get(shipNo) || 0;
+      if (n >= 2) { log('v5_reclaim_gaveup', { why, shipmentNo: shipNo }); return Promise.resolve(false); }
+      tries.set(shipNo, n + 1);
+      inflight = (async () => {
+        try {
+          const data = await apiGet(
+            `job/job&expand=job_type&per-page=50&page=1` +
+            `&fields=id,job_type_id,user_id,job_no,created_at,job_type.name` +
+            `&close=1&reference_number=${encodeURIComponent(shipNo)}`, true);
+          const rows = (Array.isArray(data) ? data : (data?.items || []))
+            .filter(j => j && jobBelongsToShipment(j, shipNo) && /pack/i.test(String(j.job_type?.name || '')));
+          if (rows.some(j => Number(j.user_id) === me)) { log('v5_reclaim_mine', { why, shipmentNo: shipNo }); return true; }
+          const free = rows.filter(j => j.user_id == null)
+            .sort((a, b) => (Number(b.created_at) || 0) - (Number(a.created_at) || 0))[0];
+          if (!free) { log('v5_reclaim_none', { why, shipmentNo: shipNo, owners: rows.map(j => j.user_id) }); return false; }
+          await assignJobToUser(free.id, me);
+          try { _currentJobId = free.id; } catch (_) {}
+          log('v5_reclaim_ok', { why, shipmentNo: shipNo, job: free.id });
+          EventLog.ok(`${shipNo}: the job had been unassigned in C7 — taken back, carrying on.`);
+          return true;
+        } catch (e) {
+          log('v5_reclaim_err', { why, shipmentNo: shipNo, error: e.message });
+          return false;
+        } finally {
+          setTimeout(() => { inflight = null; }, 0);
+        }
+      })();
+      return inflight;
+    }
+    return { matches, reclaim };
+  })();
+
+  // ── SG: a box with stock in it can't be walked away from ──────────────────────
+  var SG = (() => {
+    const log = (e, d) => { try { if (typeof __NL !== 'undefined' && __NL) __NL.event(e, d); } catch (_) {} };
+    const S = (el, css) => { for (const k of Object.keys(css)) el.style.setProperty(k, css[k], 'important'); };
+    let pop = null;
+    function units() {
+      try {
+        const c = Session.outboundContainer;
+        if (!c || !c.id || c._nl7Placeholder) return 0;
+        if (!['PACKING', 'CHOOSE_BOX', 'CLOSING'].includes(Session.phase)) return 0;
+        return ShipmentCache.allItems.reduce((s, t) =>
+          s + Math.max(0, (Number(t.scanned) || 0) - (Number(t._scannedAtPieceStart) || 0)), 0);
+      } catch (_) { return 0; }
+    }
+    function refuse(what) {
+      const n = units();
+      if (n <= 0) return false;
+      const box = Session.outboundContainer?.container_no || 'the box';
+      const shipNo = ShipmentCache.shipmentHeader?.shipment_number || '';
+      log('v5_close_refused', { what, units: n, box, shipmentNo: shipNo });
+      try { beep('err'); } catch (_) {}
+      if (pop && pop.isConnected) return true;
+      pop = document.createElement('div');
+      pop.className = 'mp-v5-guard';
+      S(pop, { position: 'fixed', inset: '0', background: 'rgba(0,0,0,.55)', 'z-index': '2147483600',
+        display: 'flex', 'align-items': 'center', 'justify-content': 'center', 'font-family': 'system-ui,sans-serif' });
+      const card = document.createElement('div');
+      S(card, { background: '#fff', border: '5px solid #b91c1c', 'border-radius': '12px', padding: '24px 28px', 'max-width': '620px', color: '#111' });
+      const verb = what === 'reset' ? 'reset the pack screen' : 'close the pack screen';
+      card.innerHTML =
+        `<div style="font-size:26px;font-weight:800;color:#b91c1c;margin-bottom:10px">⛔ Can't ${verb} yet</div>` +
+        `<div style="font-size:19px;line-height:1.45"><b>${n} unit${n === 1 ? ' is' : 's are'}</b> already packed in <b>${esc5(box)}</b>` +
+        (shipNo ? ` for <b>${esc5(shipNo)}</b>` : '') + `, and the box is not closed yet.<br><br>` +
+        `Finish it first: scan the carton / press <b>Close</b>.<br>To stop this order, use <b>⛔ Abort order…</b></div>`;
+      const btn = document.createElement('button');
+      btn.type = 'button'; btn.className = 'mp-v5-guard-ok';
+      btn.textContent = 'OK, go back to the order';
+      S(btn, { 'margin-top': '18px', padding: '12px 18px', 'font-size': '18px', background: '#b91c1c', color: '#fff', border: '0', 'border-radius': '6px', cursor: 'pointer' });
+      // Mouse only: a scanner's Enter must not dismiss it.
+      btn.addEventListener('keydown', ev => { ev.preventDefault(); ev.stopPropagation(); }, true);
+      btn.addEventListener('click', () => { try { pop.remove(); } catch (_) {} pop = null; });
+      card.append(btn); pop.append(card); document.body.appendChild(pop);
+      return true;
+    }
+    window.addEventListener('beforeunload', e => {
+      if (units() > 0) { log('v5_unload_warned', { units: units() }); e.preventDefault(); e.returnValue = ''; return ''; }
+    });
+    return { units, refuse };
+  })();
+
+  function esc5(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch])); }
+
+  // ── OB: remember open boxes with stock; rescue one left open ──────────────────
+  var OB = (() => {
+    const NL = (typeof __NL !== 'undefined') ? __NL : null;
+    const log = (e, d) => { try { if (NL) NL.event(e, d); } catch (_) {} };
+    const S = (el, css) => { for (const k of Object.keys(css)) el.style.setProperty(k, css[k], 'important'); };
+    const KEY = 'mp_v5_open_boxes';
+    const STALE_MS = 20000, MAX_AGE_MS = 3 * 24 * 3600 * 1000;
+    const checked = new Map();        // box id -> last check time
+    let card = null, busy = false;
+    const load = () => { try { return JSON.parse(localStorage.getItem(KEY) || '{}') || {}; } catch (_) { return {}; } };
+    const save = m => { try { localStorage.setItem(KEY, JSON.stringify(m)); } catch (_) {} };
+    function parse(t) { try { return typeof t === 'string' ? JSON.parse(t) : t; } catch (_) { return null; } }
+
+    if (NL && NL.onCall) NL.onCall(rec => {
+      try {
+        if (!rec || !rec.route) return;
+        const ok = rec.ok !== false && Number(rec.status) < 400;
+        const p = rec.params || {};
+        if (rec.route === 'shipment/shipment-container/move-into-container-v2' && ok) {
+          const id = String(p.container_id || '');
+          if (!id) return;
+          const m = load();
+          const b = parse(rec.res_body) || {};
+          const cx = rec.ctx_start || {};
+          const sh = ShipmentCache.shipmentHeader || {};
+          const e = m[id] || { id: Number(id), no: cx.outContainerNo || Session.outboundContainer?.container_no || null,
+            shipId: cx.shipmentHeaderId || sh.id || null, shipNo: sh.shipment_number || null,
+            tote: ShipmentCache.sourceContainerNo || null, desk: Session.packLocationCode || null, units: 0, t0: Date.now() };
+          e.units += Number(b.quantity) || 1;
+          e.ts = Date.now();
+          m[id] = e; save(m);
+        } else if ((rec.route === 'shipment/shipment-container/close-to-container' && ok) ||
+                   (rec.route === 'shipment/shipment-container/delete' && ok)) {
+          const id = String(p.container_id || p.id || '');
+          const m = load();
+          if (id && m[id]) { delete m[id]; save(m); }
+        } else if (rec.route === 'shipment/shipment-container/get-pack-container' && !ok) {
+          setTimeout(check, 300);   // "Job does not exist" on a tote is exactly when a stranded box hides
+        }
+      } catch (_) {}
+    });
+
+    async function check() {
+      if (busy || (card && card.isConnected)) return;
+      if (['PACKING', 'CLOSING', 'CHOOSE_BOX'].includes(Session.phase)) return;
+      const m = load();
+      const now = Date.now();
+      const curId = Session.outboundContainer?.id || null;
+      const ids = Object.keys(m).filter(id => Number(id) !== Number(curId) && now - (m[id].ts || 0) > STALE_MS);
+      for (const id of ids) {
+        const e = m[id];
+        if (now - (e.ts || 0) > MAX_AGE_MS || !e.shipId) { delete m[id]; save(m); continue; }
+        if (now - (checked.get(id) || 0) < 60000) continue;
+        checked.set(id, now);
+        busy = true;
+        try {
+          const open = await fetchOpenOutboundContainersForShipment(e.shipId);
+          const still = (open || []).find(c => Number(c.id) === Number(id) && Number(c.status_id) < 7);
+          if (!still) { const mm = load(); delete mm[id]; save(mm); log('v5_box_cleared', { box: e.no }); continue; }
+          log('v5_box_left_open', { box: e.no, shipmentNo: e.shipNo, units: e.units });
+          show(e);
+          return;
+        } catch (_) { /* try again later */ }
+        finally { busy = false; }
+      }
+    }
+
+    function show(e) {
+      // Above the tote box: that is where the packer is looking when this shows.
+      const anchorEl = (R && R.toteSection && R.toteSection.parentElement) ? R.toteSection : null;
+      const host = anchorEl ? anchorEl.parentElement : null;
+      if (!host) return;
+      card = document.createElement('div');
+      card.className = 'mp-v5-openbox';
+      S(card, { margin: '8px 10px 6px', padding: '14px 16px', 'border-radius': '8px', border: '4px solid #b91c1c',
+        background: '#fef2f2', color: '#111', font: '17px/1.45 system-ui,sans-serif' });
+      card.innerHTML =
+        `<div style="font-size:21px;font-weight:800;color:#b91c1c">⛔ Unfinished box: ${esc5(e.no || 'box')}</div>` +
+        `<div><b>${esc5(e.shipNo || 'An order')}</b> has <b>${e.units} unit${e.units === 1 ? '' : 's'}</b> packed in <b>${esc5(e.no || 'a box')}</b>` +
+        `${e.desk ? ` at ${esc5(e.desk)}` : ''}, but the box was never closed: <b>no label</b>.</div>` +
+        `<div style="margin-top:4px">Do <b>not</b> repack it. Find the box${e.tote ? ` (tote ${esc5(e.tote)})` : ''} and send it to Exceptions.</div>`;
+      const row = document.createElement('div');
+      S(row, { display: 'flex', gap: '10px', 'margin-top': '10px' });
+      const mk = (txt, bg, fg) => { const b = document.createElement('button'); b.type = 'button'; b.textContent = txt;
+        S(b, { padding: '10px 14px', 'font-size': '16px', background: bg, color: fg, border: '2px solid #b91c1c', 'border-radius': '6px', cursor: 'pointer' });
+        b.addEventListener('keydown', ev => { ev.preventDefault(); ev.stopPropagation(); }, true); return b; };
+      const send = mk('Send to Exceptions (print error sheet)', '#b91c1c', '#fff');
+      send.className = 'mp-v5-openbox-send';
+      const done = mk('Already dealt with', '#fff', '#b91c1c');
+      done.className = 'mp-v5-openbox-done';
+      send.addEventListener('click', async () => {
+        send.disabled = true; send.textContent = 'Sending…';
+        log('v5_box_sent', { box: e.no, shipmentNo: e.shipNo });
+        try {
+          const row = await handOffErroredShipment({
+            reason: `Box ${e.no} left OPEN with ${e.units} unit(s), not closed, no label (pack screen closed or reloaded mid-order)`,
+            stage: 'box-left-open', shipmentNo: e.shipNo, shipmentHeaderId: e.shipId, jobId: null,
+            packDesk: e.desk || Session.packLocationCode, containerNo: e.no, sourceTote: e.tote,
+            error: null, consignmentId: null, state: null,
+          });
+          if (row && (!row.printed || row.printed === 'pending')) {
+            if (_handoffBannerNodes) { _handoffBannerNodes.forEach(n => { try { n.remove(); } catch (_) {} }); _handoffBannerNodes = null; }
+            await printErrorSheet(row).catch(() => null);
+            showHandoffBanner(ErroredShipments.find(row.shipmentHeaderId) || row);
+          }
+        } catch (err) { EventLog.err(`Could not send ${e.shipNo} to Exceptions: ${err.message}`); }
+        const mm = load(); delete mm[String(e.id)]; save(mm);
+        try { card.remove(); } catch (_) {} card = null;
+      });
+      done.addEventListener('click', () => {
+        log('v5_box_dismissed', { box: e.no, shipmentNo: e.shipNo });
+        const mm = load(); delete mm[String(e.id)]; save(mm);
+        try { card.remove(); } catch (_) {} card = null;
+      });
+      row.append(send, done); card.append(row);
+      host.insertBefore(card, anchorEl);
+      try { beep('err'); } catch (_) {}
+    }
+
+    // A box that went to Exceptions through any hand-off is already owned: never flag it again.
+    function forgetNo(no) {
+      if (!no) return;
+      const m = load(); let hit = false;
+      for (const id of Object.keys(m)) if (m[id] && m[id].no === no) { delete m[id]; hit = true; }
+      if (hit) save(m);
+    }
+
+    setInterval(() => { check().catch(() => {}); }, 15000);
+    setTimeout(() => { check().catch(() => {}); }, 4000);
+    return { check, load, forgetNo, get card() { return card; } };
+  })();
+
   // ─────────────────────────────────────────────────────────────────────────────
   //  DEBUG HANDLE — on-device console + offline test harness
   //  Read-only surface onto the internals the v3.4.0 fixes turn on.
@@ -11176,7 +11435,7 @@ color: #b91c1c;
       // answer with total confidence. GM_info is absent in the Node test
       // harness, hence the literal fallback.
       VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '3.9.0',
-      Session, ShipmentCache, SourceToteCache, Workflow, R, EventLog, PF, EP, FK, LV, TG, SL, AB, CF, FIN,
+      Session, ShipmentCache, SourceToteCache, Workflow, R, EventLog, PF, EP, FK, LV, TG, SL, AB, CF, FIN, JR, SG, OB,
       // v3.7.0 — error log internals, so the pipeline can be inspected from
       // the console on a bench instead of guessed at from null columns.
       ShipmentSnapshot, PickerByTote, reportPackError, ERROR_LOG_URL,

@@ -1,4 +1,4 @@
-# Malpa Pack v4 — README
+# Malpa Pack v5 — README
 
 `malpa-pack.user.js` · ~11,300 lines · one IIFE plus the NetLog recorder IIFE, no dependencies.
 
@@ -32,7 +32,26 @@
 - `@version` carries `-nl.9.1` on purpose: the recorder's "TWO PACK SCRIPTS ON" check treats
   a `__malpaPack` handle without `-nl` as a second, older pack script.
 
-Still open (not in v4): part-packed guard (F1), item barcode in the tote box (F3), PF
+- **v5.0.0 (25 Nov 2026, WPD-08 incidents SBDC#71868 / SBDC#71921):**
+  - `JR` — a move or close that C7 refuses with "This job is already unassigned" (someone
+    took the pack job off the packer in C7) is fixed in place: the script looks up the pack
+    job by shipment number, assigns it back to the signed-in packer (`currentOperatorWmsId()`)
+    **only if nobody owns it**, and retries once. At most 2 reclaims per shipment. Hooks:
+    `apiGet(path, _jrRetry)` and `closeContainer()`. Not wired into the print-first
+    background close (`PF.bgCloseCall`): by then ShipmentCache may hold the next order.
+  - `SG` — Escape, the × on the pack tab and Reset are refused with a red mouse-only popup
+    while units sit in an open box (phase PACKING/CHOOSE_BOX/CLOSING). Leaving or reloading
+    the page asks first (`beforeunload`). `maybeDeleteAbandonedContainer()` never deletes a
+    box that holds stock.
+  - `OB` — every successful move records the box in `localStorage.mp_v5_open_boxes`; a
+    successful close or delete removes it; any hand-off forgets it. Every 15 s (and after a
+    tote load fails) a box last touched >20 s ago is checked in C7; if still open, a red card
+    above the tote box names the box, order and units, with **Send to Exceptions** (hand-off +
+    error sheet) or **Already dealt with**.
+  - After a hand-off the status line says "Last order NOT finished — it has gone to
+    Exceptions" instead of "✓ Shipment complete".
+
+Still open (not in v5): part-packed guard (F1), item barcode in the tote box (F3), PF
 overlap watch ignoring `logging/*` (F5), multi-box card wording (F6). See handover §9.5.
 
 This document is for someone who has never seen this file and needs to change it without
