@@ -1,6 +1,39 @@
-# Malpa Pack v3 — README
+# Malpa Pack v4 — README
 
-`malpa-pack.user.js` · ~5,900 lines · one IIFE, no build step, no dependencies.
+`malpa-pack.user.js` · ~11,300 lines · one IIFE plus the NetLog recorder IIFE, no dependencies.
+
+> **v4.0.0 (25 Nov 2026).** v4 is the bench build nl.9.1: live 3.9.2 plus the patch blocks
+> trialled on the pack desks 9–25 Nov. Sections 2–14 below still describe the 3.9.2 core,
+> which is unchanged underneath. What v4 adds is in **section 0**. Full reasoning, evidence
+> and the bench reviews: Claude "Tech" project, `MALPA-PACK-HANDOVER-ZAYNNE.md` and
+> `NL9-BENCH-2026-11-25.md`. Build source: `C:\dev\Claude outputs\netlog\build\`
+> (`build.py` → nl.9, then `nl91_patch.py` → v4). Offline tests: `...\netlog\test\`.
+
+---
+
+## 0. What v4 adds on top of 3.9.2
+
+- **NetLog recorder** (top of file, `__NL`). Records every C7/GM call, scans, F9 "slow"
+  marks and browser health to IndexedDB on the desk (purged after 5 days). Export with
+  Ctrl+Alt+E or the pill bottom-left. Auth headers are redacted, but **exports contain
+  customer names and addresses**: treat them as personal data.
+- **SIBP print-first** (`PF`, nl.4–6): only on a SIBP-flow profile with "print consignment
+  piece label" OFF (today: profile 21 "TESTING – DO NOT USE", which `Workflow.isSIBP()`
+  also matches). Reprints the stored label, closes in the background, alerts on overlap.
+- **nl.7** (`EP`, `FK`, `LV`): item box ready at tote Enter with early scans held; box created
+  in the background; PACKING FAILED popup; counters in units; focus keeper; long-order list.
+- **nl.8** (`TG`, `SL`, `AB`): unfinished-tote guard; SIBP "N orders left"; Abort order.
+- **nl.9** (`CF`, `FIN`): are-you-sure on de-scan and manual close; wrong-item / extra-unit
+  alarm; finishing-order card; label queue split from the tracking call; empty-parcel
+  auto-recovery fixed; TOO MANY qty popup.
+- **v4.0.0 (F2):** `onProfileChange()` fully resets when leaving SIBP (phase, cart, item box,
+  label) and sets the retain box from the profile (ticked for MIBP, unticked otherwise). A
+  SIBP close that finishes after the profile changed no longer restores the SIBP screen.
+- `@version` carries `-nl.9.1` on purpose: the recorder's "TWO PACK SCRIPTS ON" check treats
+  a `__malpaPack` handle without `-nl` as a second, older pack script.
+
+Still open (not in v4): part-packed guard (F1), item barcode in the tote box (F3), PF
+overlap watch ignoring `logging/*` (F5), multi-box card wording (F6). See handover §9.5.
 
 This document is for someone who has never seen this file and needs to change it without
 breaking a live packing bench. Read sections 1–4 before you touch anything.
@@ -381,7 +414,8 @@ inspect state on a locked-down bench machine. Adding it is a good first contribu
 - SIBP/MIBP detection is a **regex on the profile name**; renaming a profile in C7 silently
   changes behaviour.
 - Metabase and Retool credentials are committed in the file.
-- No offline test harness ships alongside this script, and no `window.__malpaPack` handle.
+- The offline test harness (Playwright + mock C7) lives outside the repo, in
+  `C:\\dev\\Claude outputs\\netlog\\test\\`. `window.__malpaPack` exists (debug handle, end of file).
 - `Session.containerTypes` is cached for the life of the tab; a container type added in C7
   mid-shift will not appear until reload.
 - Sections 17/19 are stubs; §18 does not exist.
