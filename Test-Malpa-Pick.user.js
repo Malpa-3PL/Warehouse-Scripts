@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Pick TEST
 // @namespace    https://malpa.canary7.com/test
-// @version      4.18.1
+// @version      4.18.2
 // @description  TEST BUILD of Malpa Pick (scan guards, faster summary, portal styling). Disable "Malpa Pick" in Tampermonkey on any device running this.
 // @author       Malpa 3PL
 // @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/Test-Malpa-Pick.user.js
@@ -5874,6 +5874,12 @@
       entered = String(newCount);
       render();
     };
+    // The quantity the Confirm key would send right now (4.18.2).
+    overlay._current = () => {
+      const req = displayQty(State.instruction);
+      const v = entered ? parseInt(entered, 10) : req;
+      return Math.min(isNaN(v) ? 0 : v, req);
+    };
     screen.appendChild(overlay);
 
     // Re-focus hidden scan input so scanner can still increment by scanning
@@ -5887,6 +5893,27 @@
     // auto-confirm and the overscan block would both never fire on a
     // multi-each UoM.
     const qty = displayQty(State.instruction);
+
+    // 4.18.2 - a TOTE scanned while the keypad is still open. Fast pickers do
+    // this straight after the last unit; 4.18.1 said "Wrong item", and 4.13
+    // dropped it. If the keypad already holds the full quantity, that is what
+    // Confirm would send anyway: confirm it and carry the tote scan straight on.
+    // If it holds less, never guess a partial pick - say what is missing.
+    if (validateContainerLabel(barcode) && !verifyItem(barcode)) {
+      const ov = document.getElementById('mpk-numpad-overlay');
+      const have = ov && ov._current ? ov._current() : State.scanCount;
+      if (have >= qty) {
+        ov?.remove();
+        State.scanCount = qty;
+        goToToteStep();
+        if (!isLocod()) onContainerScan(barcode);
+      } else {
+        if (ov && ov._note) ov._note(`Confirm the quantity first - ${have} of ${qty} counted`, 'warn');
+        Voice.error('Confirm quantity first');
+        if (navigator.vibrate) navigator.vibrate([40, 40, 40]);
+      }
+      return;
+    }
 
     // Block further scans once target reached -- prevents overscan
     if (State.scanCount >= qty) {
@@ -6138,7 +6165,7 @@
     // '4.10.0' on a 4.10.1 file, so anyone checking the running build was told
     // the wrong answer. GM_info is absent in the Node test harness, hence the
     // literal fallback.
-    VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '4.18.1',
+    VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '4.18.2',
     reportPickError,
     currentOperatorName,
     ERROR_LOG_URL,

@@ -646,6 +646,39 @@ const tick = async (k = 6) => { for (let i = 0; i < k; i++) await flush(); };
   T.State.instruction = Object.assign({}, I2, { cluster_position_id: null });
   eq('no cluster positions: lists the totes used', T.cartSlots().slots.map(x => x.tote), ['B197']);
 
+  console.log('\n15. Tote scanned while the quantity keypad is open');
+  const M = { id: 3438000, job_id: 2077877, job_instruction_group_id: null, reference_number: '#200001',
+    quantity: 4, item_id: 1, from_location_id: 1, fromLocation: { location_code: 'B01-A02' },
+    item: ITEM, itemUnitOfMeasure: { id: 7, factor: 1 } };
+  const setupKeypad = () => {
+    T.Busy.end();
+    T.State.reset();
+    T.State.profile = { id: 49, name: 'Wholesale Queue' };
+    T.State.jobId = 2077877;
+    T.State.instruction = M;
+    T.State.groupRecord = null;
+    T.State.containerPrefixes = ['B', 'W'];
+    T.clearInflight();
+    T.renderPickScreen(M);
+    T.onItemScan('9300000000011');
+    reset();
+  };
+  stubFetch({ 'job-instruction/perform': { job_instruction: null }, 'change-sequence': {} });
+  setupKeypad();
+  eq('item scan on a 4-unit pick opens the keypad', T.State.screen, 'QTY_MODAL');
+  await T._onScan('B197'); await tick(10);
+  eq('keypad showing the full 4: the tote scan confirms and moves - ONE perform', n('job-instruction/perform', 'POST'), 1);
+  eq('...with the full quantity', posted.find(x => x.url.includes('job-instruction/perform')).body.picking_qty, 4);
+  eq('...into the scanned tote', posted.find(x => x.url.includes('job-instruction/perform')).body.container_no, 'B197');
+
+  setupKeypad();
+  T._onScan('9300000000011');                 // 2 of 4 counted
+  T._onScan('B197'); await tick(10);
+  eq('only 2 of 4 counted: nothing moves', n('job-instruction/perform', 'POST'), 0);
+  eq('keypad stays open', T.State.screen, 'QTY_MODAL');
+  ok('and says what is missing', /Confirm the quantity first - 2 of 4 counted/.test(
+     (sandbox.document.getElementById('mpk-numpad-err') || {}).textContent || ''));
+
   console.log('\n11. Short pick goes through the same lock');
   stubFetch({ 'pick-short': { job_instruction: null } });
   setupGroupPick();
