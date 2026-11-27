@@ -198,6 +198,9 @@ function memStore() {
            key: (i) => [...m.keys()][i], get length() { return m.size; } };
 }
 sandbox.window = sandbox;
+let spoken = 0;
+sandbox.speechSynthesis = { speak() { spoken++; }, cancel() {} };
+sandbox.SpeechSynthesisUtterance = function (t) { this.text = t; };
 sandbox.XMLHttpRequest.prototype = { open() {}, setRequestHeader() {} };
 sandbox.localStorage.setItem('access_token', 'ey' + 'x'.repeat(40) + '.abc.def');
 
@@ -352,10 +355,18 @@ const tick = async (k = 6) => { for (let i = 0; i < k; i++) await flush(); };
   ok('busy lock is up while Canary7 works', T.Busy.isActive());
   ok('overlay painted', !!sandbox.document.getElementById('mpk-busy'));
   ok('in-flight ledger written BEFORE the answer', !!T.loadInflight() && T.loadInflight().tote === 'B197');
+  const busyText = (sandbox.document.getElementById('mpk-busy') || {})._html || '';
+  ok('busy card says "Moving items to container" + "Please wait"',
+     busyText.includes('Moving items to container') && busyText.includes('Please wait'));
+  ok('no instructions to the picker (no DO NOT SCAN / scan once)', !/do not scan|scan once/i.test(busyText));
+  ok('the tote is named', busyText.includes('B197'));
+  ok('a 100-order group gets a determinate progress bar', T.Busy.active.estMs > 30000 && !busyText.includes('indeterminate'));
+  const spokenBefore = spoken;
   for (let i = 0; i < 5; i++) T._onScan('B197');
   T._onScan('9300000000011');
   eq('six panicked scans -> still ONE group-perform', n('group-perform', 'POST'), 1);
-  eq('every one of them was answered (ignored count)', T.Busy.active.ignored, 6);
+  eq('repeat scans were swallowed', T.Busy.active.ignored, 6);
+  eq('...silently: nothing spoken for them', spoken, spokenBefore);
   ok('Back is refused while busy', (() => {
     const before = T.Busy.active.ignored;
     const back = sandbox.document.getElementById('mpk-back-btn'); back && back.click();
@@ -444,6 +455,23 @@ const tick = async (k = 6) => { for (let i = 0; i < k; i++) await flush(); };
   await s1; await s2; await tick();
   eq('one get-job-instructions call', n('get-job-instructions'), 1);
   ok('group record prefetched from the summary screen', T.groupCache.has(75831));
+
+  console.log('\n4b. Progress estimate');
+  const P = T.progressAt;
+  ok('0% at the start, 90% at the estimate', P(0, 10000) === 0 && Math.abs(P(10000, 10000) - 0.9) < 1e-9);
+  ok('keeps creeping after the estimate but never reaches 100%',
+     P(20000, 10000) > P(15000, 10000) && P(15000, 10000) > 0.9 && P(1e9, 10000) < 0.991);
+  ok('never goes backwards', [0, 1, 5, 9, 10, 11, 30, 90].map(x => P(x * 1000, 10000)).every((v, i, a) => !i || v >= a[i - 1]));
+  sandbox.localStorage.setItem('mpk_perform_rate', JSON.stringify({ baseMs: 1500, perOrderMs: 550 }));
+  const e1 = T.Rate.estimate(100);
+  eq('seed estimate for 100 orders (1.5s + 100 x 0.55s)', e1, 56500);
+  T.Rate.learn(100, 31500);                   // this site ran at 0.3s/order
+  const r1 = JSON.parse(sandbox.localStorage.getItem('mpk_perform_rate'));
+  ok('learns a faster per-order rate from a real group', r1.perOrderMs < 550 && r1.perOrderMs > 300);
+  T.Rate.learn(100, 9e9);
+  ok('one absurd sample is clamped', JSON.parse(sandbox.localStorage.getItem('mpk_perform_rate')).perOrderMs <= 2000);
+  sandbox.localStorage.setItem('mpk_perform_rate', 'garbage');
+  eq('corrupt storage falls back to the seed', T.Rate.estimate(1), 2050);
 
   console.log('\n10b. Summary counts paint from get-job-summary before the slow list');
   stubFetch({
