@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Pick TEST
 // @namespace    https://malpa.canary7.com/test
-// @version      4.14.1
+// @version      4.14.2
 // @description  TEST BUILD of Malpa Pick (scan guards, faster summary, portal styling). Disable "Malpa Pick" in Tampermonkey on any device running this.
 // @author       Malpa 3PL
 // @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/Test-Malpa-Pick.user.js
@@ -1388,10 +1388,11 @@
   //     THE RULES NOW:
   //       1. One write at a time. Busy.start() before any perform / group-
   //          perform / pick-short; nothing else may start until Busy.end().
-  //       2. While busy, a full-panel overlay says exactly what is happening
-  //          and "DO NOT SCAN". The scan input stays ENABLED and focused so
-  //          every scan is caught, swallowed, and answered (buzz + "Wait" +
-  //          a visible count) instead of falling through to the page.
+  //       2. While busy, a full-panel overlay says "Moving items to container -
+  //          Please wait" with a progress bar. The scan input stays ENABLED
+  //          and focused, so a repeat scan is caught and simply does nothing
+  //          (4.14.2: silently - only the first scan counts, and the design
+  //          must not depend on pickers reading or hearing an instruction).
   //       3. Back, Short Pick, Esc and the tab close are refused while busy.
   //       4. A perform is never blindly retried. If it errors, the script
   //          asks Canary7 where the job is now (reconcilePerform): if the
@@ -1402,8 +1403,7 @@
   // -----------------------------------------------------------------------------
 
   const _INFLIGHT_KEY = 'mpk_inflight';
-  const BUSY_SLOW_MS  = 8000;    // after this, say "big groups take a while"
-  const BUSY_CHECK_MS = 75000;   // after this, offer "Check status" (100-order groups take ~60s)
+  const BUSY_CHECK_MS = 75000;   // after this, offer "Check with Canary7" (100-order groups take ~60s)
 
   function saveInflight(rec) {
     try { sessionStorage.setItem(_INFLIGHT_KEY, JSON.stringify({ ...rec, at: Date.now() })); } catch (_) {}
@@ -1423,34 +1423,110 @@
     } catch (_) { return null; }
   }
 
+  // ---------------------------------------------------------------------------
+  // PERFORM TIME ESTIMATE (4.14.2) - drives the progress bar.
+  //
+  // Canary7 cannot report progress cheaply (the group filter on
+  // job/job-instruction is ignored, and a job-wide read takes 6-8s), so the bar
+  // is an ESTIMATE: fixed overhead + per-order cost. Seeded from timings
+  // measured 2026-11-27 on PuraU MIBP groups (~0.37-0.6s per order), then
+  // learned per device from every perform that answers directly, so the bar
+  // tracks this site's real speed. localStorage, not sessionStorage: it should
+  // survive a shift change. Clamped so one freak result cannot wreck it.
+  // ---------------------------------------------------------------------------
+  const _RATE_KEY = 'mpk_perform_rate';
+  const Rate = {
+    _d: { baseMs: 1500, perOrderMs: 550 },
+    load() {
+      try {
+        const r = JSON.parse(localStorage.getItem(_RATE_KEY) || 'null');
+        if (r && r.baseMs > 0 && r.perOrderMs > 0) return { baseMs: r.baseMs, perOrderMs: r.perOrderMs };
+      } catch (_) {}
+      return { ...this._d };
+    },
+    estimate(orders, extraMs) {
+      const r = this.load();
+      return Math.round(r.baseMs + Math.max(1, orders || 1) * r.perOrderMs + (extraMs || 0));
+    },
+    learn(orders, elapsedMs, extraMs) {
+      try {
+        const r = this.load();
+        const n = Math.max(1, orders || 1);
+        const t = elapsedMs - (extraMs || 0);
+        const A = 0.3;                                   // weight of the newest sample
+        if (n >= 5) {
+          const per = Math.min(2000, Math.max(150, (t - r.baseMs) / n));
+          r.perOrderMs = Math.round(r.perOrderMs * (1 - A) + per * A);
+        } else {
+          const base = Math.min(10000, Math.max(400, t - n * r.perOrderMs));
+          r.baseMs = Math.round(r.baseMs * (1 - A) + base * A);
+        }
+        localStorage.setItem(_RATE_KEY, JSON.stringify(r));
+      } catch (_) {}
+    },
+  };
+
+  /**
+   * Bar position for elapsed `t` against estimate `est`: linear to 90% at the
+   * estimate, then creeping toward (never reaching) 99% - so a slow Canary7
+   * looks slow, not frozen, and the bar never sits "full" while still waiting.
+   */
+  function progressAt(t, est) {
+    if (!est || est <= 0) return 0;
+    if (t <= est) return 0.9 * (t / est);
+    return 0.9 + 0.09 * (1 - Math.exp(-(t - est) / est));
+  }
+
   const Busy = {
-    active: null,     // { kind, title, sub, startedAt, ignored }
+    active: null,     // { kind, title, detail, startedAt, estMs, ignored, done }
     _tick: null,
-    _lastVoice: 0,
     _onCheck: null,
 
     isActive() { return !!this.active; },
 
     /**
-     * kind:  'perform' | 'shortpick' | 'loading'
-     * title: big line, HTML-escaped by caller where it carries data
-     * opts.onCheck: async fn wired to the "Check status" button that
+     * kind:   'perform' | 'shortpick' | 'loading'
+     * title:  plain text, e.g. 'Moving items to container'
+     * opts.detail:  small mono line under the title (the tote number)
+     * opts.estMs:   expected duration -> determinate progress bar
+     * opts.onCheck: async fn behind the "Check with Canary7" button that
      *               appears after BUSY_CHECK_MS
      */
-    start(kind, titleHtml, sub, opts) {
-      this.active = { kind, titleHtml, sub: sub || '', startedAt: Date.now(), ignored: 0 };
-      this._onCheck = (opts && opts.onCheck) || null;
+    start(kind, title, opts) {
+      opts = opts || {};
+      this.active = {
+        kind, title, detail: opts.detail || '', startedAt: Date.now(),
+        estMs: opts.estMs || 0, ignored: 0, done: false,
+      };
+      this._onCheck = opts.onCheck || null;
       State._busyKind = kind;
       this._render();
       if (this._tick) clearInterval(this._tick);
-      this._tick = setInterval(() => this._refresh(), 1000);
+      // 200ms: smooth enough to read as continuous on a TC51, cheap enough
+      // not to matter.
+      this._tick = setInterval(() => this._refresh(), 200);
     },
 
-    update(titleHtml, sub) {
+    /** Change the headline (e.g. 'Checking with Canary7', 'Loading next pick'). */
+    update(title, opts) {
+      if (!this.active || title == null) return;
+      this.active.title = title;
+      if (opts && opts.indeterminate) {
+        // The estimate no longer applies (we are now checking, not moving):
+        // switch to a sliding bar rather than show a made-up percentage.
+        this.active.estMs = 0;
+        this._render();
+        return;
+      }
+      const el = document.getElementById('mpk-busy-title');
+      if (el) el.textContent = title;
+    },
+
+    /** Canary7 answered: fill the bar. The overlay stays until end(). */
+    complete() {
       if (!this.active) return;
-      if (titleHtml != null) this.active.titleHtml = titleHtml;
-      if (sub != null) this.active.sub = sub;
-      this._render();
+      this.active.done = true;
+      this._refresh();
     },
 
     end() {
@@ -1473,8 +1549,8 @@
       if (!el) {
         el = document.createElement('div');
         el.id = 'mpk-busy';
-        el.setAttribute('role', 'alert');
-        el.setAttribute('aria-live', 'assertive');
+        el.setAttribute('role', 'status');
+        el.setAttribute('aria-live', 'polite');
         host.appendChild(el);
         // Taps on the overlay must not reach anything underneath, and they
         // put focus back on the scan input so the next scan is caught.
@@ -1486,14 +1562,19 @@
       }
       const a = this.active;
       el.innerHTML = `
-        <div class="mpk-busy-spin"></div>
-        <div class="mpk-busy-stop">Do not scan</div>
-        <div class="mpk-busy-title" id="mpk-busy-title">${a.titleHtml}</div>
-        <div class="mpk-busy-sub" id="mpk-busy-sub">${_esc(a.sub)}</div>
-        <div class="mpk-busy-meta" id="mpk-busy-meta"></div>
-        <div class="mpk-busy-ignored" id="mpk-busy-ignored"></div>
+        <div class="mpk-busy-card">
+          <div class="mpk-busy-spin"></div>
+          <div class="mpk-busy-title" id="mpk-busy-title">${_esc(a.title)}</div>
+          ${a.detail ? `<div class="mpk-busy-detail mpk-mono">${_esc(a.detail)}</div>` : ''}
+          <div class="mpk-busy-wait">Please wait</div>
+          <div class="mpk-busy-track${a.estMs ? '' : ' indeterminate'}" id="mpk-busy-track"
+               role="progressbar" aria-valuemin="0" aria-valuemax="100">
+            <div class="mpk-busy-fill" id="mpk-busy-fill"></div>
+          </div>
+          <div class="mpk-busy-left" id="mpk-busy-left"></div>
+        </div>
         <div class="mpk-busy-actions" id="mpk-busy-actions">
-          <button id="mpk-busy-check" class="mpk-btn mpk-btn-secondary">Check status with Canary7</button>
+          <button id="mpk-busy-check" class="mpk-btn mpk-btn-secondary">Check with Canary7</button>
         </div>`;
       document.getElementById('mpk-busy-check')?.addEventListener('click', async (e) => {
         e.stopPropagation();
@@ -1502,7 +1583,7 @@
         const btn = e.currentTarget || e.target;
         if (btn) { btn.disabled = true; btn.textContent = 'Checking...'; }
         try { await fn(); }
-        finally { if (btn && document.contains(btn)) { btn.disabled = false; btn.textContent = 'Check status with Canary7'; } }
+        finally { if (btn && document.contains(btn)) { btn.disabled = false; btn.textContent = 'Check with Canary7'; } }
       });
       this._refresh();
     },
@@ -1510,46 +1591,32 @@
     _refresh() {
       const a = this.active;
       if (!a) return;
-      const secs = Math.floor((Date.now() - a.startedAt) / 1000);
-      const meta = document.getElementById('mpk-busy-meta');
-      if (meta) {
-        meta.textContent = secs >= 2 ? `Waiting on Canary7 - ${secs}s` : 'Sending to Canary7...';
-      }
-      const sub = document.getElementById('mpk-busy-sub');
-      if (sub && a.kind === 'perform' && Date.now() - a.startedAt > BUSY_SLOW_MS && !a._slowShown) {
-        a._slowShown = true;
-        sub.textContent = 'Big groups can take Canary7 a while. It is still working - '
-          + 'scanning again will NOT speed it up. Keep the tote where it is.';
-      }
-      const ign = document.getElementById('mpk-busy-ignored');
-      if (ign) {
-        ign.classList.toggle('show', a.ignored > 0);
-        ign.textContent = a.ignored === 1 ? '1 scan ignored' : `${a.ignored} scans ignored`;
+      const t = Date.now() - a.startedAt;
+      const fill  = document.getElementById('mpk-busy-fill');
+      const track = document.getElementById('mpk-busy-track');
+      const left  = document.getElementById('mpk-busy-left');
+      if (a.estMs || a.done) {
+        const p = a.done ? 1 : progressAt(t, a.estMs);
+        if (track) { track.classList.remove('indeterminate'); track.setAttribute('aria-valuenow', String(Math.round(p * 100))); }
+        if (fill) fill.style.width = (p * 100).toFixed(1) + '%';
+        if (left) {
+          const secs = Math.ceil((a.estMs - t) / 1000);
+          left.textContent = a.done ? '' : (secs >= 2 ? `About ${secs}s left` : 'Almost done');
+        }
       }
       const acts = document.getElementById('mpk-busy-actions');
-      if (acts) acts.classList.toggle('show', !!this._onCheck && Date.now() - a.startedAt > BUSY_CHECK_MS);
+      if (acts) acts.classList.toggle('show', !!this._onCheck && !a.done && t > BUSY_CHECK_MS);
     },
 
-    /** A scan (or Back/Esc) arrived while a write is in flight. */
-    blocked(what) {
-      const a = this.active;
-      if (!a) return;
-      a.ignored++;
-      this._refresh();
-      const el = document.getElementById('mpk-busy');
-      if (el) {
-        el.classList.remove('shake');
-        void el.offsetWidth;            // restart the animation
-        el.classList.add('shake');
-      }
-      Audio.chime('blocked');
-      if (navigator.vibrate) navigator.vibrate([200]);
-      // Throttle the voice - a picker hammering the trigger should hear one
-      // clear "wait", not a stutter.
-      if (Date.now() - this._lastVoice > 2500) {
-        this._lastVoice = Date.now();
-        Voice.error(what === 'scan' ? 'Wait. Still moving.' : 'Wait');
-      }
+    /**
+     * A scan, Back, Esc or close arrived while a write is in flight. It is
+     * swallowed and does NOTHING (4.14.2): no buzz, voice or counter. The
+     * overlay itself is the feedback; the count is kept only for the logs
+     * and the test harness.
+     */
+    blocked() {
+      if (!this.active) return;
+      this.active.ignored++;
     },
   };
 
@@ -2117,9 +2184,9 @@
         transition: opacity .06s ease-in;
         border-radius: inherit;
       }
-      .mpk-flash.flash-ok   { background: #3cbe78; }
-      .mpk-flash.flash-err  { background: #e5484d; }
-      .mpk-flash.flash-warn { background: #f0be50; }
+      .mpk-flash.flash-ok   { background: var(--mpk-ok-fg); }
+      .mpk-flash.flash-err  { background: var(--mpk-crit-fg); }
+      .mpk-flash.flash-warn { background: var(--mpk-warn-fg); }
 
       /* -- Cluster position strip -- */
       .mpk-cluster-strip {
@@ -2555,75 +2622,84 @@
       .mpk-block-overlay .mpk-bo-text { font-size: 14px; color: rgb(255 255 255 / 0.78); line-height: 1.5; }
       .mpk-block-overlay .mpk-btn-secondary { background: transparent; color: #fff; border-color: rgb(255 255 255 / 0.3); }
 
-      /* == BUSY LOCK (v4.14.0) ============================================
+      /* == BUSY LOCK (v4.14.0, card + progress bar 4.14.2) ================
          Covers the whole panel - scan zone, Back, Short Pick - while
-         Canary7 is moving stock. Scans that arrive are swallowed and
-         answered here, so the picker always gets a response and nothing
-         reaches a second perform. */
+         Canary7 is moving stock. Same shape as the portal's modal: navy
+         scrim, white card, coral accent. Repeat scans land on the hidden
+         input underneath and are swallowed. */
       #mpk-busy {
         position: absolute;
         inset: 0;
         z-index: 9000;
-        background: rgb(20 21 63 / 0.94);
+        background: rgb(20 21 63 / 0.72);
         display: flex;
         flex-direction: column;
         align-items: center;
         justify-content: center;
-        gap: 14px;
-        padding: 24px 20px;
-        text-align: center;
+        gap: 12px;
+        padding: 20px 16px;
         font-family: var(--mpk-font);
-        color: #fff;
         -webkit-tap-highlight-color: transparent;
       }
+      #mpk-busy .mpk-busy-card {
+        width: 100%;
+        max-width: 380px;
+        background: var(--mpk-surface);
+        border-radius: var(--mpk-r);
+        box-shadow: var(--mpk-pop-shadow);
+        padding: 24px 20px 20px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        text-align: center;
+        gap: 8px;
+        color: var(--mpk-text);
+      }
       #mpk-busy .mpk-busy-spin {
-        width: 56px; height: 56px;
-        border: 5px solid rgb(255 255 255 / 0.15);
+        width: 44px; height: 44px;
+        border: 4px solid var(--mpk-brand-subtle);
         border-top-color: var(--mpk-brand);
         border-radius: 50%;
         animation: mpk-spin .8s linear infinite;
+        margin-bottom: 4px;
       }
-      #mpk-busy .mpk-busy-stop {
-        display: inline-flex; align-items: center; gap: 8px;
-        padding: 6px 14px;
+      #mpk-busy .mpk-busy-title { font-size: 20px; font-weight: 700; line-height: 1.25; letter-spacing: -.01em; }
+      #mpk-busy .mpk-busy-detail { font-size: 15px; font-weight: 500; color: var(--mpk-muted); }
+      #mpk-busy .mpk-busy-wait { font-size: 15px; color: var(--mpk-muted); font-weight: 500; }
+      #mpk-busy .mpk-busy-track {
+        width: 100%;
+        height: 10px;
+        margin-top: 10px;
+        border-radius: 999px;
+        background: var(--mpk-sunken);
+        overflow: hidden;
+        position: relative;
+      }
+      #mpk-busy .mpk-busy-fill {
+        height: 100%;
+        width: 0;
         border-radius: 999px;
         background: var(--mpk-brand);
-        color: var(--mpk-on-brand);
-        font-size: 14px;
-        font-weight: 800;
-        letter-spacing: .08em;
-        text-transform: uppercase;
+        transition: width .2s linear;
       }
-      #mpk-busy .mpk-busy-title { font-size: 22px; font-weight: 700; line-height: 1.25; }
-      #mpk-busy .mpk-busy-title .mpk-mono { font-weight: 500; }
-      #mpk-busy .mpk-busy-sub { font-size: 14px; color: rgb(255 255 255 / 0.78); line-height: 1.5; max-width: 340px; }
-      #mpk-busy .mpk-busy-meta {
+      /* No estimate (e.g. checking with Canary7): a sliding bar, never a
+         fake percentage. */
+      #mpk-busy .mpk-busy-track.indeterminate .mpk-busy-fill {
+        width: 35%;
+        position: absolute;
+        left: -35%;
+        animation: mpk-slide 1.2s var(--mpk-ease) infinite;
+      }
+      @keyframes mpk-slide { to { left: 100%; } }
+      #mpk-busy .mpk-busy-left {
+        min-height: 18px;
         font-size: 13px;
-        color: rgb(255 255 255 / 0.6);
+        color: var(--mpk-muted);
         font-variant-numeric: tabular-nums;
       }
-      #mpk-busy .mpk-busy-ignored {
-        display: none;
-        padding: 6px 12px;
-        border-radius: var(--mpk-r-sm);
-        background: rgb(255 110 100 / 0.2);
-        color: #ffb4ae;
-        font-size: 14px;
-        font-weight: 700;
-      }
-      #mpk-busy .mpk-busy-ignored.show { display: block; }
-      #mpk-busy .mpk-busy-actions { display: none; width: 100%; max-width: 340px; flex-direction: column; gap: 8px; }
+      #mpk-busy .mpk-busy-actions { display: none; width: 100%; max-width: 380px; flex-direction: column; gap: 8px; }
       #mpk-busy .mpk-busy-actions.show { display: flex; }
-      #mpk-busy .mpk-btn-secondary { background: transparent; color: #fff; border-color: rgb(255 255 255 / 0.3); }
-      #mpk-busy.shake { animation: mpk-shake .32s var(--mpk-ease); }
-      #mpk-busy.shake .mpk-busy-stop { background: #ff6b5e; }
-      @keyframes mpk-shake {
-        0%, 100% { transform: translateX(0); }
-        20% { transform: translateX(-10px); }
-        40% { transform: translateX(10px); }
-        60% { transform: translateX(-6px); }
-        80% { transform: translateX(6px); }
-      }
+      #mpk-busy .mpk-btn-secondary { background: var(--mpk-surface); }
     `;
     document.head.appendChild(style);
   }
@@ -3810,10 +3886,8 @@
     else if (s === 'TOTE_CONFIRM') {
       Audio.chime('nudge');
       Voice.error('Answer the question on screen');
-    } else if (s === 'PERFORMING' || s === 'TRANSITIONING') {
-      setScanFeedback('Hold on - still working', 'warn');
-      Audio.chime('blocked');
     }
+    // PERFORMING / TRANSITIONING: the busy overlay is up; a scan does nothing.
   }
 
   function setScanFeedback(msg, type) {
@@ -4025,8 +4099,8 @@
     await runPerform({
       instruction,
       backTo: 'PICK_ITEM',
-      titleHtml: 'Recording short pick',
-      sub: `Reason: ${reasonCode || '-'}. Canary7 is updating the job. Do not scan.`,
+      title: 'Recording short pick',
+      detail: reasonCode || '',
       call: () => performShortPick(instruction, reasonCode, 0, ''),
     });
   }
@@ -4480,8 +4554,8 @@
     const shipNo     = instruction.reference_number;
     return runPerform({
       instruction,
-      titleHtml: `Picking <b>${_esc(String(displayQty(instruction)))}</b> into an auto container`,
-      sub: 'Canary7 is creating the container and moving the stock. Do not scan.',
+      title: 'Moving items to container',
+      extraMs: 1500,                 // container lookup / generate before the perform
       backTo: 'PICK_ITEM',
       call: async () => {
         // Step 1: existing container for the shipment, else generate one
@@ -4592,9 +4666,7 @@
     let last = { landed: false };
     for (let i = 0; i < attempts; i++) {
       if (i > 0) { if (Date.now() > deadline) break; await _sleep(5000); }
-      Busy.update(null, kind === 'business'
-        ? 'Canary7 replied with an error. Checking whether the move happened anyway...'
-        : `No clear answer from Canary7 yet - it is probably still working. Checking again (${i + 1})... Do not scan.`);
+      if (i === 0) Busy.update('Checking with Canary7', { indeterminate: true });
       try {
         const v = await verifyPerformLanded(instr);
         if (v.landed) return v;
@@ -4607,7 +4679,9 @@
   }
 
   /**
-   * opts: { instruction, titleHtml, sub, call, clusterPos, tote, backTo }
+   * opts: { instruction, title, detail, orders, extraMs, call, clusterPos, tote, backTo }
+   *   orders  - shipments the write fans out to (group size); drives the estimate
+   *   extraMs - fixed extra time before the write (LOCOD container lookup)
    *   call()  - performs the write, resolves C7's response
    *   backTo  - screen to return to when the write is confirmed NOT to have landed
    */
@@ -4620,7 +4694,11 @@
     const settle = () => { if (settled || seq !== _performSeq) return false; settled = true; return true; };
 
     State.screen = 'PERFORMING';
-    Busy.start('perform', opts.titleHtml, opts.sub || 'Canary7 is moving the stock. Do not scan again.', {
+    const extraMs = opts.extraMs || 0;
+    const estMs = Rate.estimate(opts.orders || 1, extraMs);
+    Busy.start('perform', opts.title || 'Moving items to container', {
+      detail: opts.detail || '',
+      estMs,
       // Manual "Check status" while the request is STILL pending. It can
       // complete the pick if Canary7 has clearly moved on; it never
       // unlocks a re-scan while the original request is outstanding.
@@ -4630,12 +4708,9 @@
           if (v.landed) {
             if (!settle()) return;
             await onLanded(v.next, v.next === null, false, 'Canary7 confirmed the move.');
-          } else {
-            Busy.update(null, 'Canary7 has not finished yet. Keep waiting - do not scan again.');
           }
-        } catch (_) {
-          Busy.update(null, 'Could not reach Canary7 to check. Still waiting...');
-        }
+          // Not finished: say nothing new - the bar keeps creeping.
+        } catch (_) { /* still waiting on the original request */ }
       },
     });
     saveInflight({
@@ -4647,6 +4722,7 @@
 
     async function onLanded(nextHint, isJobDone, isClusterDone, note) {
       clearInflight();
+      Busy.complete();
       Audio.chime('container_ok');
       if (navigator.vibrate) navigator.vibrate([30]);
       if (opts.clusterPos && opts.tote) {
@@ -4680,6 +4756,8 @@
     }
 
     if (!settle()) return;
+    // Teach the estimator - only from a direct answer, never a reconcile.
+    if (Busy.active) Rate.learn(opts.orders || 1, Date.now() - Busy.active.startedAt, extraMs);
     const isJobDone     = result?.job_instruction === null;
     const isClusterDone = result?.is_cluster_job === true && isJobDone;
     await onLanded(result?.job_instruction, isJobDone, isClusterDone, null);
@@ -4722,7 +4800,7 @@
       return;
     }
 
-    Busy.update('Loading next pick...', 'Done. Fetching your next location.');
+    Busy.update('Loading next pick');
     if (nextHint?.job_instruction_group_id) prefetchGroupRecord(nextHint.job_instruction_group_id);
 
     let nextInstr = null;
@@ -4759,10 +4837,7 @@
       (!!inf.groupId && inf.groupId === cur.job_instruction_group_id);
     if (!same) { clearInflight(); return false; }   // C7 has already moved on
 
-    Busy.start('perform',
-      inf.tote ? `Checking the last move into <span class="mpk-mono">${_esc(inf.tote)}</span>`
-               : 'Checking the last pick',
-      'This device was interrupted while Canary7 was moving stock. Checking before you scan again.');
+    Busy.start('perform', 'Checking your last pick', { detail: inf.tote || '' });
     for (let i = 0; i < 18; i++) {      // ~90s - see RECONCILE_WINDOW_MS
       if (i > 0) await _sleep(5000);
       try {
@@ -4858,7 +4933,6 @@
 
     const clusterPos = State.instruction?.cluster_position_id;
     const existingContainer = clusterPos ? State.containersByPosition[clusterPos] : null;
-    const isGrouped = !!State.instruction?.job_instruction_group_id;
     const total = State.pickProgress?.total || '?';
     const cur   = State.pickProgress?.current || 1;
     const pct   = State.pickProgress?.total ? Math.round(((cur - 1) / State.pickProgress.total) * 100) : 0;
@@ -4887,7 +4961,6 @@
           <div class="mpk-scan-zone tote" id="mpk-scan-zone">
             <div class="mpk-scan-zone-label">Scan tote now</div>
             ${existingContainer ? `<div class="mpk-scan-hint">Last used: ${_esc(existingContainer)}</div>` : ''}
-            ${isGrouped ? '<div class="mpk-scan-hint" style="font-family:inherit">Scan ONCE - big groups take Canary7 a moment</div>' : ''}
             <div class="mpk-scan-arrows">&gt;&gt;&gt;</div>
             <input id="mpk-scan-in" type="text" inputmode="none"
               autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"/>
@@ -4985,25 +5058,20 @@
       ? toRawQty(instr, State.scanCount)
       : effectiveQty(instr);
     const isGroup = !!instr.job_instruction_group_id;
-    const shown   = State.scanCount || displayQty(instr);
     // How many orders this group fans out to - from the summary list - so the
     // busy screen can say up front how long Canary7 will take.
     const orders  = isGroup
       ? State.allInstructions.filter(i => i.job_instruction_group_id === instr.job_instruction_group_id).length
       : 0;
-    const est     = orders > 10 ? Math.max(10, Math.round(orders * 0.55)) : 0;
 
     await runPerform({
       instruction: instr,
       tote: label,
       clusterPos,
       backTo: 'SCAN_CONTAINER',
-      titleHtml: `Moving <b>${_esc(String(shown))}</b> into<br><span class="mpk-mono">${_esc(label)}</span>`,
-      sub: isGroup
-        ? (est
-            ? `${orders} orders in this group - Canary7 usually takes about ${est}s. Do not scan again.`
-            : 'Canary7 is splitting this group across its shipments. Do not scan again.')
-        : 'Canary7 is moving the stock. Do not scan again.',
+      title: 'Moving items to container',
+      detail: label,
+      orders: isGroup ? Math.max(1, orders) : 1,
       call: () => isGroup
         ? groupPerform(instr, label, pickQty)
         : performPick(instr, label, pickQty),
@@ -5398,7 +5466,7 @@
     // '4.10.0' on a 4.10.1 file, so anyone checking the running build was told
     // the wrong answer. GM_info is absent in the Node test harness, hence the
     // literal fallback.
-    VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '4.14.1',
+    VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '4.14.2',
     reportPickError,
     currentOperatorName,
     ERROR_LOG_URL,
@@ -5407,7 +5475,7 @@
     showOurs, hideOurs, syncTabs, restoreOtherPanels,
     getToken, hasToken: () => !!getToken(),
     // v4.14.0 - offline harness (malpa-pick.test.js)
-    Busy, runPerform, verifyPerformLanded, classifyPerformError, reconcilePerform,
+    Busy, Rate, progressAt, runPerform, verifyPerformLanded, classifyPerformError, reconcilePerform,
     reconcileInflightOnEntry, loadInflight, saveInflight, clearInflight,
     fetchJobInstructions, countPickActions, prefetchGroupRecord, loadGroupRecordIfNeeded,
     get groupCache() { return _groupCache; },
