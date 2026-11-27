@@ -516,9 +516,9 @@ const tick = async (k = 6) => { for (let i = 0; i < k; i++) await flush(); };
   await tick(10);
   const g = (id) => (sandbox.document.getElementById(id) || {}).textContent;
   ok('asked the LAN proxy, not Canary7 or Metabase', gmCalls.some(u => u === 'http://192.168.1.27:8790/pick-queues'));
-  eq('MIBP shows shipments left (thousands separator)', g('mpk-q-meta-48'), '1,908 left to pick');
+  eq('MIBP shows instructions left (thousands separator)', g('mpk-q-meta-48'), '1,908 Instructions to Pick');
   eq('and % picked today', [g('mpk-q-pct-47'), g('mpk-q-pct-48')], ['61%', '51%']);
-  eq('an empty queue says so, with no fake %', [g('mpk-q-meta-53'), g('mpk-q-pct-53')], ['No shipments', '']);
+  eq('an empty queue says so, with no fake %', [g('mpk-q-meta-53'), g('mpk-q-pct-53')], ['Nothing to pick', '']);
   ok('freshness shown', /Updated just now/.test(g('mpk-q-updated')));
   ok('Start disabled until a queue is tapped', /mpk-btn-primary" disabled>/.test(sandbox.document.getElementById('mpk-root')._html));
   const n0 = gmCalls.filter(u => u.includes('pick-queues')).length;
@@ -528,6 +528,39 @@ const tick = async (k = 6) => { for (let i = 0; i < k; i++) await flush(); };
   T.paintQueueStats(null);
   eq('proxy down: says so, nothing breaks', g('mpk-q-updated'), 'Queue counts unavailable');
   delete sandbox.GM_xmlhttpRequest;
+  console.log('\n13. Summary list comes from the proxy, not the slow API');
+  let gmUrls = [];
+  sandbox.GM_xmlhttpRequest = (o) => {
+    gmUrls.push(o.url);
+    if (o.url.includes('/job-instructions?job_id=77'))
+      setImmediate(() => o.onload({ responseText: JSON.stringify({ ok: true, rows: [
+        { id: 1, reference_number: '#1', quantity: 4, job_instruction_group_id: 9 },
+        { id: 2, reference_number: '#2', quantity: 1, job_instruction_group_id: 9 }] }) }));
+    else if (o.url.includes('/job-instructions?job_id=78'))
+      setImmediate(() => o.onerror());
+  };
+  stubFetch({ 'job/job-instruction&job_id=78': [{ id: 5, reference_number: '#5', quantity: 2, job_instruction_group_id: null }] });
+  reset();
+  const fastRows = await T.fetchJobInstructions(77);
+  eq('proxy rows used', fastRows.map(r => r.id), [1, 2]);
+  eq('Canary7 list NOT called when the proxy answers', n('job/job-instruction&job_id'), 0);
+  const slowRows = await T.fetchJobInstructions(78);
+  eq('proxy down -> falls back to the Canary7 list', slowRows.map(r => r.id), [5]);
+  ok('asked the LAN proxy', gmUrls.includes('http://192.168.1.27:8790/job-instructions?job_id=77'));
+  delete sandbox.GM_xmlhttpRequest;
+
+  const names = (arr) => arr.map(p => p.name);
+  const PROF = [{ id: 53, name: 'Wholesale Cluster' }, { id: 48, name: 'MIBP' }, { id: 47, name: 'SIBP' },
+                { id: 40, name: 'Group 1 Clusters' }, { id: 46, name: 'Group 6 Clusters' }];
+  eq('no counts yet: plain A-Z', names(T.orderProfiles(PROF, null)),
+     ['Group 1 Clusters', 'Group 6 Clusters', 'MIBP', 'SIBP', 'Wholesale Cluster']);
+  eq('queues with work A-Z first, then empty / 100% done A-Z',
+     names(T.orderProfiles(PROF, { queues: {
+       40: { remaining: 0, picked_today: 540, pct: 100 },     // done
+       46: { remaining: 0, picked_today: 0, pct: null },      // empty
+       47: { remaining: 693, picked_today: 1257, pct: 64 },
+       48: { remaining: 4837, picked_today: 3791, pct: 44 } } })),   // 53 missing = nothing
+     ['MIBP', 'SIBP', 'Group 1 Clusters', 'Group 6 Clusters', 'Wholesale Cluster']);
 
   console.log('\n11. Short pick goes through the same lock');
   stubFetch({ 'pick-short': { job_instruction: null } });

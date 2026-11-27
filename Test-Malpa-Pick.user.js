@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Pick TEST
 // @namespace    https://malpa.canary7.com/test
-// @version      4.15.0
+// @version      4.16.0
 // @description  TEST BUILD of Malpa Pick (scan guards, faster summary, portal styling). Disable "Malpa Pick" in Tampermonkey on any device running this.
 // @author       Malpa 3PL
 // @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/Test-Malpa-Pick.user.js
@@ -2657,6 +2657,8 @@
       .mpk-q-row:active { background: var(--mpk-hover); }
       .mpk-q-row.selected { background: var(--mpk-brand-subtle); border-left-color: var(--mpk-brand); }
       .mpk-q-row.empty .mpk-q-name { color: var(--mpk-muted); }
+      .mpk-q-row.empty { background: var(--mpk-subtle); }
+      .mpk-q-row.first-idle { border-top: 6px solid var(--mpk-bg); }
       .mpk-q-dot {
         width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
         background: var(--mpk-profile-color, var(--mpk-brand));
@@ -3086,7 +3088,37 @@
   // so a big SIBP/MIBP job under-counted. Page 1 asks for 400 (C7's own cap)
   // and any further pages named by x-pagination-page-count are read in turn.
   const _SUMMARY_FIELDS = 'id,reference_number,quantity,job_instruction_group_id';
+
+  // 4.16.0 - the same four columns straight from the Canary7 database via the
+  // LAN canary7-proxy (Metabase card 1146, job_instruction.job_id index):
+  // ~1s instead of the API's 6-8s. Null on any failure or an empty answer
+  // (e.g. a brand-new job not visible to Metabase yet) -> the caller falls
+  // back to the API list, so the summary is never worse than before.
+  const JOB_INSTR_URL = 'http://192.168.1.27:8790/job-instructions?job_id=';
+  function fetchJobInstructionsFast(jobId) {
+    return new Promise((resolve) => {
+      try {
+        if (typeof GM_xmlhttpRequest !== 'function' || !/^\d+$/.test(String(jobId))) { resolve(null); return; }
+        GM_xmlhttpRequest({
+          method: 'GET',
+          url: JOB_INSTR_URL + encodeURIComponent(String(jobId)),
+          timeout: 5000,
+          onload: (r) => {
+            try {
+              const j = JSON.parse(r.responseText);
+              resolve(j && j.ok && Array.isArray(j.rows) && j.rows.length ? j.rows : null);
+            } catch (_) { resolve(null); }
+          },
+          onerror: () => resolve(null),
+          ontimeout: () => resolve(null),
+        });
+      } catch (_) { resolve(null); }
+    });
+  }
+
   async function fetchJobInstructions(jobId) {
+    const fast = await fetchJobInstructionsFast(jobId);
+    if (fast) return fast;
     const base = `job/job-instruction&job_id=${jobId}&per-page=400` +
                  `&fields=${encodeURIComponent(_SUMMARY_FIELDS)}`;
     const asArr = (d) => Array.isArray(d) ? d : (d && Array.isArray(d.items) ? d.items : []);
@@ -3154,9 +3186,10 @@
   //   GET http://192.168.1.27:8790/pick-queues
   //   -> { ok, as_of, age_s, stale, queues: { "<profile_id>":
   //        { remaining, picked_today, pct } } }
-  // remaining    = shipments in Pick Pending with an open instruction in the
-  //                profile's job types
-  // picked_today = shipments in those job types fully picked today (Brisbane)
+  // Counted in JOB INSTRUCTIONS (4.15.1):
+  // remaining    = open (status 1/2) instructions in the profile's job types,
+  //                on shipments still in Pick Pending
+  // picked_today = instructions in those job types completed today (Brisbane)
   // pct          = picked_today / (picked_today + remaining); null when both 0
   //
   // Purely informational: if the proxy is down the list simply shows no
@@ -3193,6 +3226,27 @@
     return _queues.inflight;
   }
 
+  /**
+   * Queue order (4.15.1): queues with work left first, then queues with
+   * nothing left (empty or 100% done) - each group A-Z by name. Before the
+   * counts arrive everything counts as "has work", so the list starts A-Z.
+   */
+  function orderProfiles(profiles, stats) {
+    const q = stats && stats.queues;
+    const hasWork = (p) => {
+      if (!q) return true;
+      const s = q[String(p.id)];
+      return !!(s && s.remaining > 0);
+    };
+    return profiles.slice().sort((a, b) => {
+      const wa = hasWork(a), wb = hasWork(b);
+      if (wa !== wb) return wa ? -1 : 1;
+      return String(a.name || '').localeCompare(String(b.name || ''), undefined, { sensitivity: 'base', numeric: true });
+    });
+  }
+
+  function _plural(n, word) { return n === 1 ? word : word + 's'; }
+
   function _fmtInt(n) {
     return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
   }
@@ -3209,20 +3263,32 @@
       const fill = document.getElementById('mpk-q-fill-' + p.id);
       const pct  = document.getElementById('mpk-q-pct-' + p.id);
       if (!s) {
-        if (meta) meta.textContent = q ? 'No shipments' : '';
+        if (meta) meta.textContent = q ? 'Nothing to pick' : '';
         if (pct) pct.textContent = '';
         if (fill) fill.style.width = '0%';
         row.classList.toggle('empty', !!q);
         continue;
       }
-      row.classList.toggle('empty', s.remaining === 0);
+      row.classList.toggle('empty', !(s.remaining > 0));
       if (meta) {
         meta.textContent = s.remaining === 0
-          ? (s.picked_today ? `All picked - ${_fmtInt(s.picked_today)} today` : 'No shipments')
-          : `${_fmtInt(s.remaining)} left to pick`;
+          ? (s.picked_today ? `All picked - ${_fmtInt(s.picked_today)} ${_plural(s.picked_today, 'instruction')} today` : 'Nothing to pick')
+          : `${_fmtInt(s.remaining)} ${s.remaining === 1 ? 'Instruction' : 'Instructions'} to Pick`;
       }
       if (pct)  pct.textContent = s.pct == null ? '' : s.pct + '%';
       if (fill) fill.style.width = (s.pct == null ? 0 : s.pct) + '%';
+    }
+    const list = document.getElementById('mpk-q-list');
+    if (list && q) {
+      let firstIdle = true;
+      for (const p of orderProfiles(State.profiles, stats)) {
+        const row = document.getElementById('mpk-q-' + p.id);
+        if (!row) continue;
+        list.appendChild(row);                       // moves the node
+        const idle = row.classList.contains('empty');
+        row.classList.toggle('first-idle', idle && firstIdle);
+        if (idle) firstIdle = false;
+      }
     }
     const upd = document.getElementById('mpk-q-updated');
     if (upd) {
@@ -3249,7 +3315,7 @@
     setTimeout(measureHeight, 30);
 
     const selId = State.profile ? String(State.profile.id) : '';
-    const rows = State.profiles.map(p => `
+    const rows = orderProfiles(State.profiles, _queues.data).map(p => `
       <button type="button" class="mpk-q-row${String(p.id) === selId ? ' selected' : ''}"
               id="mpk-q-${p.id}" data-pid="${p.id}" style="--mpk-profile-color:${profileColour(p)}">
         <span class="mpk-q-dot"></span>
@@ -5644,7 +5710,7 @@
     // '4.10.0' on a 4.10.1 file, so anyone checking the running build was told
     // the wrong answer. GM_info is absent in the Node test harness, hence the
     // literal fallback.
-    VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '4.15.0',
+    VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '4.16.0',
     reportPickError,
     currentOperatorName,
     ERROR_LOG_URL,
@@ -5653,7 +5719,7 @@
     showOurs, hideOurs, syncTabs, restoreOtherPanels,
     getToken, hasToken: () => !!getToken(),
     // v4.14.0 - offline harness (malpa-pick.test.js)
-    Busy, Rate, progressAt, runPerform, loadQueueStats, paintQueueStats, renderProfileSelect, verifyPerformLanded, classifyPerformError, reconcilePerform,
+    Busy, Rate, progressAt, runPerform, loadQueueStats, paintQueueStats, renderProfileSelect, orderProfiles, fetchJobInstructionsFast, verifyPerformLanded, classifyPerformError, reconcilePerform,
     reconcileInflightOnEntry, loadInflight, saveInflight, clearInflight,
     fetchJobInstructions, countPickActions, prefetchGroupRecord, loadGroupRecordIfNeeded,
     get groupCache() { return _groupCache; },
