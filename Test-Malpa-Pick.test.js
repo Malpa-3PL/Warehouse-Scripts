@@ -498,6 +498,37 @@ const tick = async (k = 6) => { for (let i = 0; i < k; i++) await flush(); };
   await tick(20);
   eq('list lands: the whole group is 1 pick', txt('mpk-sum-instructions'), '1');
 
+  console.log('\n12. Queue progress on the profile screen');
+  let gmCalls = [];
+  let gmReply = { ok: true, as_of: 1, age_s: 20, stale: false, queues: {
+    47: { remaining: 755, picked_today: 1195, pct: 61 },
+    48: { remaining: 1908, picked_today: 2009, pct: 51 },
+    53: { remaining: 0, picked_today: 0, pct: null } } };
+  sandbox.GM_xmlhttpRequest = (o) => {
+    gmCalls.push(o.url);
+    if (!o.url.includes('/pick-queues')) return;           // error log posts: ignore
+    setImmediate(() => gmReply === 'down' ? o.onerror && o.onerror() : o.onload({ responseText: JSON.stringify(gmReply) }));
+  };
+  T.State.reset();
+  T.State.profile = null;
+  T.State.profiles = [{ id: 47, name: 'SIBP' }, { id: 48, name: 'MIBP' }, { id: 53, name: 'Wholesale Cluster' }];
+  T.renderProfileSelect();
+  await tick(10);
+  const g = (id) => (sandbox.document.getElementById(id) || {}).textContent;
+  ok('asked the LAN proxy, not Canary7 or Metabase', gmCalls.some(u => u === 'http://192.168.1.27:8790/pick-queues'));
+  eq('MIBP shows shipments left (thousands separator)', g('mpk-q-meta-48'), '1,908 left to pick');
+  eq('and % picked today', [g('mpk-q-pct-47'), g('mpk-q-pct-48')], ['61%', '51%']);
+  eq('an empty queue says so, with no fake %', [g('mpk-q-meta-53'), g('mpk-q-pct-53')], ['No shipments', '']);
+  ok('freshness shown', /Updated just now/.test(g('mpk-q-updated')));
+  ok('Start disabled until a queue is tapped', /mpk-btn-primary" disabled>/.test(sandbox.document.getElementById('mpk-root')._html));
+  const n0 = gmCalls.filter(u => u.includes('pick-queues')).length;
+  T.renderProfileSelect(); await tick(10);
+  eq('re-render within 30s reuses the numbers (no new request)', gmCalls.filter(u => u.includes('pick-queues')).length, n0);
+  gmReply = 'down';
+  T.paintQueueStats(null);
+  eq('proxy down: says so, nothing breaks', g('mpk-q-updated'), 'Queue counts unavailable');
+  delete sandbox.GM_xmlhttpRequest;
+
   console.log('\n11. Short pick goes through the same lock');
   stubFetch({ 'pick-short': { job_instruction: null } });
   setupGroupPick();

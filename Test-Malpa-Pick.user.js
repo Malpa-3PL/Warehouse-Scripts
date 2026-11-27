@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Pick TEST
 // @namespace    https://malpa.canary7.com/test
-// @version      4.14.2
+// @version      4.15.0
 // @description  TEST BUILD of Malpa Pick (scan guards, faster summary, portal styling). Disable "Malpa Pick" in Tampermonkey on any device running this.
 // @author       Malpa 3PL
 // @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/Test-Malpa-Pick.user.js
@@ -2622,6 +2622,72 @@
       .mpk-block-overlay .mpk-bo-text { font-size: 14px; color: rgb(255 255 255 / 0.78); line-height: 1.5; }
       .mpk-block-overlay .mpk-btn-secondary { background: transparent; color: #fff; border-color: rgb(255 255 255 / 0.3); }
 
+      /* -- Queue list on the profile screen (4.15.0) -- */
+      .mpk-q-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+      .mpk-q-updated { font-size: 12px; color: var(--mpk-muted); }
+      .mpk-q-list {
+        display: flex;
+        flex-direction: column;
+        background: var(--mpk-surface);
+        border: 1px solid var(--mpk-border);
+        border-radius: var(--mpk-r);
+        box-shadow: var(--mpk-shadow);
+        overflow: hidden;
+        flex-shrink: 0;
+      }
+      .mpk-q-row {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        width: 100%;
+        min-height: 60px;
+        padding: 10px 14px;
+        background: var(--mpk-surface);
+        border: none;
+        border-bottom: 1px solid var(--mpk-border);
+        border-left: 4px solid transparent;
+        text-align: left;
+        font-family: var(--mpk-font);
+        color: var(--mpk-text);
+        cursor: pointer;
+        -webkit-tap-highlight-color: transparent;
+        touch-action: manipulation;
+      }
+      .mpk-q-row:last-child { border-bottom: none; }
+      .mpk-q-row:active { background: var(--mpk-hover); }
+      .mpk-q-row.selected { background: var(--mpk-brand-subtle); border-left-color: var(--mpk-brand); }
+      .mpk-q-row.empty .mpk-q-name { color: var(--mpk-muted); }
+      .mpk-q-dot {
+        width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
+        background: var(--mpk-profile-color, var(--mpk-brand));
+      }
+      .mpk-q-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+      .mpk-q-name { font-size: 15px; font-weight: 600; line-height: 1.25; }
+      .mpk-q-meta { font-size: 13px; color: var(--mpk-muted); min-height: 16px; font-variant-numeric: tabular-nums; }
+      .mpk-q-track {
+        display: block;
+        height: 4px;
+        border-radius: 999px;
+        background: var(--mpk-sunken);
+        overflow: hidden;
+      }
+      .mpk-q-fill {
+        display: block;
+        height: 100%;
+        width: 0;
+        background: var(--mpk-ok-fg);
+        border-radius: 999px;
+        transition: width .4s var(--mpk-ease);
+      }
+      .mpk-q-pct {
+        min-width: 44px;
+        text-align: right;
+        font-size: 16px;
+        font-weight: 700;
+        font-variant-numeric: tabular-nums;
+        color: var(--mpk-text);
+      }
+
       /* == BUSY LOCK (v4.14.0, card + progress bar 4.14.2) ================
          Covers the whole panel - scan zone, Back, Short Pick - while
          Canary7 is moving stock. Same shape as the portal's modal: navy
@@ -3079,7 +3145,102 @@
     return instr;
   }
 
+  // ---------------------------------------------------------------------------
+  // QUEUE PROGRESS (4.15.0) - "how many shipments are left in each queue".
+  //
+  // Canary7's API cannot answer this quickly (jobs have no status; one job's
+  // instruction list takes 6-8s). The canary7-proxy on the LAN serves it from
+  // Metabase card 1145, cached ~60s and shared by every device:
+  //   GET http://192.168.1.27:8790/pick-queues
+  //   -> { ok, as_of, age_s, stale, queues: { "<profile_id>":
+  //        { remaining, picked_today, pct } } }
+  // remaining    = shipments in Pick Pending with an open instruction in the
+  //                profile's job types
+  // picked_today = shipments in those job types fully picked today (Brisbane)
+  // pct          = picked_today / (picked_today + remaining); null when both 0
+  //
+  // Purely informational: if the proxy is down the list simply shows no
+  // numbers. Nothing on this screen waits for it.
+  // ---------------------------------------------------------------------------
+  const QUEUES_URL = 'http://192.168.1.27:8790/pick-queues';
+  const QUEUES_CLIENT_TTL = 30000;
+  const _queues = { at: 0, data: null, inflight: null };
+
+  function loadQueueStats(force) {
+    if (!force && _queues.data && Date.now() - _queues.at < QUEUES_CLIENT_TTL) {
+      return Promise.resolve(_queues.data);
+    }
+    if (_queues.inflight) return _queues.inflight;
+    _queues.inflight = new Promise((resolve) => {
+      try {
+        if (typeof GM_xmlhttpRequest !== 'function') { resolve(null); return; }
+        GM_xmlhttpRequest({
+          method: 'GET',
+          url: QUEUES_URL,
+          timeout: 8000,
+          onload: (r) => {
+            try {
+              const j = JSON.parse(r.responseText);
+              if (j && j.ok && j.queues) { _queues.data = j; _queues.at = Date.now(); resolve(j); }
+              else resolve(_queues.data);
+            } catch (_) { resolve(_queues.data); }
+          },
+          onerror:   () => resolve(_queues.data),
+          ontimeout: () => resolve(_queues.data),
+        });
+      } catch (_) { resolve(_queues.data); }
+    }).finally(() => { _queues.inflight = null; });
+    return _queues.inflight;
+  }
+
+  function _fmtInt(n) {
+    return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  }
+
+  /** Paint the numbers into rows already on screen (no re-render, keeps selection). */
+  function paintQueueStats(stats) {
+    if (State.screen !== 'PROFILE_SELECT') return;
+    const q = stats && stats.queues;
+    for (const p of State.profiles) {
+      const row = document.getElementById('mpk-q-' + p.id);
+      if (!row) continue;
+      const s = q && q[String(p.id)];
+      const meta = document.getElementById('mpk-q-meta-' + p.id);
+      const fill = document.getElementById('mpk-q-fill-' + p.id);
+      const pct  = document.getElementById('mpk-q-pct-' + p.id);
+      if (!s) {
+        if (meta) meta.textContent = q ? 'No shipments' : '';
+        if (pct) pct.textContent = '';
+        if (fill) fill.style.width = '0%';
+        row.classList.toggle('empty', !!q);
+        continue;
+      }
+      row.classList.toggle('empty', s.remaining === 0);
+      if (meta) {
+        meta.textContent = s.remaining === 0
+          ? (s.picked_today ? `All picked - ${_fmtInt(s.picked_today)} today` : 'No shipments')
+          : `${_fmtInt(s.remaining)} left to pick`;
+      }
+      if (pct)  pct.textContent = s.pct == null ? '' : s.pct + '%';
+      if (fill) fill.style.width = (s.pct == null ? 0 : s.pct) + '%';
+    }
+    const upd = document.getElementById('mpk-q-updated');
+    if (upd) {
+      upd.textContent = !q ? 'Queue counts unavailable'
+        : (stats.stale ? 'Counts may be out of date' : 'Updated ' + _ageText(stats.age_s));
+    }
+  }
+
+  function _ageText(s) {
+    s = Number(s) || 0;
+    if (s < 60) return 'just now';
+    return Math.round(s / 60) + ' min ago';
+  }
+
   // -- Screen A: Profile select ------------------------------------------------
+  // 4.15.0: a tappable list (name, shipments left, % picked today) instead of
+  // a <select>, which cannot show numbers or bars. The chosen id lives in a
+  // hidden input so onStartPicking reads R.profileSel.value exactly as before.
 
   function renderProfileSelect(errorMsg) {
     const root = document.getElementById('mpk-root');
@@ -3087,48 +3248,65 @@
     R.root = root;
     setTimeout(measureHeight, 30);
 
-    const profileOptions = State.profiles.length
-      ? '<option value="" disabled selected>-- Select profile --</option>' +
-        State.profiles.map(p =>
-          `<option value="${p.id}">${_esc(p.name)}</option>`
-        ).join('')
-      : '<option value="" disabled>No profiles available</option>';
+    const selId = State.profile ? String(State.profile.id) : '';
+    const rows = State.profiles.map(p => `
+      <button type="button" class="mpk-q-row${String(p.id) === selId ? ' selected' : ''}"
+              id="mpk-q-${p.id}" data-pid="${p.id}" style="--mpk-profile-color:${profileColour(p)}">
+        <span class="mpk-q-dot"></span>
+        <span class="mpk-q-main">
+          <span class="mpk-q-name">${_esc(p.name)}</span>
+          <span class="mpk-q-meta" id="mpk-q-meta-${p.id}"></span>
+          <span class="mpk-q-track"><span class="mpk-q-fill" id="mpk-q-fill-${p.id}"></span></span>
+        </span>
+        <span class="mpk-q-pct" id="mpk-q-pct-${p.id}"></span>
+      </button>`).join('');
 
     root.innerHTML = `
       <div class="mpk-screen">
         <div class="mpk-screen-header">Malpa Pick <span class="mpk-badge warn">TEST</span></div>
         <div class="mpk-screen-body">
           ${errorMsg ? `<div class="mpk-error-banner">${_esc(errorMsg)}</div>` : ''}
-          <label class="mpk-field-label" for="mpk-profile-sel">Picking profile</label>
-          <select id="mpk-profile-sel" class="mpk-select">
-            ${profileOptions}
-          </select>
-          ${State.profiles.length === 0
-            ? '<div class="mpk-empty-queue"><div class="mpk-empty-queue-title">No profiles loaded</div><div class="mpk-empty-queue-sub">Check your connection and try again</div></div>'
-            : ''}
+          ${State.profiles.length
+            ? `<div class="mpk-q-head"><span class="mpk-field-label">Choose a queue</span>
+                 <span class="mpk-q-updated" id="mpk-q-updated"></span></div>
+               <div class="mpk-q-list" id="mpk-q-list">${rows}</div>`
+            : '<div class="mpk-empty-queue"><div class="mpk-empty-queue-title">No profiles loaded</div><div class="mpk-empty-queue-sub">Check your connection and try again</div></div>'}
+          <input type="hidden" id="mpk-profile-sel" value="${_esc(selId)}"/>
         </div>
       </div>
-      <div class="mpk-spacer"></div>
       <div class="mpk-btn-stack">
-        <button id="mpk-start-btn" class="mpk-btn mpk-btn-primary" ${State.profiles.length === 0 ? 'disabled' : ''}>
-          Start Picking
+        <button id="mpk-start-btn" class="mpk-btn mpk-btn-primary" ${selId ? '' : 'disabled'}>
+          Start picking
         </button>
       </div>`;
 
     R.profileSel = document.getElementById('mpk-profile-sel');
     R.startBtn   = document.getElementById('mpk-start-btn');
+    R.startBtn?.addEventListener('click', onStartPicking);
 
-    if (R.startBtn) {
-      R.startBtn.addEventListener('click', onStartPicking);
-    }
-
-    // Pre-select previously chosen profile
-    if (R.profileSel && State.profile) {
-      R.profileSel.value = String(State.profile.id);
-    }
+    document.getElementById('mpk-q-list')?.addEventListener('click', (e) => {
+      const row = e.target && e.target.closest ? e.target.closest('.mpk-q-row') : null;
+      if (!row || _jobLoadInFlight) return;
+      document.querySelectorAll('.mpk-q-row.selected').forEach(r => r.classList.remove('selected'));
+      row.classList.add('selected');
+      if (R.profileSel) R.profileSel.value = row.dataset.pid;
+      if (R.startBtn) R.startBtn.disabled = false;
+    });
 
     State.screen = 'PROFILE_SELECT';
+
+    // Paint whatever we have now, then refresh in the background.
+    if (_queues.data) paintQueueStats(_queues.data);
+    loadQueueStats().then(paintQueueStats);
   }
+
+  // Keep the numbers moving while the picker is choosing (proxy caches, so
+  // this is cheap for Canary7: one shared query a minute at most).
+  setInterval(() => {
+    if (State.screen === 'PROFILE_SELECT' && document.getElementById('mpk-q-list')) {
+      loadQueueStats(true).then(paintQueueStats);
+    }
+  }, 60000);
 
   // v4.14.0 - get-job-instructions ASSIGNS a job. A double-tap on Start used
   // to fire it twice; one flag now covers Start and Load Job.
@@ -5466,7 +5644,7 @@
     // '4.10.0' on a 4.10.1 file, so anyone checking the running build was told
     // the wrong answer. GM_info is absent in the Node test harness, hence the
     // literal fallback.
-    VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '4.14.2',
+    VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '4.15.0',
     reportPickError,
     currentOperatorName,
     ERROR_LOG_URL,
@@ -5475,7 +5653,7 @@
     showOurs, hideOurs, syncTabs, restoreOtherPanels,
     getToken, hasToken: () => !!getToken(),
     // v4.14.0 - offline harness (malpa-pick.test.js)
-    Busy, Rate, progressAt, runPerform, verifyPerformLanded, classifyPerformError, reconcilePerform,
+    Busy, Rate, progressAt, runPerform, loadQueueStats, paintQueueStats, renderProfileSelect, verifyPerformLanded, classifyPerformError, reconcilePerform,
     reconcileInflightOnEntry, loadInflight, saveInflight, clearInflight,
     fetchJobInstructions, countPickActions, prefetchGroupRecord, loadGroupRecordIfNeeded,
     get groupCache() { return _groupCache; },
