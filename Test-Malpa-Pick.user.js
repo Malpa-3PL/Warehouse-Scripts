@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Pick TEST
 // @namespace    https://malpa.canary7.com/test
-// @version      4.14.0
+// @version      4.14.1
 // @description  TEST BUILD of Malpa Pick (scan guards, faster summary, portal styling). Disable "Malpa Pick" in Tampermonkey on any device running this.
 // @author       Malpa 3PL
 // @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/Test-Malpa-Pick.user.js
@@ -3268,6 +3268,16 @@
     //   2. the first pick's group record (Accept used to block on this)
     const listP = State.jobId ? fetchJobInstructions(State.jobId) : Promise.resolve([]);
     if (groupId) prefetchGroupRecord(groupId);
+    // 4.14.1 - the list above is slow ON CANARY7'S SIDE, whatever we ask for.
+    // Timed 2026-11-27 (job 2077877, read-only): a trivial call ~1.4s round
+    // trip; job-instruction&job_id= ~6.6-7.8s even for ONE row of ONE column,
+    // with or without sort - it is the job_id filter + pagination COUNT over a
+    // 3.3M-row table. get-job-summary (what C7's own pick menu calls) answers
+    // in ~1.4s, so it paints the counts first and the list corrects them.
+    const summaryP = (State.profile && State.jobId)
+      ? fetchJobSummary(State.profile.id).catch(() => null)
+      : Promise.resolve(null);
+    let listLanded = false;
 
     // Render immediately - counts show spinners until the background fetch lands
     root.innerHTML = `
@@ -3345,11 +3355,40 @@
       }).catch(() => { if (stillHere()) upd('mpk-sum-first', '-'); });
     }
 
+    // Fast numbers from get-job-summary. Shipments and Units read straight
+    // across. Picks only when the job is NOT grouped - for SIBP/MIBP C7's
+    // instruction count is one per shipment, not one per group, so that tile
+    // waits for the list rather than show a number that then shrinks.
+    let summaryShown = null;
+    summaryP.then(sum => {
+      if (listLanded || !stillHere() || !sum) return;
+      const ti = Number(sum.total_instructions) || 0;
+      if (ti <= 0) return;                           // nothing for this picker - wait for the list
+      summaryShown = sum;
+      State.summary = sum;
+      upd('mpk-sum-shipments', Number(sum.total_shipments) || 0);
+      upd('mpk-sum-qty',       Number(sum.total_quantity) || 0);
+      if (!groupId) upd('mpk-sum-instructions', ti);
+    });
+
     listP.then(all => {
+      listLanded = true;
       if (State.jobId !== jobIdAtRender) return;   // a different job now
       if (all.length) {
         State.allInstructions = all;
         const pickTotal = countPickActions(all);
+        // If get-job-summary painted first, check it agreed with the list. It
+        // could not be confirmed job-scoped offline (the service account has no
+        // assigned job), so a mismatch is logged to the error table, not hidden.
+        if (summaryShown) {
+          const ships = new Set(all.map(i => i.reference_number).filter(Boolean)).size;
+          if (Number(summaryShown.total_shipments) !== ships ||
+              Number(summaryShown.total_instructions) !== all.length) {
+            try {
+              reportPickError(new Error(`get-job-summary disagreed with job list: summary ${summaryShown.total_shipments} ships / ${summaryShown.total_instructions} instr, list ${ships} / ${all.length}`));
+            } catch (_) {}
+          }
+        }
         // Set or update pickProgress -- may already exist if Accept fired first
         if (!State.pickProgress || State.pickProgress.total === '?') {
           State.pickProgress = { current: State.pickProgress?.current || 1, total: pickTotal };
@@ -3369,10 +3408,14 @@
           if (fill) fill.style.width = Math.round(((State.pickProgress.current - 1) / pickTotal) * 100) + '%';
         }
       } else if (stillHere()) {
-        ['mpk-sum-shipments', 'mpk-sum-instructions', 'mpk-sum-qty'].forEach(id => upd(id, '-'));
+        // List failed or empty: keep whatever get-job-summary painted.
+        const ids = summaryShown ? (groupId ? ['mpk-sum-instructions'] : [])
+                                 : ['mpk-sum-shipments', 'mpk-sum-instructions', 'mpk-sum-qty'];
+        ids.forEach(id => upd(id, '-'));
       }
     }).catch(() => {
-      if (stillHere()) ['mpk-sum-shipments', 'mpk-sum-instructions', 'mpk-sum-qty'].forEach(id => upd(id, '-'));
+      listLanded = true;
+      if (stillHere() && !summaryShown) ['mpk-sum-shipments', 'mpk-sum-instructions', 'mpk-sum-qty'].forEach(id => upd(id, '-'));
     });
   }
 
@@ -5355,7 +5398,7 @@
     // '4.10.0' on a 4.10.1 file, so anyone checking the running build was told
     // the wrong answer. GM_info is absent in the Node test harness, hence the
     // literal fallback.
-    VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '4.14.0',
+    VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '4.14.1',
     reportPickError,
     currentOperatorName,
     ERROR_LOG_URL,
