@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Pick TEST
 // @namespace    https://malpa.canary7.com/test
-// @version      4.17.0
+// @version      4.17.1
 // @description  TEST BUILD of Malpa Pick (scan guards, faster summary, portal styling). Disable "Malpa Pick" in Tampermonkey on any device running this.
 // @author       Malpa 3PL
 // @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/Test-Malpa-Pick.user.js
@@ -2762,6 +2762,24 @@
       }
       .mpk-cart-cell.has:active { background: var(--mpk-hover); }
       .mpk-cart-cell.current { border: 2px solid var(--mpk-brand); background: var(--mpk-brand-subtle); }
+      /* Tote colour fills (4.17.1) */
+      .mpk-cart-cell.coloured { background: var(--cart-bg); color: var(--cart-fg); border-color: rgb(20 21 63 / 0.18); }
+      .mpk-cart-cell.coloured .mpk-cart-pos,
+      .mpk-cart-cell.coloured .mpk-cart-count { color: var(--cart-fg); }
+      .mpk-cart-cell.coloured .mpk-cart-count { opacity: .85; }
+      .mpk-cart-cell.tote-white { border-color: var(--mpk-border-strong); }
+      .mpk-cart-cell.coloured:active { filter: brightness(.92); }
+      /* "This pick" on a coloured cell: a navy ring + offset, readable on every fill */
+      .mpk-cart-cell.coloured.current {
+        background: var(--cart-bg);
+        border: 2px solid #ffffff;
+        box-shadow: 0 0 0 3px var(--mpk-navy);
+      }
+      .mpk-cart-chip {
+        width: 16px; height: 16px; border-radius: 4px; flex-shrink: 0;
+        background: var(--cart-bg);
+        box-shadow: inset 0 0 0 1px rgb(20 21 63 / 0.25);
+      }
       .mpk-cart-pos { font-size: 18px; font-weight: 700; line-height: 1.1; }
       .mpk-cart-cell:not(.has) .mpk-cart-pos { color: var(--mpk-muted); }
       .mpk-cart-tote { font-size: 12px; font-weight: 500; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -4265,6 +4283,43 @@
   // had not been open.
   // ---------------------------------------------------------------------------
 
+  /**
+   * Tote colour (4.17.1). The colour comes from Canary7's own container types,
+   * which the script already loads: "Tote Blue" (prefix B), "Tote Green" (G),
+   * "Tote Orange" (O), "Tote Purple" (P), "Tote Red" (R), "Tote White" (W) -
+   * confirmed 27 Nov 2026. LONGEST matching prefix wins, so a "B150-" carton
+   * is never mistaken for a blue tote, and a colour added in Canary7 later is
+   * picked up without a script change. Text colour is chosen per fill for
+   * contrast (white on dark fills, navy on light ones).
+   */
+  const _TOTE_PALETTE = {
+    blue:   { bg: '#2f6fdb', fg: '#ffffff' },
+    green:  { bg: '#2e8f55', fg: '#ffffff' },
+    orange: { bg: '#f59a3b', fg: '#14153f' },
+    purple: { bg: '#7b4fc9', fg: '#ffffff' },
+    red:    { bg: '#d63b3b', fg: '#ffffff' },
+    white:  { bg: '#ffffff', fg: '#14153f' },
+    yellow: { bg: '#f5cf3b', fg: '#14153f' },
+    pink:   { bg: '#e86aa8', fg: '#14153f' },
+    black:  { bg: '#24262b', fg: '#ffffff' },
+    grey:   { bg: '#8a8f99', fg: '#ffffff' },
+  };
+  function toteColour(tote) {
+    if (!tote) return null;
+    const up = String(tote).toUpperCase();
+    let best = null;
+    for (const ct of State.containerTypes || []) {
+      const pre = String(ct.container_number_prefix || '').toUpperCase();
+      if (!pre || !up.startsWith(pre)) continue;
+      const m = /\b(blue|green|orange|purple|red|white|yellow|pink|black|gr[ae]y)\b/i
+        .exec(String(ct.name || '') + ' ' + String(ct.description || ''));
+      // A longer prefix always wins, even if it names no colour (a carton).
+      if (!best || pre.length > best.pre.length) best = { pre, colour: m ? m[1].toLowerCase().replace('gray', 'grey') : null };
+      else if (pre.length === best.pre.length && !best.colour && m) best.colour = m[1].toLowerCase().replace('gray', 'grey');
+    }
+    return best && best.colour ? Object.assign({ name: best.colour }, _TOTE_PALETTE[best.colour]) : null;
+  }
+
   function recordToteContents(tote, instr, pos, qty) {
     if (!tote || !instr) return;
     const key = String(tote).toUpperCase();
@@ -4319,13 +4374,17 @@
     closeCart();
     const { mode, slots } = cartSlots();
     const totals = slots.filter(s => s.tote).length;
-    const cells = slots.map((s, i) => `
-      <button type="button" class="mpk-cart-cell${s.tote ? ' has' : ''}${s.current ? ' current' : ''}"
-              id="mpk-cart-pos-${_esc(s.label)}" data-i="${i}" ${s.tote ? '' : 'disabled'}>
+    const cells = slots.map((s, i) => {
+      const c = toteColour(s.tote);
+      const style = c ? ` style="--cart-bg:${c.bg};--cart-fg:${c.fg}"` : '';
+      return `
+      <button type="button" class="mpk-cart-cell${s.tote ? ' has' : ''}${c ? ' coloured tote-' + c.name : ''}${s.current ? ' current' : ''}"
+              id="mpk-cart-pos-${_esc(s.label)}" data-i="${i}" ${s.tote ? '' : 'disabled'}${style}>
         <span class="mpk-cart-pos">${_esc(s.label)}</span>
         <span class="mpk-cart-tote mpk-mono">${s.tote ? _esc(s.tote) : '-'}</span>
         <span class="mpk-cart-count">${s.items.length ? s.items.length + (s.items.length === 1 ? ' pick' : ' picks') : ''}</span>
-      </button>`).join('');
+      </button>`;
+    }).join('');
 
     const el = document.createElement('div');
     el.id = 'mpk-cart';
@@ -4376,6 +4435,7 @@
     d.innerHTML = `
       <div class="mpk-cart-detail-head">
         <button type="button" class="mpk-cart-x" id="mpk-cart-back" aria-label="Back to grid">&lt;</button>
+        ${(() => { const c = toteColour(slot.tote); return c ? `<span class="mpk-cart-chip" style="--cart-bg:${c.bg}"></span>` : ''; })()}
         <span class="mpk-cart-title mpk-mono">${_esc(slot.tote)}</span>
         <span class="mpk-cart-sub">Position ${_esc(slot.label)}</span>
       </div>
@@ -5966,7 +6026,7 @@
     // '4.10.0' on a 4.10.1 file, so anyone checking the running build was told
     // the wrong answer. GM_info is absent in the Node test harness, hence the
     // literal fallback.
-    VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '4.17.0',
+    VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '4.17.1',
     reportPickError,
     currentOperatorName,
     ERROR_LOG_URL,
@@ -5975,7 +6035,7 @@
     showOurs, hideOurs, syncTabs, restoreOtherPanels,
     getToken, hasToken: () => !!getToken(),
     // v4.14.0 - offline harness (malpa-pick.test.js)
-    Busy, Rate, progressAt, runPerform, loadQueueStats, paintQueueStats, renderProfileSelect, orderProfiles, fetchJobInstructionsFast, showCartPositions, closeCart, recordToteContents, cartSlots, verifyPerformLanded, classifyPerformError, reconcilePerform,
+    Busy, Rate, progressAt, runPerform, loadQueueStats, paintQueueStats, renderProfileSelect, orderProfiles, fetchJobInstructionsFast, showCartPositions, closeCart, recordToteContents, cartSlots, toteColour, verifyPerformLanded, classifyPerformError, reconcilePerform,
     reconcileInflightOnEntry, loadInflight, saveInflight, clearInflight,
     fetchJobInstructions, countPickActions, prefetchGroupRecord, loadGroupRecordIfNeeded,
     get groupCache() { return _groupCache; },

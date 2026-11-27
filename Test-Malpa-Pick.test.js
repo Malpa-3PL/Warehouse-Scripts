@@ -594,6 +594,27 @@ const tick = async (k = 6) => { for (let i = 0; i < k; i++) await flush(); };
   eq('...and still counts as the item scan', T.State.screen === 'SCAN_CONTAINER' || T.State.screen === 'QTY_MODAL', true);
   T.State.containersByPosition = {};
   T.State.instruction = Object.assign({}, I2, { cluster_position_id: null });
+  T.State.containerTypes = [
+    { name: 'Tote Blue', description: 'Blue Totes', container_number_prefix: 'B' },
+    { name: 'EBPak B150 Diecut', description: '{E-669.4.1}', container_number_prefix: 'B150-' },
+    { name: 'Tote', description: 'Picking Tote', container_number_prefix: 'R' },
+    { name: 'Tote Red', description: 'Red Totes', container_number_prefix: 'R' },
+    { name: 'Tote White', description: 'White Totes', container_number_prefix: 'W' },
+    { name: 'Lou Lou Carton', description: 'LLCs', container_number_prefix: 'L' },
+  ];
+  eq('B tote is blue (from Canary7\'s "Tote Blue" type)', (T.toteColour('B197') || {}).name, 'blue');
+  eq('longest prefix wins: a B150- carton is not blue', T.toteColour('B150-0001'), null);
+  eq('generic "Tote" and "Tote Red" share R -> red', (T.toteColour('R057') || {}).name, 'red');
+  eq('white tote gets dark text', (T.toteColour('W128') || {}).fg, '#14153f');
+  eq('cartons stay uncoloured', T.toteColour('L0001'), null);
+  T.State.containersByPosition = { 3: 'B197' };
+  T.State.instruction = C;
+  T.renderPickScreen(C);
+  T.showCartPositions();
+  ok('cell painted with the tote colour', /mpk-cart-cell has coloured tote-blue current"[\s\S]*?--cart-bg:#2f6fdb/.test(sandbox.document.getElementById('mpk-cart')._html));
+  T.closeCart();
+  T.State.containersByPosition = {};
+  T.State.instruction = Object.assign({}, I2, { cluster_position_id: null });
   eq('no cluster positions: lists the totes used', T.cartSlots().slots.map(x => x.tote), ['B197']);
 
   console.log('\n11. Short pick goes through the same lock');
