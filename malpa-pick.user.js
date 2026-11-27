@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Pick
 // @namespace    https://malpa.canary7.com
-// @version      4.13.0
+// @version      4.18.2
 // @description  Picking interface for Canary7 WMS - TC51 optimised
 // @author       Malpa 3PL
 // @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/malpa-pick.user.js
@@ -14,6 +14,11 @@
 
 (function () {
   'use strict';
+
+  // 4.18.2 - promoted from the Test-Malpa-Pick trial build (4.14.0-4.18.2):
+  // scan guards + busy lock, reconcile-before-retry, faster summary, queue
+  // progress, Cart Positions, Last scanned, portal styling. Offline harness:
+  // node malpa-pick.test.js
 
   // -----------------------------------------------------------------------------
   // 0. CONSTANTS
@@ -1133,7 +1138,10 @@
     }
   }
 
-  async function apiGet(path) {
+  // opts.withMeta (v4.14.0): resolve { data, pageCount } instead of the bare
+  // body, reading C7's x-pagination-page-count header. Null pageCount means the
+  // header was not exposed - callers treat that as "one page".
+  async function apiGet(path, opts) {
     await waitForSession();
     const res = await fetch(API_BASE + path, { method: 'GET', headers: mkHeaders() });
     if (res.status === 401) {
@@ -1145,8 +1153,16 @@
       const e = new Error(`${body.message || `API error ${res.status}`} [${res.status}]`);
       e._body = body; e._status = res.status;
       e._url = API_BASE + path; e._method = 'GET';
-      reportPickError(e);            // v4.11.0 — fire and forget
+      reportPickError(e);            // v4.11.0 - fire and forget
       throw e;
+    }
+    if (opts && opts.withMeta) {
+      let pageCount = null;
+      try {
+        const h = res.headers && res.headers.get && res.headers.get('x-pagination-page-count');
+        if (h && /^\d+$/.test(h)) pageCount = parseInt(h, 10);
+      } catch (_) {}
+      return { data: await res.json(), pageCount };
     }
     return res.json();
   }
@@ -1167,7 +1183,7 @@
       const e = new Error(body.message || `API error ${res.status}`);
       e._body = body; e._status = res.status;
       e._url = API_BASE + path; e._method = 'POST';
-      reportPickError(e);            // v4.11.0 — fire and forget
+      reportPickError(e);            // v4.11.0 - fire and forget
       throw e;
     }
     return res.json();
@@ -1299,6 +1315,8 @@
         pickProgressCurrent:  State.pickProgress?.current || 1,
         pickProgressTotal:    State.pickProgress?.total   || 1,
         containersByPosition: State.containersByPosition,
+        toteContents:         State.toteContents,
+        lastPick:             State.lastPick,
         savedAt:              Date.now(),
       };
       sessionStorage.setItem(_RESUME_KEY, JSON.stringify(snapshot));
@@ -1334,23 +1352,17 @@
     const root = document.getElementById('mpk-root');
     if (!root) return;
     // Overlay the current screen
+    // A 401 mid-perform must not leave the busy lock up behind this banner.
+    try { Busy.end(); } catch (_) {}
     const banner = document.createElement('div');
-    banner.style.cssText = [
-      'position:absolute;inset:0;z-index:9999;background:rgba(0,0,0,.75)',
-      'display:flex;flex-direction:column;align-items:center;justify-content:center',
-      'padding:24px;gap:16px;text-align:center',
-    ].join(';');
+    banner.className = 'mpk-block-overlay';
     banner.innerHTML = `
-      <div style="font-size:20px;font-weight:700;color:#fff">LOCKED</div>
-      <div style="font-size:18px;font-weight:700;color:#fff">Session Expired</div>
-      <div style="font-size:13px;color:rgba(255,255,255,.75);line-height:1.5">
-        Your C7 session has timed out.<br>Please log back in to continue picking.
+      <div class="mpk-bo-kicker">Locked</div>
+      <div class="mpk-bo-title">Session expired</div>
+      <div class="mpk-bo-text">
+        Your Canary7 session has timed out.<br>Log back in to continue picking.
       </div>
-      <button id="mpk-session-dismiss" style="
-        margin-top:8px;padding:12px 24px;background:#20a8d8;color:#fff;
-        border:none;font-size:15px;font-weight:600;font-family:Roboto,sans-serif;
-        cursor:pointer;border-radius:4px;
-      ">Dismiss</button>`;
+      <button id="mpk-session-dismiss" class="mpk-btn mpk-btn-primary" style="max-width:320px">Dismiss</button>`;
     root.style.position = 'relative';
     root.appendChild(banner);
     document.getElementById('mpk-session-dismiss')?.addEventListener('click', () => {
@@ -1360,6 +1372,262 @@
       renderProfileSelect();
     });
   }
+
+  // -----------------------------------------------------------------------------
+  // 1c. BUSY LOCK + IN-FLIGHT LEDGER                               (v4.14.0)
+  //
+  //     THE INCIDENT. A big SIBP/MIBP group-perform can take Canary7 many
+  //     seconds. Until 4.13 the only sign anything was happening was a 12px
+  //     grey "Confirming?" and a DISABLED scan input - a disabled input drops
+  //     focus, so further scans went nowhere and the picker heard nothing.
+  //     They re-scanned the tote again and again; the 800ms blind auto-retry
+  //     and the still-live Back button turned that into second group-performs
+  //     while the first was still running server-side, which split units
+  //     across totes and broke the packing instructions.
+  //
+  //     THE RULES NOW:
+  //       1. One write at a time. Busy.start() before any perform / group-
+  //          perform / pick-short; nothing else may start until Busy.end().
+  //       2. While busy, a full-panel overlay says "Moving items to container -
+  //          Please wait" with a progress bar. The scan input stays ENABLED
+  //          and focused, so a repeat scan is caught and simply does nothing
+  //          (4.14.2: silently - only the first scan counts, and the design
+  //          must not depend on pickers reading or hearing an instruction).
+  //       3. Back, Short Pick, Esc and the tab close are refused while busy.
+  //       4. A perform is never blindly retried. If it errors, the script
+  //          asks Canary7 where the job is now (reconcilePerform): if the
+  //          instruction has moved on, the first call landed and we carry on
+  //          as success; only a confirmed "still here" unlocks a re-scan.
+  //       5. The attempt is written to sessionStorage before the POST, so a
+  //          reload or re-open mid-perform reconciles before allowing a scan.
+  // -----------------------------------------------------------------------------
+
+  const _INFLIGHT_KEY = 'mpk_inflight';
+  const BUSY_CHECK_MS = 75000;   // after this, offer "Check with Canary7" (100-order groups take ~60s)
+
+  function saveInflight(rec) {
+    try { sessionStorage.setItem(_INFLIGHT_KEY, JSON.stringify({ ...rec, at: Date.now() })); } catch (_) {}
+  }
+  function clearInflight() {
+    try { sessionStorage.removeItem(_INFLIGHT_KEY); } catch (_) {}
+  }
+  function loadInflight() {
+    try {
+      const raw = sessionStorage.getItem(_INFLIGHT_KEY);
+      if (!raw) return null;
+      const r = JSON.parse(raw);
+      // A perform older than 15 minutes has long since resolved one way or
+      // the other; the fresh get-job-instructions read is authoritative.
+      if (!r || Date.now() - (r.at || 0) > 15 * 60 * 1000) { clearInflight(); return null; }
+      return r;
+    } catch (_) { return null; }
+  }
+
+  // ---------------------------------------------------------------------------
+  // PERFORM TIME ESTIMATE (4.14.2) - drives the progress bar.
+  //
+  // Canary7 cannot report progress cheaply (the group filter on
+  // job/job-instruction is ignored, and a job-wide read takes 6-8s), so the bar
+  // is an ESTIMATE: fixed overhead + per-order cost. Seeded from timings
+  // measured 2026-11-27 on PuraU MIBP groups (~0.37-0.6s per order), then
+  // learned per device from every perform that answers directly, so the bar
+  // tracks this site's real speed. localStorage, not sessionStorage: it should
+  // survive a shift change. Clamped so one freak result cannot wreck it.
+  // ---------------------------------------------------------------------------
+  const _RATE_KEY = 'mpk_perform_rate';
+  const Rate = {
+    _d: { baseMs: 1500, perOrderMs: 550 },
+    load() {
+      try {
+        const r = JSON.parse(localStorage.getItem(_RATE_KEY) || 'null');
+        if (r && r.baseMs > 0 && r.perOrderMs > 0) return { baseMs: r.baseMs, perOrderMs: r.perOrderMs };
+      } catch (_) {}
+      return { ...this._d };
+    },
+    estimate(orders, extraMs) {
+      const r = this.load();
+      return Math.round(r.baseMs + Math.max(1, orders || 1) * r.perOrderMs + (extraMs || 0));
+    },
+    learn(orders, elapsedMs, extraMs) {
+      try {
+        const r = this.load();
+        const n = Math.max(1, orders || 1);
+        const t = elapsedMs - (extraMs || 0);
+        const A = 0.3;                                   // weight of the newest sample
+        if (n >= 5) {
+          const per = Math.min(2000, Math.max(150, (t - r.baseMs) / n));
+          r.perOrderMs = Math.round(r.perOrderMs * (1 - A) + per * A);
+        } else {
+          const base = Math.min(10000, Math.max(400, t - n * r.perOrderMs));
+          r.baseMs = Math.round(r.baseMs * (1 - A) + base * A);
+        }
+        localStorage.setItem(_RATE_KEY, JSON.stringify(r));
+      } catch (_) {}
+    },
+  };
+
+  /**
+   * Bar position for elapsed `t` against estimate `est`: linear to 90% at the
+   * estimate, then creeping toward (never reaching) 99% - so a slow Canary7
+   * looks slow, not frozen, and the bar never sits "full" while still waiting.
+   */
+  function progressAt(t, est) {
+    if (!est || est <= 0) return 0;
+    if (t <= est) return 0.9 * (t / est);
+    return 0.9 + 0.09 * (1 - Math.exp(-(t - est) / est));
+  }
+
+  const Busy = {
+    active: null,     // { kind, title, detail, startedAt, estMs, ignored, done }
+    _tick: null,
+    _onCheck: null,
+
+    isActive() { return !!this.active; },
+
+    /**
+     * kind:   'perform' | 'shortpick' | 'loading'
+     * title:  plain text, e.g. 'Moving items to container'
+     * opts.detail:  small mono line under the title (the tote number)
+     * opts.estMs:   expected duration -> determinate progress bar
+     * opts.onCheck: async fn behind the "Check with Canary7" button that
+     *               appears after BUSY_CHECK_MS
+     */
+    start(kind, title, opts) {
+      opts = opts || {};
+      this.active = {
+        kind, title, detail: opts.detail || '', startedAt: Date.now(),
+        estMs: opts.estMs || 0, ignored: 0, done: false,
+      };
+      this._onCheck = opts.onCheck || null;
+      State._busyKind = kind;
+      this._render();
+      if (this._tick) clearInterval(this._tick);
+      // 200ms: smooth enough to read as continuous on a TC51, cheap enough
+      // not to matter.
+      this._tick = setInterval(() => this._refresh(), 200);
+    },
+
+    /** Change the headline (e.g. 'Checking with Canary7', 'Loading next pick'). */
+    update(title, opts) {
+      if (!this.active || title == null) return;
+      this.active.title = title;
+      if (opts && opts.indeterminate) {
+        // The estimate no longer applies (we are now checking, not moving):
+        // switch to a sliding bar rather than show a made-up percentage.
+        this.active.estMs = 0;
+        this._render();
+        return;
+      }
+      const el = document.getElementById('mpk-busy-title');
+      if (el) el.textContent = title;
+    },
+
+    /** Canary7 answered: fill the bar. The overlay stays until end(). */
+    complete() {
+      if (!this.active) return;
+      this.active.done = true;
+      this._refresh();
+    },
+
+    end() {
+      this.active = null;
+      this._onCheck = null;
+      State._busyKind = null;
+      if (this._tick) { clearInterval(this._tick); this._tick = null; }
+      document.getElementById('mpk-busy')?.remove();
+      setTimeout(() => _refocusScanInput(), 60);
+    },
+
+    _host() {
+      return document.getElementById('mpk-tab-view') || document.getElementById('mpk-root');
+    },
+
+    _render() {
+      const host = this._host();
+      if (!host || !this.active) return;
+      let el = document.getElementById('mpk-busy');
+      if (!el) {
+        el = document.createElement('div');
+        el.id = 'mpk-busy';
+        el.setAttribute('role', 'status');
+        el.setAttribute('aria-live', 'polite');
+        host.appendChild(el);
+        // Taps on the overlay must not reach anything underneath, and they
+        // put focus back on the scan input so the next scan is caught.
+        el.addEventListener('click', (e) => {
+          if (e.target && e.target.closest && e.target.closest('button')) return;
+          e.stopPropagation();
+          _refocusScanInput();
+        });
+      }
+      const a = this.active;
+      el.innerHTML = `
+        <div class="mpk-busy-card">
+          <div class="mpk-busy-spin"></div>
+          <div class="mpk-busy-title" id="mpk-busy-title">${_esc(a.title)}</div>
+          ${a.detail ? `<div class="mpk-busy-detail mpk-mono">${_esc(a.detail)}</div>` : ''}
+          <div class="mpk-busy-wait">Please wait</div>
+          <div class="mpk-busy-track${a.estMs ? '' : ' indeterminate'}" id="mpk-busy-track"
+               role="progressbar" aria-valuemin="0" aria-valuemax="100">
+            <div class="mpk-busy-fill" id="mpk-busy-fill"></div>
+          </div>
+          <div class="mpk-busy-meta">
+            <span class="mpk-busy-pct" id="mpk-busy-pct"></span>
+            <span class="mpk-busy-left" id="mpk-busy-left"></span>
+          </div>
+        </div>
+        <div class="mpk-busy-actions" id="mpk-busy-actions">
+          <button id="mpk-busy-check" class="mpk-btn mpk-btn-secondary">Check with Canary7</button>
+        </div>`;
+      document.getElementById('mpk-busy-check')?.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const fn = this._onCheck;
+        if (!fn) return;
+        const btn = e.currentTarget || e.target;
+        if (btn) { btn.disabled = true; btn.textContent = 'Checking...'; }
+        try { await fn(); }
+        finally { if (btn && document.contains(btn)) { btn.disabled = false; btn.textContent = 'Check with Canary7'; } }
+      });
+      this._refresh();
+    },
+
+    _refresh() {
+      const a = this.active;
+      if (!a) return;
+      const t = Date.now() - a.startedAt;
+      const fill  = document.getElementById('mpk-busy-fill');
+      const track = document.getElementById('mpk-busy-track');
+      const left  = document.getElementById('mpk-busy-left');
+      const pctEl = document.getElementById('mpk-busy-pct');
+      if (!a.estMs && !a.done && pctEl) pctEl.textContent = '';   // sliding bar: no fake %
+      if (a.estMs || a.done) {
+        const p = a.done ? 1 : progressAt(t, a.estMs);
+        // 4.18.1: the % is the bar's own position (estimate-driven), shown as a
+        // whole number. It tops out at 99% until Canary7 actually answers.
+        const pct = a.done ? 100 : Math.min(99, Math.floor(p * 100));
+        if (pctEl) pctEl.textContent = pct + '%';
+        if (track) { track.classList.remove('indeterminate'); track.setAttribute('aria-valuenow', String(pct)); }
+        if (fill) fill.style.width = (p * 100).toFixed(1) + '%';
+        if (left) {
+          const secs = Math.ceil((a.estMs - t) / 1000);
+          left.textContent = a.done ? '' : (secs >= 2 ? `About ${secs}s left` : 'Almost done');
+        }
+      }
+      const acts = document.getElementById('mpk-busy-actions');
+      if (acts) acts.classList.toggle('show', !!this._onCheck && !a.done && t > BUSY_CHECK_MS);
+    },
+
+    /**
+     * A scan, Back, Esc or close arrived while a write is in flight. It is
+     * swallowed and does NOTHING (4.14.2): no buzz, voice or counter. The
+     * overlay itself is the feedback; the count is kept only for the logs
+     * and the test harness.
+     */
+    blocked() {
+      if (!this.active) return;
+      this.active.ignored++;
+    },
+  };
 
   // -----------------------------------------------------------------------------
   // 2. STATE STORE
@@ -1386,6 +1654,8 @@
     allInstructions: [],     // cached from summary fetchJobInstructions call
     barcodeMap: {},          // barcode -> instruction_id lookup, built at accept
     containerPrefixes: [],   // valid container prefixes for O(1) validation
+    toteContents: {},        // 4.17.0: TOTE -> { tote, pos, items[] } picked on this device this job
+    lastPick: null,          // 4.18.0: { sku, desc, qty, uom, tote, pos, at } for the Last scanned banner
 
     reset() {
       this.screen = 'PROFILE_SELECT';
@@ -1402,6 +1672,10 @@
       this.allInstructions = [];
       this.barcodeMap = {};
       this.containerPrefixes = [];
+      this.lastItemScan = null;
+      this.toteContents = {};
+      this.lastPick = null;
+      try { _groupCache.clear(); } catch (_) {}
     },
   };
 
@@ -1416,7 +1690,48 @@
     if (document.getElementById('mpk-styles')) return;
     const style = document.createElement('style');
     style.id = 'mpk-styles';
+    // v4.14.0 - restyled onto the Malpa portal tokens (wms.internalsoft.com
+    // src/web/tokens.css, v1 LOCKED 6 Sep 2026). Values are copied, not linked:
+    // the portal's fonts and CSS are not reachable from a C7 page.
+    //   - Coral is a FILL under DARK text (--mpk-on-brand), never white text
+    //     and never a text colour on white (3.18:1, fails AA).
+    //   - Navy #14153f is the portal text colour; here it is also the band
+    //     behind the location code so the code reads at arm's length.
+    //   - Tokens are scoped to #mpk-tab-view, never :root, so nothing leaks
+    //     into C7's own chrome.
     style.textContent = `
+      #mpk-tab-view, #mpk-nav-li {
+        --mpk-bg: #f3f4f7;
+        --mpk-surface: #ffffff;
+        --mpk-subtle: #f8f9fb;
+        --mpk-hover: #eef0f4;
+        --mpk-sunken: #e8eaef;
+        --mpk-border: #e2e4ea;
+        --mpk-border-strong: #c9cdd6;
+        --mpk-text: #14153f;
+        --mpk-muted: #5f6372;
+        --mpk-faint: #9497a3;
+        --mpk-brand: #f26247;
+        --mpk-brand-hover: #e0543b;
+        --mpk-brand-subtle: #fdece7;
+        --mpk-brand-on-subtle: #a52f19;
+        --mpk-on-brand: #14153f;
+        --mpk-navy: #14153f;
+        --mpk-focus: #4f7cff;
+        --mpk-ok-bg: #def4e6;   --mpk-ok-fg: #186a3c;
+        --mpk-warn-bg: #fbeecf; --mpk-warn-fg: #855400;
+        --mpk-crit-bg: #fde2de; --mpk-crit-fg: #a3261a;
+        --mpk-info-bg: #e0eafc; --mpk-info-fg: #2a4f9e;
+        --mpk-scrim: rgb(20 21 63 / 0.55);
+        --mpk-shadow: 0 1px 2px rgb(20 21 63 / 0.06), 0 8px 24px -12px rgb(20 21 63 / 0.18);
+        --mpk-pop-shadow: 0 2px 6px rgb(20 21 63 / 0.08), 0 16px 40px -16px rgb(20 21 63 / 0.28);
+        --mpk-r: 8px;
+        --mpk-r-sm: 6px;
+        --mpk-ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+        --mpk-font: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+        --mpk-mono: 'JetBrains Mono', ui-monospace, Menlo, Consolas, 'Roboto Mono', monospace;
+      }
+
       /* -- Tab panel: fills TC51 screen -- */
       #mpk-tab-view {
         display: flex;
@@ -1424,7 +1739,7 @@
         height: calc(100vh - 55px); /* overridden by JS measureHeight() */
         max-height: 100vh;
         overflow: hidden;
-        background: #fff;
+        background: var(--mpk-bg);
         padding: 0;
         position: relative; /* needed for absolute overlays */
       }
@@ -1435,253 +1750,189 @@
         display: flex;
         flex-direction: column;
         overflow: hidden;
-        font-family: Roboto, sans-serif;
-        font-size: .875rem;
-        color: #384042;
+        font-family: var(--mpk-font);
+        font-size: 14px;
+        line-height: 1.45;
+        color: var(--mpk-text);
+        background: var(--mpk-bg);
         box-sizing: border-box;
         min-width: 0;
         justify-content: flex-start;
+        -webkit-font-smoothing: antialiased;
       }
 
-      /* Pushes btn-stack down only when there IS remaining space */
       .mpk-spacer { flex: 1; min-height: 8px; max-height: 24px; }
 
-      #mpk-root *, #mpk-root *::before, #mpk-root *::after {
+      #mpk-root *, #mpk-root *::before, #mpk-root *::after,
+      #mpk-busy *, #mpk-busy *::before, #mpk-busy *::after {
         box-sizing: border-box;
       }
 
-      /* -- Keyboard suppression for scanner inputs -- */
       #mpk-root input[inputmode="none"] {
         caret-color: transparent;
         -webkit-user-select: text;
         user-select: text;
       }
 
-      /* -- Buttons: match C7 .btn shape, TC51 44px min-height -- */
-      #mpk-root .mpk-btn {
+      .mpk-mono { font-family: var(--mpk-mono); letter-spacing: 0; }
+
+      /* -- Buttons: portal shape, TC51 48px touch target -- */
+      #mpk-root .mpk-btn, #mpk-busy .mpk-btn {
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        min-height: 44px;
-        padding: .5rem 1rem;
-        font-size: .875rem;
-        font-weight: 400;
-        font-family: Roboto, sans-serif;
+        min-height: 48px;
+        padding: 0 16px;
+        font-size: 15px;
+        font-weight: 600;
+        font-family: var(--mpk-font);
         border: 1px solid transparent;
-        border-radius: 0;
+        border-radius: var(--mpk-r);
         cursor: pointer;
-        transition: all .2s ease-in-out;
+        transition: background 180ms var(--mpk-ease), border-color 180ms var(--mpk-ease);
         white-space: nowrap;
         width: 100%;
         -webkit-tap-highlight-color: transparent;
         touch-action: manipulation;
         text-align: center;
       }
-      #mpk-root .mpk-btn:active {
-        opacity: .85;
-      }
+      #mpk-root .mpk-btn:focus-visible { outline: 2px solid var(--mpk-focus); outline-offset: 2px; }
+      #mpk-root .mpk-btn:active { transform: translateY(1px); }
 
-      #mpk-root .mpk-btn-primary {
-        background: #20a8d8;
-        border-color: #20a8d8;
-        color: #fff;
+      /* Coral fill, DARK text - white on coral fails AA */
+      #mpk-root .mpk-btn-primary, #mpk-busy .mpk-btn-primary {
+        background: var(--mpk-brand);
+        border-color: var(--mpk-brand);
+        color: var(--mpk-on-brand);
       }
-      #mpk-root .mpk-btn-primary:hover {
-        background: #1985ac;
-        border-color: #187fa3;
-      }
+      #mpk-root .mpk-btn-primary:hover { background: var(--mpk-brand-hover); border-color: var(--mpk-brand-hover); }
       #mpk-root .mpk-btn-primary:disabled {
-        opacity: .55;
+        background: var(--mpk-sunken);
+        border-color: var(--mpk-sunken);
+        color: var(--mpk-muted);
         cursor: not-allowed;
       }
 
-      #mpk-root .mpk-btn-secondary {
-        background: #fff;
-        border-color: #e1e6ef;
-        color: #384042;
+      #mpk-root .mpk-btn-secondary, #mpk-busy .mpk-btn-secondary {
+        background: var(--mpk-surface);
+        border-color: var(--mpk-border-strong);
+        color: var(--mpk-text);
       }
-      #mpk-root .mpk-btn-secondary:hover {
-        background: #f9f9fa;
-      }
+      #mpk-root .mpk-btn-secondary:hover { background: var(--mpk-hover); }
+      #mpk-root .mpk-btn-secondary:disabled { color: var(--mpk-faint); cursor: not-allowed; }
 
       #mpk-root .mpk-btn-danger {
-        background: #fff;
-        border-color: #ff5454;
-        color: #ff5454;
+        background: var(--mpk-surface);
+        border-color: var(--mpk-crit-fg);
+        color: var(--mpk-crit-fg);
       }
-      #mpk-root .mpk-btn-danger:hover {
-        background: #fff0f0;
-      }
+      #mpk-root .mpk-btn-danger:hover { background: var(--mpk-crit-bg); }
 
-      /* -- Form inputs: C7 style -- */
+      /* -- Form inputs -- */
       #mpk-root .mpk-input {
         display: block;
         width: 100%;
-        padding: .5rem .75rem;
-        font-size: .875rem;
-        font-family: Roboto, sans-serif;
-        color: #020202;
-        background: #fff;
-        border: 1px solid #e1e6ef;
-        border-radius: 0;
+        padding: 0 12px;
+        font-size: 16px;
+        font-family: var(--mpk-mono);
+        color: var(--mpk-text);
+        background: var(--mpk-surface);
+        border: 1px solid var(--mpk-border-strong);
+        border-radius: var(--mpk-r);
         outline: none;
-        min-height: 44px;
-        transition: border-color .15s ease-in-out;
+        min-height: 48px;
+        transition: border-color 180ms var(--mpk-ease), box-shadow 180ms var(--mpk-ease);
         -webkit-tap-highlight-color: transparent;
       }
-      #mpk-root .mpk-input:focus {
-        border-color: #8ad4ee;
-      }
-      #mpk-root .mpk-input::placeholder {
-        color: #c0cadd;
-      }
-      #mpk-root .mpk-input:disabled {
-        background: #e1e6ef;
-        cursor: not-allowed;
-      }
+      #mpk-root .mpk-input:focus { border-color: var(--mpk-focus); box-shadow: 0 0 0 3px rgb(79 124 255 / 0.18); }
+      #mpk-root .mpk-input::placeholder { color: var(--mpk-faint); font-family: var(--mpk-font); }
+      #mpk-root .mpk-input:disabled { background: var(--mpk-sunken); cursor: not-allowed; }
 
-      /* -- Status messages -- */
-      .mpk-status {
-        padding: 8px 16px;
+      .mpk-field-label {
         font-size: 13px;
-        text-align: center;
-        flex-shrink: 0;
-      }
-      .mpk-status.ok    { color: #79c447; }
-      .mpk-status.err   { color: #ff5454; background: #fff5f5; }
-      .mpk-status.warn  { color: #b07d00; }
-      .mpk-status.idle  { color: #9faecb; }
-
-      /* -- Placeholder screen (Fragment 1) -- */
-      .mpk-placeholder {
-        flex: 1;
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        justify-content: center;
-        gap: 12px;
-        color: #9faecb;
-        padding: 24px;
-        text-align: center;
-      }
-      .mpk-placeholder-icon {
-        font-size: 48px;
-        line-height: 1;
-      }
-      .mpk-placeholder-title {
-        font-size: 18px;
-        font-weight: 500;
-        color: #394967;
-      }
-      .mpk-placeholder-sub {
-        font-size: 13px;
-        color: #9faecb;
-        line-height: 1.5;
-      }
-      .mpk-placeholder-badge {
-        display: inline-block;
-        padding: 3px 10px;
-        background: #e8f8ef;
-        color: #3a7d44;
-        font-size: 12px;
-        font-weight: 500;
-        border-radius: 12px;
-        margin-top: 4px;
+        font-weight: 600;
+        color: var(--mpk-muted);
+        margin-bottom: -4px;
       }
 
-      /* -- Sidebar nav item - exact same pattern as Malpa Pack v3 -- */
+      /* -- Sidebar nav item (ours; sits on C7's dark sidebar) -- */
       #mpk-nav-li { order: -1; }
       #mpk-nav {
         display: flex !important; align-items: center;
         gap: 10px; padding: 10px 12px;
-        color: #fabb3d !important; font-weight: 500;
+        color: #f5836a !important; font-weight: 600;
         cursor: pointer; transition: background .1s;
         text-decoration: none !important;
         position: relative;
       }
-      #mpk-nav:hover { background: rgba(245,158,11,.08); }
+      #mpk-nav:hover { background: rgb(245 131 106 / 0.12); }
       #mpk-nav .mpk-nav-icon {
         width: 20px; height: 20px; flex-shrink: 0;
         background: transparent; border-radius: 4px; overflow: hidden;
         display: flex; align-items: center; justify-content: center;
       }
       #mpk-nav .mpk-nav-icon img { width: 20px; height: 20px; object-fit: contain; border-radius: 4px; }
-      #mpk-nav .mpk-nav-label { font-size: 17px; font-weight: 500; }
+      #mpk-nav .mpk-nav-label { font-size: 17px; font-weight: 600; }
 
-      /* -- Content body area -- */
-      .mpk-body {
-        flex: 1;
-        display: flex;
-        flex-direction: column;
-        overflow-y: auto;
-        overflow-x: hidden;
-        padding: 16px;
-        gap: 12px;
-      }
+      /* == PICK SCREEN ==================================================== */
 
-      /* -- Divider -- */
-      .mpk-divider {
-        height: 1px;
-        background: #e1e6ef;
-        margin: 0;
-        flex-shrink: 0;
-      }
-
-      /* == FRAGMENT 3: PICK SCREEN ========================================== */
-
-      /* -- Pick screen root -- */
       .mpk-pick-screen {
         flex: 1;
         min-height: 0;
         display: flex;
         flex-direction: column;
         overflow: hidden;
-        background: #f5f7fa;
+        background: var(--mpk-bg);
         position: relative;
       }
 
-      /* -- Location header (coloured band) -- */
+      /* -- Location header (navy band) -- */
       .mpk-loc-header {
-        background: #20a8d8;
-        padding: 10px 16px 8px;
+        background: var(--mpk-navy);
+        padding: 10px 16px 10px;
         flex-shrink: 0;
       }
       .mpk-loc-header-top {
         display: flex;
         align-items: center;
         justify-content: space-between;
-        margin-bottom: 5px;
+        margin-bottom: 4px;
       }
       .mpk-loc-label {
-        font-size: 10px;
+        font-size: 11px;
         font-weight: 600;
-        color: rgba(255,255,255,.7);
+        color: rgb(255 255 255 / 0.72);
         text-transform: uppercase;
         letter-spacing: .08em;
       }
       .mpk-loc-progress-text {
-        font-size: 10px;
+        font-size: 11px;
         font-weight: 600;
-        color: rgba(255,255,255,.7);
-        letter-spacing: .04em;
+        color: rgb(255 255 255 / 0.72);
+        font-variant-numeric: tabular-nums;
       }
       .mpk-loc-code {
-        font-size: 26px;
-        font-weight: 700;
+        font-family: var(--mpk-mono);
+        font-size: 28px;
+        font-weight: 500;
         color: #fff;
-        letter-spacing: .03em;
-        line-height: 1.1;
+        line-height: 1.15;
       }
-      /* -- Voice toggle button -- */
+      .mpk-loc-ship {
+        font-size: 11px;
+        color: rgb(255 255 255 / 0.72);
+        font-weight: 500;
+        margin-top: 2px;
+      }
       .mpk-voice-toggle {
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        width: 32px;
-        height: 28px;
+        width: 34px;
+        height: 30px;
         border: none;
-        border-radius: 4px;
-        background: rgba(255,255,255,.18);
+        border-radius: var(--mpk-r-sm);
+        background: rgb(255 255 255 / 0.14);
         color: #fff;
         font-size: 15px;
         cursor: pointer;
@@ -1690,85 +1941,91 @@
         touch-action: manipulation;
         transition: background .15s, opacity .15s;
       }
-      .mpk-voice-toggle:active { background: rgba(255,255,255,.35); }
-      .mpk-voice-toggle.muted  { opacity: .45; background: rgba(0,0,0,.15); }
+      .mpk-voice-toggle:active { background: rgb(255 255 255 / 0.3); }
+      .mpk-voice-toggle.muted  { opacity: .5; background: rgb(0 0 0 / 0.2); }
 
-      /* Progress bar lives inside the blue header */
       .mpk-progress-track {
-        height: 3px;
-        background: rgba(255,255,255,.25);
+        height: 4px;
+        background: rgb(255 255 255 / 0.18);
         width: 100%;
-        margin-top: 7px;
-        border-radius: 2px;
+        margin-top: 8px;
+        border-radius: 999px;
+        overflow: hidden;
       }
       .mpk-progress-fill {
-        height: 3px;
-        background: #fff;
-        transition: width .4s ease;
+        height: 4px;
+        background: var(--mpk-brand);
+        transition: width .4s var(--mpk-ease);
         min-width: 4px;
-        border-radius: 2px;
+        border-radius: 999px;
       }
 
-      /* -- Item block (centred) -- */
+      /* -- Item block -- */
       .mpk-item-block {
-        padding: 14px 16px 10px;
+        margin: 10px 12px 0;
+        padding: 12px 16px 12px;
         flex-shrink: 0;
-        background: #fff;
-        border-bottom: 1px solid #e1e6ef;
+        background: var(--mpk-surface);
+        border: 1px solid var(--mpk-border);
+        border-radius: var(--mpk-r);
+        box-shadow: var(--mpk-shadow);
         display: flex;
         flex-direction: column;
         align-items: center;
         text-align: center;
+        transition: background 180ms var(--mpk-ease), border-color 180ms var(--mpk-ease);
       }
       .mpk-qty-value {
         font-size: 64px;
         font-weight: 700;
-        color: #384042;
+        color: var(--mpk-text);
         line-height: 1;
         letter-spacing: -.02em;
+        font-variant-numeric: tabular-nums;
       }
       .mpk-qty-label {
         font-size: 11px;
         font-weight: 600;
-        color: #9faecb;
+        color: var(--mpk-muted);
         letter-spacing: .08em;
         text-transform: uppercase;
         margin-bottom: 4px;
       }
       .mpk-qty-uom {
-        font-size: 13px;
-        font-weight: 600;
-        color: #9faecb;
+        display: inline-block;
+        margin-top: 6px;
+        padding: 2px 10px;
+        border-radius: 999px;
+        background: var(--mpk-warn-bg);
+        color: var(--mpk-warn-fg);
+        font-size: 12px;
+        font-weight: 700;
         text-transform: uppercase;
         letter-spacing: .06em;
-        margin-top: 2px;
       }
       .mpk-item-sku {
+        font-family: var(--mpk-mono);
         font-size: 16px;
-        font-weight: 700;
-        color: #384042;
-        margin-top: 6px;
-        letter-spacing: .01em;
+        font-weight: 500;
+        color: var(--mpk-text);
+        margin-top: 8px;
       }
       .mpk-item-desc {
-        font-size: 12px;
-        color: #9faecb;
+        font-size: 13px;
+        color: var(--mpk-muted);
         font-weight: 500;
         margin-top: 2px;
         line-height: 1.3;
       }
-
-      /* -- Verified item block state -- */
       .mpk-item-block.verified {
-        background: #f0fff4;
-        border-bottom-color: #79c447;
-        transition: background .15s, border-color .15s;
+        background: var(--mpk-ok-bg);
+        border-color: var(--mpk-ok-fg);
       }
-      .mpk-item-block.verified .mpk-qty-value {
-        color: #79c447;
-      }
+      .mpk-item-block.verified .mpk-qty-value,
+      .mpk-item-block.verified .mpk-qty-label { color: var(--mpk-ok-fg); }
 
-      /* -- Scan zone -- */
+      /* -- Scan zone. Coral = scan ITEM, blue = scan TOTE, so the stage
+            reads from across an aisle without reading the words. -- */
       .mpk-scan-area {
         flex: 1;
         min-height: 0;
@@ -1776,14 +2033,14 @@
         flex-direction: column;
         justify-content: center;
         align-items: center;
-        padding: 12px 20px;
+        padding: 12px;
         gap: 8px;
       }
       .mpk-scan-zone {
         width: 100%;
-        border: 2px dashed #20a8d8;
-        background: #f0f8fd;
-        border-radius: 6px;
+        border: 2px dashed var(--mpk-brand);
+        background: var(--mpk-brand-subtle);
+        border-radius: var(--mpk-r);
         padding: 14px 16px;
         display: flex;
         flex-direction: column;
@@ -1792,15 +2049,25 @@
         position: relative;
       }
       .mpk-scan-zone-label {
-        font-size: 10px;
+        font-size: 13px;
         font-weight: 700;
-        color: #20a8d8;
+        color: var(--mpk-brand-on-subtle);
         text-transform: uppercase;
         letter-spacing: .1em;
       }
+      .mpk-scan-zone.tote { border-color: var(--mpk-info-fg); background: var(--mpk-info-bg); }
+      .mpk-scan-zone.tote .mpk-scan-zone-label { color: var(--mpk-info-fg); font-size: 15px; }
+      .mpk-scan-zone.tote .mpk-scan-arrows { color: var(--mpk-info-fg); }
+      .mpk-scan-hint {
+        font-family: var(--mpk-mono);
+        font-size: 12px;
+        color: var(--mpk-info-fg);
+        font-weight: 500;
+      }
       .mpk-scan-arrows {
         font-size: 22px;
-        color: #b8dff5;
+        color: var(--mpk-brand);
+        opacity: .55;
         letter-spacing: 4px;
         line-height: 1;
       }
@@ -1816,30 +2083,39 @@
         -webkit-user-select: text;
         user-select: text;
       }
+
+      /* Feedback is a pill, not a line of grey text: on a TC51 at arm's
+         length the old 12px line was the "no feedback" the floor reported. */
       .mpk-scan-feedback {
-        font-size: 12px;
+        font-size: 14px;
         font-weight: 600;
-        min-height: 18px;
+        min-height: 30px;
+        padding: 5px 14px;
+        border-radius: 999px;
         text-align: center;
+        line-height: 1.35;
+        max-width: 100%;
       }
-      .mpk-scan-feedback.ok  { color: #79c447; }
-      .mpk-scan-feedback.err { color: #ff5454; }
-      .mpk-scan-feedback.dim { color: #9faecb; }
+      .mpk-scan-feedback.ok   { color: var(--mpk-ok-fg);   background: var(--mpk-ok-bg); }
+      .mpk-scan-feedback.err  { color: var(--mpk-crit-fg); background: var(--mpk-crit-bg); }
+      .mpk-scan-feedback.warn { color: var(--mpk-warn-fg); background: var(--mpk-warn-bg); }
+      .mpk-scan-feedback.dim  { color: var(--mpk-muted);   background: transparent; }
 
       /* -- Qty numpad overlay -- */
       .mpk-numpad-overlay {
         position: absolute;
         inset: 0;
-        background: rgba(0,0,0,.55);
+        background: var(--mpk-scrim);
         display: flex;
         align-items: flex-end;
         z-index: 100;
       }
       .mpk-numpad-sheet {
         width: 100%;
-        background: #fff;
+        background: var(--mpk-surface);
         border-radius: 12px 12px 0 0;
-        padding: 16px;
+        box-shadow: var(--mpk-pop-shadow);
+        padding: 14px;
         display: flex;
         flex-direction: column;
         gap: 10px;
@@ -1848,19 +2124,33 @@
         text-align: center;
         font-size: 40px;
         font-weight: 700;
-        color: #384042;
-        padding: 8px 0 4px;
-        border-bottom: 2px solid #e1e6ef;
+        color: var(--mpk-text);
+        padding: 6px 0 6px;
+        border-bottom: 1px solid var(--mpk-border);
         min-height: 64px;
         line-height: 1;
+        font-variant-numeric: tabular-nums;
       }
       .mpk-numpad-display .mpk-numpad-target {
         font-size: 14px;
-        color: #9faecb;
+        color: var(--mpk-muted);
         font-weight: 500;
         display: block;
-        margin-top: 2px;
+        margin-top: 4px;
       }
+      .mpk-numpad-err {
+        display: none;
+        margin: 0 4px;
+        padding: 8px 10px;
+        border-radius: var(--mpk-r-sm);
+        background: var(--mpk-crit-bg);
+        color: var(--mpk-crit-fg);
+        font-size: 13px;
+        font-weight: 700;
+        text-align: center;
+        line-height: 1.3;
+      }
+      .mpk-numpad-err.warn { background: var(--mpk-warn-bg); color: var(--mpk-warn-fg); }
       .mpk-numpad-grid {
         display: grid;
         grid-template-columns: repeat(3, 1fr);
@@ -1871,28 +2161,33 @@
         display: flex;
         align-items: center;
         justify-content: center;
+        font-family: var(--mpk-font);
         font-size: 22px;
         font-weight: 600;
-        color: #384042;
-        background: #f5f7fa;
-        border: none;
-        border-radius: 6px;
+        color: var(--mpk-text);
+        background: var(--mpk-subtle);
+        border: 1px solid var(--mpk-border);
+        border-radius: var(--mpk-r);
         cursor: pointer;
         -webkit-tap-highlight-color: transparent;
         touch-action: manipulation;
       }
-      .mpk-numpad-key:active { background: #e1e6ef; }
-      .mpk-numpad-key.del { font-size: 18px; color: #9faecb; }
+      .mpk-numpad-key:active { background: var(--mpk-sunken); }
+      .mpk-numpad-key.del { font-size: 18px; color: var(--mpk-muted); }
       .mpk-numpad-key.confirm {
-        background: #20a8d8;
-        color: #fff;
+        background: var(--mpk-brand);
+        border-color: var(--mpk-brand);
+        color: var(--mpk-on-brand);
         grid-column: span 2;
         font-size: 16px;
+        font-weight: 700;
       }
-      .mpk-numpad-key.confirm:active { background: #1985ac; }
-      .mpk-numpad-key.cancel { color: #ff5454; background: #fff5f5; }
+      .mpk-numpad-key.confirm:active { background: var(--mpk-brand-hover); }
+      .mpk-numpad-key.cancel { color: var(--mpk-crit-fg); background: var(--mpk-crit-bg); border-color: transparent; }
 
-      /* -- Full-screen flash overlay -- 
+      /* -- Full-screen flash overlay --
+         v4.14.0: this comment was missing its close, which swallowed every
+         rule down to the cluster strip - the ok/err flash never rendered. */
       .mpk-flash {
         position: absolute;
         inset: 0;
@@ -1902,16 +2197,19 @@
         transition: opacity .06s ease-in;
         border-radius: inherit;
       }
-      .mpk-flash.flash-ok  { background: #79c447; }
-      .mpk-flash.flash-err { background: #ff5454; }
+      .mpk-flash.flash-ok   { background: var(--mpk-ok-fg); }
+      .mpk-flash.flash-err  { background: var(--mpk-crit-fg); }
+      .mpk-flash.flash-warn { background: var(--mpk-warn-fg); }
 
       /* -- Cluster position strip -- */
       .mpk-cluster-strip {
         display: none;
         align-items: center;
         justify-content: space-between;
-        padding: 10px 16px;
-        background: #20a8d8;
+        margin: 0 12px 10px;
+        padding: 8px 12px;
+        background: var(--mpk-navy);
+        border-radius: var(--mpk-r);
         flex-shrink: 0;
         gap: 10px;
       }
@@ -1923,12 +2221,11 @@
         width: 36px;
         height: 36px;
         border-radius: 50%;
-        background: #fff;
-        color: #20a8d8;
+        background: var(--mpk-brand);
+        color: var(--mpk-on-brand);
         font-size: 18px;
         font-weight: 700;
         flex-shrink: 0;
-        box-shadow: 0 1px 4px rgba(0,0,0,.15);
       }
       .mpk-cluster-pos-label {
         font-size: 15px;
@@ -1939,52 +2236,49 @@
         flex: 1;
       }
       .mpk-cluster-container {
+        font-family: var(--mpk-mono);
         font-size: 13px;
-        color: rgba(255,255,255,.75);
-        font-weight: 500;
+        color: rgb(255 255 255 / 0.72);
         text-align: right;
       }
-      .mpk-cluster-container.assigned {
-        color: #fff;
-        font-weight: 700;
-      }
-      /* -- Multi-tote modal -- */
+      .mpk-cluster-container.assigned { color: #fff; font-weight: 500; }
+
+      /* -- Modal (multi-tote etc.) -- */
       .mpk-modal-overlay {
         position: absolute;
         inset: 0;
-        background: rgba(0,0,0,.6);
+        background: var(--mpk-scrim);
         display: flex;
         align-items: center;
         justify-content: center;
         z-index: 200;
-        padding: 20px;
+        padding: 16px;
       }
       .mpk-modal-card {
-        background: #fff;
+        background: var(--mpk-surface);
         width: 100%;
-        border-radius: 8px;
+        border-radius: var(--mpk-r);
+        box-shadow: var(--mpk-pop-shadow);
         overflow: hidden;
       }
       .mpk-modal-header {
-        background: #fabb3d;
+        background: var(--mpk-warn-bg);
+        color: var(--mpk-warn-fg);
         padding: 12px 16px;
         display: flex;
         align-items: center;
         gap: 8px;
-        font-size: 14px;
+        font-size: 15px;
         font-weight: 700;
-        color: #384042;
       }
       .mpk-modal-body {
         padding: 16px;
-        font-size: 13px;
-        color: #384042;
+        font-size: 14px;
+        color: var(--mpk-text);
         line-height: 1.5;
       }
-      .mpk-modal-body strong {
-        font-weight: 700;
-        color: #20a8d8;
-      }
+      .mpk-modal-body strong { font-family: var(--mpk-mono); font-weight: 500; }
+      .mpk-modal-body small { color: var(--mpk-muted); margin-top: 6px; display: block; }
       .mpk-modal-actions {
         display: flex;
         flex-direction: column;
@@ -1996,33 +2290,31 @@
       .mpk-sp-overlay {
         position: absolute;
         inset: 0;
-        background: #fff;
+        background: var(--mpk-bg);
         display: flex;
         flex-direction: column;
         z-index: 150;
         overflow: hidden;
       }
       .mpk-sp-header {
-        background: #fabb3d;
+        background: var(--mpk-warn-bg);
+        border-bottom: 1px solid var(--mpk-border);
         padding: 10px 16px;
         display: flex;
         align-items: center;
         justify-content: space-between;
         flex-shrink: 0;
       }
-      .mpk-sp-title {
-        font-size: 14px;
-        font-weight: 700;
-        color: #384042;
-      }
+      .mpk-sp-title { font-size: 15px; font-weight: 700; color: var(--mpk-warn-fg); }
       .mpk-sp-close {
         background: none;
         border: none;
         font-size: 20px;
-        color: #384042;
+        color: var(--mpk-warn-fg);
         cursor: pointer;
         padding: 0 4px;
-        opacity: .6;
+        min-width: 40px;
+        min-height: 40px;
         -webkit-tap-highlight-color: transparent;
       }
       .mpk-sp-body {
@@ -2032,28 +2324,19 @@
         flex-direction: column;
         align-items: center;
         justify-content: center;
-        padding: 20px 24px;
+        padding: 20px 16px;
         gap: 12px;
         text-align: center;
         overflow-y: auto;
         -webkit-overflow-scrolling: touch;
       }
-      .mpk-sp-loc {
-        font-size: 24px;
-        font-weight: 700;
-        color: #384042;
-        letter-spacing: .02em;
-      }
-      .mpk-sp-instruction {
-        font-size: 13px;
-        color: #9faecb;
-        line-height: 1.5;
-      }
+      .mpk-sp-loc { font-family: var(--mpk-mono); font-size: 26px; font-weight: 500; color: var(--mpk-text); }
+      .mpk-sp-instruction { font-size: 14px; color: var(--mpk-muted); line-height: 1.5; }
       .mpk-sp-scan-zone {
         width: 100%;
-        border: 2px dashed #fabb3d;
-        background: #fffbef;
-        border-radius: 6px;
+        border: 2px dashed var(--mpk-warn-fg);
+        background: var(--mpk-warn-bg);
+        border-radius: var(--mpk-r);
         padding: 14px 16px;
         display: flex;
         flex-direction: column;
@@ -2062,44 +2345,37 @@
         position: relative;
       }
       .mpk-sp-scan-label {
-        font-size: 10px;
+        font-size: 13px;
         font-weight: 700;
-        color: #ba8a00;
+        color: var(--mpk-warn-fg);
         text-transform: uppercase;
         letter-spacing: .1em;
       }
-      .mpk-sp-arrows {
-        font-size: 20px;
-        color: #f0d080;
-        letter-spacing: 4px;
-      }
+      .mpk-sp-arrows { font-size: 20px; color: var(--mpk-warn-fg); opacity: .5; letter-spacing: 4px; }
       .mpk-sp-feedback {
-        font-size: 12px;
+        font-size: 14px;
         font-weight: 600;
-        min-height: 18px;
+        min-height: 30px;
+        padding: 5px 14px;
+        border-radius: 999px;
         text-align: center;
       }
-      .mpk-sp-feedback.ok  { color: #79c447; }
-      .mpk-sp-feedback.err { color: #ff5454; }
-      .mpk-sp-feedback.dim { color: #9faecb; }
+      .mpk-sp-feedback.ok  { color: var(--mpk-ok-fg);   background: var(--mpk-ok-bg); }
+      .mpk-sp-feedback.err { color: var(--mpk-crit-fg); background: var(--mpk-crit-bg); }
+      .mpk-sp-feedback.dim { color: var(--mpk-muted); }
 
-      /* -- Reason select list -- */
-      .mpk-reason-list {
-        width: 100%;
-        display: flex;
-        flex-direction: column;
-        gap: 8px;
-      }
+      .mpk-reason-list { width: 100%; display: flex; flex-direction: column; gap: 8px; }
       .mpk-reason-btn {
         width: 100%;
         min-height: 52px;
         padding: 12px 16px;
-        background: #f9f9fa;
-        border: 1px solid #e1e6ef;
-        border-radius: 0;
-        font-size: 14px;
-        font-weight: 500;
-        color: #384042;
+        background: var(--mpk-surface);
+        border: 1px solid var(--mpk-border-strong);
+        border-radius: var(--mpk-r);
+        font-family: var(--mpk-font);
+        font-size: 15px;
+        font-weight: 600;
+        color: var(--mpk-text);
         text-align: left;
         cursor: pointer;
         display: flex;
@@ -2109,70 +2385,92 @@
         touch-action: manipulation;
         transition: background .1s, border-color .1s;
       }
-      .mpk-reason-btn:active { background: #e8f4fc; border-color: #20a8d8; }
-      .mpk-reason-btn .mpk-reason-icon { font-size: 18px; flex-shrink: 0; }
+      .mpk-reason-btn:active { background: var(--mpk-brand-subtle); border-color: var(--mpk-brand); }
+      .mpk-reason-btn:disabled { opacity: .5; }
+      .mpk-reason-btn .mpk-reason-icon { font-size: 14px; flex-shrink: 0; color: var(--mpk-warn-fg); font-weight: 700; }
 
       /* -- Bottom action bar -- */
+      /* -- Last scanned strip (4.18.0, compact 4.18.1) -- */
+      .mpk-last {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 3px 12px;
+        min-height: 32px;
+        background: var(--mpk-subtle);
+        border-top: 1px solid var(--mpk-border);
+        font-family: var(--mpk-font);
+        color: var(--mpk-text);
+        flex-shrink: 0;
+        pointer-events: none;            /* a reminder, not a control */
+      }
+      .mpk-last-qty { display: flex; flex-direction: column; align-items: center; line-height: 1; flex-shrink: 0; min-width: 32px; }
+      .mpk-last-qty b { font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; }
+      .mpk-last-qty small { font-size: 9px; font-weight: 600; color: var(--mpk-muted); text-transform: uppercase; letter-spacing: .04em; margin-top: 1px; }
+      .mpk-last-what { display: flex; align-items: baseline; gap: 6px; min-width: 0; flex: 1; overflow: hidden; }
+      .mpk-last-what .mpk-mono { font-size: 12px; font-weight: 500; white-space: nowrap; flex-shrink: 0; }
+      .mpk-last-desc { font-size: 11px; color: var(--mpk-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .mpk-last-tote {
+        display: inline-flex; align-items: center; gap: 4px;
+        flex-shrink: 0;
+        padding: 2px 6px;
+        border-radius: var(--mpk-r-sm);
+        border: 1px solid var(--mpk-border-strong);
+        background: var(--mpk-surface);
+        font-size: 12px;
+        font-weight: 600;
+      }
+      .mpk-last-tote.coloured { background: var(--cart-bg); color: var(--cart-fg); border-color: rgb(20 21 63 / 0.18); }
+      .mpk-last-pos { font-weight: 800; }
+      .mpk-last-k {
+        flex-shrink: 0;
+        font-size: 9px; line-height: 1.15; font-weight: 700;
+        letter-spacing: .06em; text-transform: uppercase; text-align: right;
+        color: var(--mpk-muted);
+      }
+      .mpk-last-time { font-family: var(--mpk-mono); font-weight: 500; letter-spacing: 0; font-size: 10px; font-variant-numeric: tabular-nums; }
       .mpk-pick-actions {
         display: flex;
         gap: 8px;
-        padding: 8px 16px 10px;
+        padding: 8px 12px 10px;
         flex-shrink: 0;
-        border-top: 1px solid #e1e6ef;
-        background: #fff;
+        border-top: 1px solid var(--mpk-border);
+        background: var(--mpk-surface);
       }
-      .mpk-pick-actions .mpk-btn {
-        flex: 1;
-        min-height: 44px;
-        font-size: 13px;
-        padding: 0 8px;
-      }
-
-      /* == END FRAGMENT 3 =================================================== */
+      .mpk-pick-actions .mpk-btn { flex: 1; min-height: 48px; font-size: 14px; padding: 0 8px; }
 
       /* -- Loading spinner -- */
       .mpk-spinner {
         display: inline-block;
         width: 20px;
         height: 20px;
-        border: 2px solid #e1e6ef;
-        border-top-color: #20a8d8;
+        border: 2px solid var(--mpk-border);
+        border-top-color: var(--mpk-brand);
         border-radius: 50%;
         animation: mpk-spin .7s linear infinite;
         flex-shrink: 0;
       }
-      @keyframes mpk-spin {
-        to { transform: rotate(360deg); }
-      }
+      @keyframes mpk-spin { to { transform: rotate(360deg); } }
       .mpk-loading {
         display: flex;
         align-items: center;
         justify-content: center;
         gap: 10px;
         padding: 24px;
-        color: #9faecb;
-        font-size: 13px;
+        color: var(--mpk-muted);
+        font-size: 14px;
       }
 
-      /* -- Fragment 2: Profile select screen -- */
-      .mpk-screen {
-        flex: 1;
-        min-height: 0;
-        display: flex;
-        flex-direction: column;
-        overflow: hidden;
-      }
-
+      /* -- Generic screens (profile select, summary, complete) -- */
+      .mpk-screen { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
       .mpk-screen-header {
-        padding: 16px 16px 8px;
-        font-size: 11px;
-        font-weight: 600;
-        letter-spacing: .08em;
-        text-transform: uppercase;
-        color: #9faecb;
+        padding: 16px 16px 10px;
+        font-size: 20px;
+        font-weight: 700;
+        color: var(--mpk-text);
         flex-shrink: 0;
+        letter-spacing: -.01em;
       }
-
       .mpk-screen-body {
         flex: 1;
         min-height: 0;
@@ -2185,18 +2483,17 @@
         -webkit-overflow-scrolling: touch;
       }
 
-      /* -- Profile select -- */
       .mpk-select {
         display: block;
         width: 100%;
-        min-height: 44px;
-        padding: .5rem .75rem;
+        min-height: 48px;
+        padding: 0 36px 0 12px;
         font-size: 16px;
-        font-family: Roboto, sans-serif;
-        color: #020202;
-        background: #fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%239faecb' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E") no-repeat right 12px center;
-        border: 1px solid #e1e6ef;
-        border-radius: 0;
+        font-family: var(--mpk-font);
+        color: var(--mpk-text);
+        background: var(--mpk-surface) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%235f6372' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E") no-repeat right 12px center;
+        border: 1px solid var(--mpk-border-strong);
+        border-radius: var(--mpk-r);
         outline: none;
         -webkit-appearance: none;
         appearance: none;
@@ -2204,15 +2501,15 @@
         transition: border-color .15s;
         -webkit-tap-highlight-color: transparent;
       }
-      .mpk-select:focus {
-        border-color: #8ad4ee;
-      }
+      .mpk-select:focus { border-color: var(--mpk-focus); box-shadow: 0 0 0 3px rgb(79 124 255 / 0.18); }
 
       /* -- Summary card -- */
       .mpk-summary-card {
-        background: #f9f9fa;
-        border: 1px solid #e1e6ef;
-        padding: 0;
+        background: var(--mpk-surface);
+        border: 1px solid var(--mpk-border);
+        border-radius: var(--mpk-r);
+        box-shadow: var(--mpk-shadow);
+        overflow: hidden;
         flex-shrink: 0;
       }
       .mpk-summary-profile {
@@ -2220,54 +2517,78 @@
         align-items: center;
         gap: 8px;
         padding: 12px 16px;
-        border-bottom: 1px solid #e1e6ef;
-        font-size: 13px;
-        font-weight: 600;
-        color: #394967;
-        text-transform: uppercase;
-        letter-spacing: .05em;
+        border-bottom: 1px solid var(--mpk-border);
+        font-size: 15px;
+        font-weight: 700;
+        color: var(--mpk-text);
       }
       .mpk-summary-profile-dot {
         width: 10px;
         height: 10px;
         border-radius: 50%;
-        background: var(--mpk-profile-color, #20a8d8);
+        background: var(--mpk-profile-color, var(--mpk-brand));
         flex-shrink: 0;
-        box-shadow: 0 0 0 2px rgba(0,0,0,.06);
+        box-shadow: 0 0 0 3px rgb(20 21 63 / 0.06);
       }
-      .mpk-summary-rows {
-        padding: 4px 0;
+      .mpk-summary-hero {
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr;
+        border-bottom: 1px solid var(--mpk-border);
       }
+      .mpk-summary-kpi {
+        padding: 12px 8px;
+        text-align: center;
+        border-right: 1px solid var(--mpk-border);
+      }
+      .mpk-summary-kpi:last-child { border-right: none; }
+      .mpk-summary-kpi-val {
+        font-size: 24px;
+        font-weight: 700;
+        line-height: 1.1;
+        color: var(--mpk-text);
+        font-variant-numeric: tabular-nums;
+        min-height: 27px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .mpk-summary-kpi-lbl {
+        font-size: 11px;
+        font-weight: 600;
+        color: var(--mpk-muted);
+        text-transform: uppercase;
+        letter-spacing: .06em;
+        margin-top: 2px;
+      }
+      .mpk-summary-rows { padding: 2px 0; }
       .mpk-summary-row {
         display: flex;
         align-items: center;
         justify-content: space-between;
-        padding: 8px 16px;
+        padding: 9px 16px;
         font-size: 13px;
-        border-bottom: 1px solid #f0f2f5;
+        border-bottom: 1px solid var(--mpk-border);
+        min-height: 36px;
       }
-      .mpk-summary-row:last-child {
-        border-bottom: none;
-      }
-      .mpk-summary-label {
-        color: #9faecb;
+      .mpk-summary-row:last-child { border-bottom: none; }
+      .mpk-summary-label { color: var(--mpk-muted); font-size: 13px; font-weight: 500; }
+      .mpk-summary-value { font-weight: 600; color: var(--mpk-text); text-align: right; font-size: 14px; }
+      .mpk-summary-value.hi { font-family: var(--mpk-mono); font-size: 18px; font-weight: 500; }
+      .mpk-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        height: 22px;
+        padding: 0 10px;
+        border-radius: 999px;
         font-size: 12px;
-        font-weight: 500;
-        letter-spacing: .02em;
-      }
-      .mpk-summary-value {
         font-weight: 600;
-        color: #384042;
-        text-align: right;
-        font-size: 13px;
+        background: var(--mpk-info-bg);
+        color: var(--mpk-info-fg);
       }
-      .mpk-summary-value.hi {
-        color: var(--mpk-profile-color, #20a8d8);
-        font-size: 16px;
-        font-weight: 700;
-      }
+      .mpk-badge.warn { background: var(--mpk-warn-bg); color: var(--mpk-warn-fg); }
 
-      /* -- Empty queue state -- */
+      /* -- Empty / complete states -- */
       .mpk-empty-queue {
         display: flex;
         flex-direction: column;
@@ -2276,72 +2597,369 @@
         gap: 8px;
         padding: 32px 16px;
         text-align: center;
-        color: #9faecb;
+        color: var(--mpk-muted);
         flex-shrink: 0;
       }
       .mpk-empty-queue-icon {
-        font-size: 36px;
-        line-height: 1;
+        width: 56px; height: 56px;
+        border-radius: 50%;
+        display: flex; align-items: center; justify-content: center;
+        background: var(--mpk-sunken);
+        color: var(--mpk-muted);
+        font-size: 22px;
+        font-weight: 700;
       }
-      .mpk-empty-queue-title {
-        font-size: 15px;
-        font-weight: 500;
-        color: #384042;
-      }
-      .mpk-empty-queue-sub {
-        font-size: 12px;
-        color: #9faecb;
-      }
+      .mpk-empty-queue-icon.ok { background: var(--mpk-ok-bg); color: var(--mpk-ok-fg); }
+      .mpk-empty-queue-title { font-size: 17px; font-weight: 700; color: var(--mpk-text); }
+      .mpk-empty-queue-sub { font-size: 13px; color: var(--mpk-muted); }
 
-      /* -- Button stack at bottom -- */
       .mpk-btn-stack {
         display: flex;
         flex-direction: column;
         gap: 8px;
-        padding: 8px 16px 12px;
-        flex-shrink: 0;      /* never shrinks - always visible at bottom */
-        border-top: 1px solid #e1e6ef;
-        background: #fff;    /* ensure it isn't obscured by scrolling content */
+        padding: 10px 16px 12px;
+        flex-shrink: 0;
+        border-top: 1px solid var(--mpk-border);
+        background: var(--mpk-surface);
       }
 
-      /* -- Job number input (initiation_method=2 profiles) -- */
-      .mpk-jobnum-hint {
-        font-size: 12px;
-        color: #9faecb;
-        margin-top: 4px;
-        line-height: 1.4;
-      }
+      .mpk-jobnum-hint { font-size: 13px; color: var(--mpk-muted); margin-top: 2px; line-height: 1.4; }
       .mpk-profile-badge {
+        align-self: flex-start;
         display: inline-flex;
         align-items: center;
         gap: 6px;
-        padding: 6px 10px;
-        background: #f0f8fd;
-        border: 1px solid #b8e4f5;
+        height: 24px;
+        padding: 0 10px;
+        background: var(--mpk-brand-subtle);
+        border-radius: 999px;
         font-size: 12px;
-        color: #20a8d8;
-        font-weight: 500;
+        color: var(--mpk-brand-on-subtle);
+        font-weight: 600;
         flex-shrink: 0;
       }
-      .mpk-profile-badge-dot {
-        width: 6px;
-        height: 6px;
-        border-radius: 50%;
-        background: #20a8d8;
+      .mpk-profile-badge-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--mpk-brand); flex-shrink: 0; }
+
+      .mpk-error-banner {
+        padding: 10px 14px;
+        background: var(--mpk-crit-bg);
+        color: var(--mpk-crit-fg);
+        font-size: 13px;
+        font-weight: 600;
+        border-radius: var(--mpk-r);
         flex-shrink: 0;
       }
 
-      /* -- Error banner -- */
-      .mpk-error-banner {
-        margin: 0 16px;
-        padding: 10px 14px;
-        background: #fff5f5;
-        border: 1px solid #ffcdd2;
-        color: #c62828;
-        font-size: 13px;
-        border-radius: 0;
+      /* -- Full-panel blocking overlays (session expired, resume) -- */
+      .mpk-block-overlay {
+        position: absolute;
+        inset: 0;
+        z-index: 9999;
+        background: rgb(20 21 63 / 0.92);
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+        gap: 12px;
+        text-align: center;
+        font-family: var(--mpk-font);
+        color: #fff;
+      }
+      .mpk-block-overlay .mpk-bo-kicker {
+        font-size: 12px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase;
+        color: #f5836a;
+      }
+      .mpk-block-overlay .mpk-bo-title { font-size: 20px; font-weight: 700; }
+      .mpk-block-overlay .mpk-bo-text { font-size: 14px; color: rgb(255 255 255 / 0.78); line-height: 1.5; }
+      .mpk-block-overlay .mpk-btn-secondary { background: transparent; color: #fff; border-color: rgb(255 255 255 / 0.3); }
+
+      /* -- Queue list on the profile screen (4.15.0) -- */
+      .mpk-q-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+      .mpk-q-updated { font-size: 12px; color: var(--mpk-muted); }
+      .mpk-q-list {
+        display: flex;
+        flex-direction: column;
+        background: var(--mpk-surface);
+        border: 1px solid var(--mpk-border);
+        border-radius: var(--mpk-r);
+        box-shadow: var(--mpk-shadow);
+        overflow: hidden;
         flex-shrink: 0;
       }
+      .mpk-q-row {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        width: 100%;
+        min-height: 60px;
+        padding: 10px 14px;
+        background: var(--mpk-surface);
+        border: none;
+        border-bottom: 1px solid var(--mpk-border);
+        border-left: 4px solid transparent;
+        text-align: left;
+        font-family: var(--mpk-font);
+        color: var(--mpk-text);
+        cursor: pointer;
+        -webkit-tap-highlight-color: transparent;
+        touch-action: manipulation;
+      }
+      .mpk-q-row:last-child { border-bottom: none; }
+      .mpk-q-row:active { background: var(--mpk-hover); }
+      .mpk-q-row.selected { background: var(--mpk-brand-subtle); border-left-color: var(--mpk-brand); }
+      .mpk-q-row.empty .mpk-q-name { color: var(--mpk-muted); }
+      .mpk-q-row.empty { background: var(--mpk-subtle); }
+      .mpk-q-row.first-idle { border-top: 6px solid var(--mpk-bg); }
+      .mpk-q-dot {
+        width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
+        background: var(--mpk-profile-color, var(--mpk-brand));
+      }
+      .mpk-q-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+      .mpk-q-name { font-size: 15px; font-weight: 600; line-height: 1.25; }
+      .mpk-q-meta { font-size: 13px; color: var(--mpk-muted); min-height: 16px; font-variant-numeric: tabular-nums; }
+      .mpk-q-track {
+        display: block;
+        height: 4px;
+        border-radius: 999px;
+        background: var(--mpk-sunken);
+        overflow: hidden;
+      }
+      .mpk-q-fill {
+        display: block;
+        height: 100%;
+        width: 0;
+        background: var(--mpk-ok-fg);
+        border-radius: 999px;
+        transition: width .4s var(--mpk-ease);
+      }
+      .mpk-q-pct {
+        min-width: 44px;
+        text-align: right;
+        font-size: 16px;
+        font-weight: 700;
+        font-variant-numeric: tabular-nums;
+        color: var(--mpk-text);
+      }
+
+      /* -- Cart positions (4.17.0) -- */
+      .mpk-cart-overlay {
+        position: absolute;
+        inset: 0;
+        z-index: 120;
+        background: rgb(20 21 63 / 0.35);
+        display: flex;
+        align-items: flex-end;
+        -webkit-tap-highlight-color: transparent;
+      }
+      .mpk-cart-card {
+        position: relative;
+        width: 100%;
+        max-height: 92%;
+        display: flex;
+        flex-direction: column;
+        background: var(--mpk-surface);
+        border-radius: 12px 12px 0 0;
+        box-shadow: var(--mpk-pop-shadow);
+        padding: 12px 12px 10px;
+        gap: 10px;
+        overflow: hidden;
+      }
+      .mpk-cart-head, .mpk-cart-detail-head { display: flex; align-items: center; gap: 8px; }
+      .mpk-cart-title { font-size: 17px; font-weight: 700; color: var(--mpk-text); }
+      .mpk-cart-sub { font-size: 13px; color: var(--mpk-muted); flex: 1; }
+      .mpk-cart-x {
+        min-width: 44px; min-height: 44px;
+        border: 1px solid var(--mpk-border);
+        border-radius: var(--mpk-r);
+        background: var(--mpk-subtle);
+        color: var(--mpk-text);
+        font-size: 18px;
+        font-weight: 700;
+        cursor: pointer;
+        -webkit-tap-highlight-color: transparent;
+      }
+      .mpk-cart-grid {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 6px;
+        overflow-y: auto;
+        -webkit-overflow-scrolling: touch;
+      }
+      .mpk-cart-cell {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 1px;
+        min-height: 64px;
+        padding: 6px 4px;
+        border: 1px solid var(--mpk-border);
+        border-radius: var(--mpk-r);
+        background: var(--mpk-subtle);
+        color: var(--mpk-faint);
+        font-family: var(--mpk-font);
+        cursor: default;
+        -webkit-tap-highlight-color: transparent;
+        touch-action: manipulation;
+      }
+      .mpk-cart-cell.has {
+        background: var(--mpk-surface);
+        border-color: var(--mpk-border-strong);
+        color: var(--mpk-text);
+        cursor: pointer;
+      }
+      .mpk-cart-cell.has:active { background: var(--mpk-hover); }
+      .mpk-cart-cell.current { border: 2px solid var(--mpk-brand); background: var(--mpk-brand-subtle); }
+      /* Tote colour fills (4.17.1) */
+      .mpk-cart-cell.coloured { background: var(--cart-bg); color: var(--cart-fg); border-color: rgb(20 21 63 / 0.18); }
+      .mpk-cart-cell.coloured .mpk-cart-pos,
+      .mpk-cart-cell.coloured .mpk-cart-count { color: var(--cart-fg); }
+      .mpk-cart-cell.coloured .mpk-cart-count { opacity: .85; }
+      .mpk-cart-cell.tote-white { border-color: var(--mpk-border-strong); }
+      .mpk-cart-cell.coloured:active { filter: brightness(.92); }
+      /* "This pick" on a coloured cell: a navy ring + offset, readable on every fill */
+      .mpk-cart-cell.coloured.current {
+        background: var(--cart-bg);
+        border: 2px solid #ffffff;
+        box-shadow: 0 0 0 3px var(--mpk-navy);
+      }
+      .mpk-cart-chip {
+        width: 16px; height: 16px; border-radius: 4px; flex-shrink: 0;
+        background: var(--cart-bg);
+        box-shadow: inset 0 0 0 1px rgb(20 21 63 / 0.25);
+      }
+      .mpk-cart-pos { font-size: 18px; font-weight: 700; line-height: 1.1; }
+      .mpk-cart-cell:not(.has) .mpk-cart-pos { color: var(--mpk-muted); }
+      .mpk-cart-tote { font-size: 12px; font-weight: 500; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .mpk-cart-count { font-size: 11px; color: var(--mpk-muted); min-height: 13px; }
+      .mpk-cart-foot { font-size: 12px; color: var(--mpk-muted); text-align: center; }
+      .mpk-cart-empty { padding: 24px 8px; text-align: center; color: var(--mpk-muted); font-size: 14px; }
+      /* Tote contents slide over the grid inside the same card */
+      .mpk-cart-detail {
+        position: absolute;
+        inset: 0;
+        display: none;
+        flex-direction: column;
+        gap: 10px;
+        padding: 12px 12px 10px;
+        background: var(--mpk-surface);
+        border-radius: 12px 12px 0 0;
+      }
+      .mpk-cart-detail.open { display: flex; }
+      .mpk-cart-items { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+      .mpk-cart-item {
+        display: grid;
+        grid-template-columns: 40px minmax(0, auto) minmax(0, 1fr);
+        align-items: baseline;
+        gap: 10px;
+        padding: 5px 4px;
+        border-bottom: 1px solid var(--mpk-border);
+        font-size: 13px;
+      }
+      .mpk-cart-item.head {
+        font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
+        color: var(--mpk-muted);
+        padding-top: 0;
+      }
+      .mpk-cart-qty { font-weight: 700; text-align: right; font-variant-numeric: tabular-nums; }
+      .mpk-cart-item:not(.head) .mpk-cart-qty { font-size: 15px; }
+      .mpk-cart-sku { font-size: 12px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .mpk-cart-desc { color: var(--mpk-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .mpk-cart-detail { gap: 6px; padding: 10px 12px 8px; }
+      .mpk-cart-detail .mpk-cart-x { min-width: 40px; min-height: 40px; }
+
+      /* == BUSY LOCK (v4.14.0, card + progress bar 4.14.2) ================
+         Covers the whole panel - scan zone, Back, Short Pick - while
+         Canary7 is moving stock. Same shape as the portal's modal: navy
+         scrim, white card, coral accent. Repeat scans land on the hidden
+         input underneath and are swallowed. */
+      #mpk-busy {
+        position: absolute;
+        inset: 0;
+        z-index: 9000;
+        background: rgb(20 21 63 / 0.72);
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 12px;
+        padding: 20px 16px;
+        font-family: var(--mpk-font);
+        -webkit-tap-highlight-color: transparent;
+      }
+      #mpk-busy .mpk-busy-card {
+        width: 100%;
+        max-width: 380px;
+        background: var(--mpk-surface);
+        border-radius: var(--mpk-r);
+        box-shadow: var(--mpk-pop-shadow);
+        padding: 24px 20px 20px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        text-align: center;
+        gap: 8px;
+        color: var(--mpk-text);
+      }
+      #mpk-busy .mpk-busy-spin {
+        width: 44px; height: 44px;
+        border: 4px solid var(--mpk-brand-subtle);
+        border-top-color: var(--mpk-brand);
+        border-radius: 50%;
+        animation: mpk-spin .8s linear infinite;
+        margin-bottom: 4px;
+      }
+      #mpk-busy .mpk-busy-title { font-size: 20px; font-weight: 700; line-height: 1.25; letter-spacing: -.01em; }
+      #mpk-busy .mpk-busy-detail { font-size: 15px; font-weight: 500; color: var(--mpk-muted); }
+      #mpk-busy .mpk-busy-wait { font-size: 15px; color: var(--mpk-muted); font-weight: 500; }
+      #mpk-busy .mpk-busy-track {
+        width: 100%;
+        height: 10px;
+        margin-top: 10px;
+        border-radius: 999px;
+        background: var(--mpk-sunken);
+        overflow: hidden;
+        position: relative;
+      }
+      #mpk-busy .mpk-busy-fill {
+        height: 100%;
+        width: 0;
+        border-radius: 999px;
+        background: var(--mpk-brand);
+        transition: width .2s linear;
+      }
+      /* No estimate (e.g. checking with Canary7): a sliding bar, never a
+         fake percentage. */
+      #mpk-busy .mpk-busy-track.indeterminate .mpk-busy-fill {
+        width: 35%;
+        position: absolute;
+        left: -35%;
+        animation: mpk-slide 1.2s var(--mpk-ease) infinite;
+      }
+      @keyframes mpk-slide { to { left: 100%; } }
+      #mpk-busy .mpk-busy-meta {
+        width: 100%;
+        min-height: 22px;
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 8px;
+      }
+      #mpk-busy .mpk-busy-pct {
+        font-size: 18px;
+        font-weight: 700;
+        color: var(--mpk-text);
+        font-variant-numeric: tabular-nums;
+      }
+      #mpk-busy .mpk-busy-left {
+        font-size: 13px;
+        color: var(--mpk-muted);
+        font-variant-numeric: tabular-nums;
+      }
+      #mpk-busy .mpk-busy-actions { display: none; width: 100%; max-width: 380px; flex-direction: column; gap: 8px; }
+      #mpk-busy .mpk-busy-actions.show { display: flex; }
+      #mpk-busy .mpk-btn-secondary { background: var(--mpk-surface); }
     `;
     document.head.appendChild(style);
   }
@@ -2650,19 +3268,81 @@
 
   // Fetch all instructions for a job using the standard REST list endpoint.
   // Requires job_id - call after fetchFirstInstruction() has set State.jobId.
+  //
+  // v4.14.0 - this is the call the summary's spinners wait on, so it is cut
+  // to the four columns the summary actually reads. Probed read-only
+  // 2026-11-27: `job_id` binds on this route and `fields=` is honoured
+  // (an unsupported dotted path in fields= 403s the whole call - keep these
+  // plain columns). Before this it expanded item.company + status on every
+  // row for a barcodeMap nothing ever read.
+  //
+  // Also no longer silently capped: 4.13 asked for 200 rows and took page 1,
+  // so a big SIBP/MIBP job under-counted. Page 1 asks for 400 (C7's own cap)
+  // and any further pages named by x-pagination-page-count are read in turn.
+  const _SUMMARY_FIELDS = 'id,reference_number,quantity,job_instruction_group_id';
+
+  // 4.16.0 - the same four columns straight from the Canary7 database via the
+  // LAN canary7-proxy (Metabase card 1146, job_instruction.job_id index):
+  // ~1s instead of the API's 6-8s. Null on any failure or an empty answer
+  // (e.g. a brand-new job not visible to Metabase yet) -> the caller falls
+  // back to the API list, so the summary is never worse than before.
+  const JOB_INSTR_URL = 'http://192.168.1.27:8790/job-instructions?job_id=';
+  function fetchJobInstructionsFast(jobId) {
+    return new Promise((resolve) => {
+      try {
+        if (typeof GM_xmlhttpRequest !== 'function' || !/^\d+$/.test(String(jobId))) { resolve(null); return; }
+        GM_xmlhttpRequest({
+          method: 'GET',
+          url: JOB_INSTR_URL + encodeURIComponent(String(jobId)),
+          timeout: 5000,
+          onload: (r) => {
+            try {
+              const j = JSON.parse(r.responseText);
+              resolve(j && j.ok && Array.isArray(j.rows) && j.rows.length ? j.rows : null);
+            } catch (_) { resolve(null); }
+          },
+          onerror: () => resolve(null),
+          ontimeout: () => resolve(null),
+        });
+      } catch (_) { resolve(null); }
+    });
+  }
+
   async function fetchJobInstructions(jobId) {
-    const EXPAND = encodeURIComponent('item.company,status');
+    const fast = await fetchJobInstructionsFast(jobId);
+    if (fast) return fast;
+    const base = `job/job-instruction&job_id=${jobId}&per-page=400` +
+                 `&fields=${encodeURIComponent(_SUMMARY_FIELDS)}`;
+    const asArr = (d) => Array.isArray(d) ? d : (d && Array.isArray(d.items) ? d.items : []);
     try {
-      const data = await apiGet(
-        `job/job-instruction&job_id=${jobId}&per-page=200&page=1&expand=${EXPAND}`
-      );
-      if (Array.isArray(data)) return data;
-      if (data && Array.isArray(data.items)) return data.items;
-      return [];
+      const first = await apiGet(base + '&page=1', { withMeta: true });
+      let all = asArr(first.data);
+      const pages = Math.min(first.pageCount || 1, 10);     // 4,000 rows is plenty
+      for (let p = 2; p <= pages; p++) {
+        // Sequential on purpose - see canary7-config measured facts (502s seen
+        // on concurrent calls from one login).
+        const next = await apiGet(`${base}&page=${p}`);
+        all = all.concat(asArr(next));
+      }
+      // Past the last page C7 re-serves the last page - dedupe by id.
+      const seen = new Set();
+      return all.filter(i => i && !seen.has(i.id) && seen.add(i.id));
     } catch (e) {
       console.warn('[MalpaPick] fetchJobInstructions failed:', e.message);
       return [];
     }
+  }
+
+  /** Distinct pick actions: a whole group is ONE pick. */
+  function countPickActions(all) {
+    const seen = new Set();
+    let n = 0;
+    for (const i of all) {
+      if (i.job_instruction_group_id) {
+        if (!seen.has(i.job_instruction_group_id)) { seen.add(i.job_instruction_group_id); n++; }
+      } else { n++; }
+    }
+    return n;
   }
 
   async function fetchFirstInstruction(profileId, jobNum) {
@@ -2689,7 +3369,136 @@
     return instr;
   }
 
+  // ---------------------------------------------------------------------------
+  // QUEUE PROGRESS (4.15.0) - "how many shipments are left in each queue".
+  //
+  // Canary7's API cannot answer this quickly (jobs have no status; one job's
+  // instruction list takes 6-8s). The canary7-proxy on the LAN serves it from
+  // Metabase card 1145, cached ~60s and shared by every device:
+  //   GET http://192.168.1.27:8790/pick-queues
+  //   -> { ok, as_of, age_s, stale, queues: { "<profile_id>":
+  //        { remaining, picked_today, pct } } }
+  // Counted in JOB INSTRUCTIONS (4.15.1):
+  // remaining    = open (status 1/2) instructions in the profile's job types,
+  //                on shipments still in Pick Pending
+  // picked_today = instructions in those job types completed today (Brisbane)
+  // pct          = picked_today / (picked_today + remaining); null when both 0
+  //
+  // Purely informational: if the proxy is down the list simply shows no
+  // numbers. Nothing on this screen waits for it.
+  // ---------------------------------------------------------------------------
+  const QUEUES_URL = 'http://192.168.1.27:8790/pick-queues';
+  const QUEUES_CLIENT_TTL = 30000;
+  const _queues = { at: 0, data: null, inflight: null };
+
+  function loadQueueStats(force) {
+    if (!force && _queues.data && Date.now() - _queues.at < QUEUES_CLIENT_TTL) {
+      return Promise.resolve(_queues.data);
+    }
+    if (_queues.inflight) return _queues.inflight;
+    _queues.inflight = new Promise((resolve) => {
+      try {
+        if (typeof GM_xmlhttpRequest !== 'function') { resolve(null); return; }
+        GM_xmlhttpRequest({
+          method: 'GET',
+          url: QUEUES_URL,
+          timeout: 8000,
+          onload: (r) => {
+            try {
+              const j = JSON.parse(r.responseText);
+              if (j && j.ok && j.queues) { _queues.data = j; _queues.at = Date.now(); resolve(j); }
+              else resolve(_queues.data);
+            } catch (_) { resolve(_queues.data); }
+          },
+          onerror:   () => resolve(_queues.data),
+          ontimeout: () => resolve(_queues.data),
+        });
+      } catch (_) { resolve(_queues.data); }
+    }).finally(() => { _queues.inflight = null; });
+    return _queues.inflight;
+  }
+
+  /**
+   * Queue order (4.15.1): queues with work left first, then queues with
+   * nothing left (empty or 100% done) - each group A-Z by name. Before the
+   * counts arrive everything counts as "has work", so the list starts A-Z.
+   */
+  function orderProfiles(profiles, stats) {
+    const q = stats && stats.queues;
+    const hasWork = (p) => {
+      if (!q) return true;
+      const s = q[String(p.id)];
+      return !!(s && s.remaining > 0);
+    };
+    return profiles.slice().sort((a, b) => {
+      const wa = hasWork(a), wb = hasWork(b);
+      if (wa !== wb) return wa ? -1 : 1;
+      return String(a.name || '').localeCompare(String(b.name || ''), undefined, { sensitivity: 'base', numeric: true });
+    });
+  }
+
+  function _plural(n, word) { return n === 1 ? word : word + 's'; }
+
+  function _fmtInt(n) {
+    return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  }
+
+  /** Paint the numbers into rows already on screen (no re-render, keeps selection). */
+  function paintQueueStats(stats) {
+    if (State.screen !== 'PROFILE_SELECT') return;
+    const q = stats && stats.queues;
+    for (const p of State.profiles) {
+      const row = document.getElementById('mpk-q-' + p.id);
+      if (!row) continue;
+      const s = q && q[String(p.id)];
+      const meta = document.getElementById('mpk-q-meta-' + p.id);
+      const fill = document.getElementById('mpk-q-fill-' + p.id);
+      const pct  = document.getElementById('mpk-q-pct-' + p.id);
+      if (!s) {
+        if (meta) meta.textContent = q ? 'Nothing to pick' : '';
+        if (pct) pct.textContent = '';
+        if (fill) fill.style.width = '0%';
+        row.classList.toggle('empty', !!q);
+        continue;
+      }
+      row.classList.toggle('empty', !(s.remaining > 0));
+      if (meta) {
+        meta.textContent = s.remaining === 0
+          ? (s.picked_today ? `All picked - ${_fmtInt(s.picked_today)} ${_plural(s.picked_today, 'instruction')} today` : 'Nothing to pick')
+          : `${_fmtInt(s.remaining)} ${s.remaining === 1 ? 'Instruction' : 'Instructions'} to Pick`;
+      }
+      if (pct)  pct.textContent = s.pct == null ? '' : s.pct + '%';
+      if (fill) fill.style.width = (s.pct == null ? 0 : s.pct) + '%';
+    }
+    const list = document.getElementById('mpk-q-list');
+    if (list && q) {
+      let firstIdle = true;
+      for (const p of orderProfiles(State.profiles, stats)) {
+        const row = document.getElementById('mpk-q-' + p.id);
+        if (!row) continue;
+        list.appendChild(row);                       // moves the node
+        const idle = row.classList.contains('empty');
+        row.classList.toggle('first-idle', idle && firstIdle);
+        if (idle) firstIdle = false;
+      }
+    }
+    const upd = document.getElementById('mpk-q-updated');
+    if (upd) {
+      upd.textContent = !q ? 'Queue counts unavailable'
+        : (stats.stale ? 'Counts may be out of date' : 'Updated ' + _ageText(stats.age_s));
+    }
+  }
+
+  function _ageText(s) {
+    s = Number(s) || 0;
+    if (s < 60) return 'just now';
+    return Math.round(s / 60) + ' min ago';
+  }
+
   // -- Screen A: Profile select ------------------------------------------------
+  // 4.15.0: a tappable list (name, shipments left, % picked today) instead of
+  // a <select>, which cannot show numbers or bars. The chosen id lives in a
+  // hidden input so onStartPicking reads R.profileSel.value exactly as before.
 
   function renderProfileSelect(errorMsg) {
     const root = document.getElementById('mpk-root');
@@ -2697,53 +3506,73 @@
     R.root = root;
     setTimeout(measureHeight, 30);
 
-    const profileOptions = State.profiles.length
-      ? '<option value="" disabled selected>-- Select profile --</option>' +
-        State.profiles.map(p =>
-          `<option value="${p.id}">${_esc(p.name)}</option>`
-        ).join('')
-      : '<option value="" disabled>No profiles available</option>';
+    const selId = State.profile ? String(State.profile.id) : '';
+    const rows = orderProfiles(State.profiles, _queues.data).map(p => `
+      <button type="button" class="mpk-q-row${String(p.id) === selId ? ' selected' : ''}"
+              id="mpk-q-${p.id}" data-pid="${p.id}" style="--mpk-profile-color:${profileColour(p)}">
+        <span class="mpk-q-dot"></span>
+        <span class="mpk-q-main">
+          <span class="mpk-q-name">${_esc(p.name)}</span>
+          <span class="mpk-q-meta" id="mpk-q-meta-${p.id}"></span>
+          <span class="mpk-q-track"><span class="mpk-q-fill" id="mpk-q-fill-${p.id}"></span></span>
+        </span>
+        <span class="mpk-q-pct" id="mpk-q-pct-${p.id}"></span>
+      </button>`).join('');
 
     root.innerHTML = `
       <div class="mpk-screen">
         <div class="mpk-screen-header">Malpa Pick</div>
         <div class="mpk-screen-body">
           ${errorMsg ? `<div class="mpk-error-banner">${_esc(errorMsg)}</div>` : ''}
-          <label style="font-size:13px;color:#384042;font-weight:500;margin-bottom:2px;">
-            Select Picking Profile
-          </label>
-          <select id="mpk-profile-sel" class="mpk-select">
-            ${profileOptions}
-          </select>
-          ${State.profiles.length === 0
-            ? '<div class="mpk-empty-queue"><div class="mpk-empty-queue-title">No profiles loaded</div><div class="mpk-empty-queue-sub">Check your connection and try again</div></div>'
-            : ''}
+          ${State.profiles.length
+            ? `<div class="mpk-q-head"><span class="mpk-field-label">Choose a queue</span>
+                 <span class="mpk-q-updated" id="mpk-q-updated"></span></div>
+               <div class="mpk-q-list" id="mpk-q-list">${rows}</div>`
+            : '<div class="mpk-empty-queue"><div class="mpk-empty-queue-title">No profiles loaded</div><div class="mpk-empty-queue-sub">Check your connection and try again</div></div>'}
+          <input type="hidden" id="mpk-profile-sel" value="${_esc(selId)}"/>
         </div>
       </div>
-      <div class="mpk-spacer"></div>
       <div class="mpk-btn-stack">
-        <button id="mpk-start-btn" class="mpk-btn mpk-btn-primary" ${State.profiles.length === 0 ? 'disabled' : ''}>
-          Start Picking
+        <button id="mpk-start-btn" class="mpk-btn mpk-btn-primary" ${selId ? '' : 'disabled'}>
+          Start picking
         </button>
       </div>`;
 
     R.profileSel = document.getElementById('mpk-profile-sel');
     R.startBtn   = document.getElementById('mpk-start-btn');
+    R.startBtn?.addEventListener('click', onStartPicking);
 
-    if (R.startBtn) {
-      R.startBtn.addEventListener('click', onStartPicking);
-    }
-
-    // Pre-select previously chosen profile
-    if (R.profileSel && State.profile) {
-      R.profileSel.value = String(State.profile.id);
-    }
+    document.getElementById('mpk-q-list')?.addEventListener('click', (e) => {
+      const row = e.target && e.target.closest ? e.target.closest('.mpk-q-row') : null;
+      if (!row || _jobLoadInFlight) return;
+      document.querySelectorAll('.mpk-q-row.selected').forEach(r => r.classList.remove('selected'));
+      row.classList.add('selected');
+      if (R.profileSel) R.profileSel.value = row.dataset.pid;
+      if (R.startBtn) R.startBtn.disabled = false;
+    });
 
     State.screen = 'PROFILE_SELECT';
+
+    // Paint whatever we have now, then refresh in the background.
+    if (_queues.data) paintQueueStats(_queues.data);
+    loadQueueStats().then(paintQueueStats);
   }
+
+  // Keep the numbers moving while the picker is choosing (proxy caches, so
+  // this is cheap for Canary7: one shared query a minute at most).
+  setInterval(() => {
+    if (State.screen === 'PROFILE_SELECT' && document.getElementById('mpk-q-list')) {
+      loadQueueStats(true).then(paintQueueStats);
+    }
+  }, 60000);
+
+  // v4.14.0 - get-job-instructions ASSIGNS a job. A double-tap on Start used
+  // to fire it twice; one flag now covers Start and Load Job.
+  let _jobLoadInFlight = false;
 
   async function onStartPicking() {
     if (!R.profileSel) return;
+    if (_jobLoadInFlight) return;
     const profileId = parseInt(R.profileSel.value, 10);
     if (!profileId || isNaN(profileId)) return;
 
@@ -2760,9 +3589,10 @@
     // initiation_method=1: queue-based - fetch next job automatically
     if (R.startBtn) {
       R.startBtn.disabled = true;
-      R.startBtn.textContent = 'Loading?';
+      R.startBtn.innerHTML = '<span class="mpk-spinner" style="width:16px;height:16px;margin-right:8px"></span>Finding your next job...';
     }
 
+    _jobLoadInFlight = true;
     try {
       const instruction = await fetchFirstInstruction(profileId);
       if (!instruction) {
@@ -2775,6 +3605,8 @@
     } catch (err) {
       console.error('[MalpaPick] onStartPicking error:', err.message);
       renderProfileSelect('Failed to load job: ' + err.message);
+    } finally {
+      _jobLoadInFlight = false;
     }
   }
 
@@ -2793,9 +3625,7 @@
             ${_esc(profile.name)}
           </div>
           ${errorMsg ? `<div class="mpk-error-banner">${_esc(errorMsg)}</div>` : ''}
-          <label style="font-size:13px;color:#384042;font-weight:500;margin-bottom:2px;">
-            Shipment Number
-          </label>
+          <label class="mpk-field-label" for="mpk-jobnum-in">Shipment number</label>
           <input
             id="mpk-jobnum-in"
             class="mpk-input"
@@ -2843,9 +3673,16 @@
   }
 
   async function onLoadJobNum(profile, jobNum) {
+    if (_jobLoadInFlight) return;      // a second scan/Enter while loading
+    _jobLoadInFlight = true;
     State._lastJobNum = jobNum;
     const loadBtn = document.getElementById('mpk-load-btn');
-    if (loadBtn) { loadBtn.disabled = true; loadBtn.textContent = 'Loading?'; }
+    if (loadBtn) {
+      loadBtn.disabled = true;
+      loadBtn.innerHTML = '<span class="mpk-spinner" style="width:16px;height:16px;margin-right:8px"></span>Loading job...';
+    }
+    const jobNumIn = document.getElementById('mpk-jobnum-in');
+    if (jobNumIn) jobNumIn.readOnly = true;
 
     try {
       const instruction = await fetchFirstInstruction(profile.id, jobNum);
@@ -2862,6 +3699,8 @@
     } catch (err) {
       console.error('[MalpaPick] onLoadJobNum error:', err.message);
       renderJobNumEntry(profile, 'Failed to load job: ' + err.message);
+    } finally {
+      _jobLoadInFlight = false;
     }
   }
 
@@ -2876,7 +3715,7 @@
         <div class="mpk-screen-header">Malpa Pick</div>
         <div class="mpk-screen-body">
           <div class="mpk-empty-queue">
-            <div class="mpk-empty-queue-icon" style="font-size:28px;font-weight:700;color:#9faecb">[0]</div>
+            <div class="mpk-empty-queue-icon">0</div>
             <div class="mpk-empty-queue-title">No jobs in queue</div>
             <div class="mpk-empty-queue-sub">
               ${_esc(profile ? profile.name : 'This profile')} has no pending jobs
@@ -2920,7 +3759,7 @@
       58: '#c62828', // Priority Cluster - deep red
       59: '#1976d2', // Wholesale Pick Consign - blue
     };
-    return MAP[profile?.id] || '#20a8d8';
+    return MAP[profile?.id] || '#f26247';
   }
 
   function renderJobSummary(summary, instruction, profile) {
@@ -2930,38 +3769,61 @@
     const profileName = profile?.name || '-';
     const colour      = profileColour(profile);
     const startingLocation = instruction?.fromLocation?.location_code || '-';
-    const SPIN        = '<span class="mpk-spinner" style="width:14px;height:14px;border-width:2px;display:inline-block"></span>';
+    const groupId     = instruction?.job_instruction_group_id || null;
+    const sku         = instruction?.item?.item_code || '';
+    const SPIN        = '<span class="mpk-spinner" style="width:16px;height:16px;border-width:2px"></span>';
+    const jobIdAtRender = State.jobId;
 
-    // Render immediately - counts show spinners until background fetch completes
+    // v4.14.0 - start BOTH background reads before painting, so they are
+    // already on the wire while the picker reads the card:
+    //   1. the slimmed instruction list (counts)
+    //   2. the first pick's group record (Accept used to block on this)
+    const listP = State.jobId ? fetchJobInstructions(State.jobId) : Promise.resolve([]);
+    if (groupId) prefetchGroupRecord(groupId);
+    // 4.14.1 - the list above is slow ON CANARY7'S SIDE, whatever we ask for.
+    // Timed 2026-11-27 (job 2077877, read-only): a trivial call ~1.4s round
+    // trip; job-instruction&job_id= ~6.6-7.8s even for ONE row of ONE column,
+    // with or without sort - it is the job_id filter + pagination COUNT over a
+    // 3.3M-row table. get-job-summary (what C7's own pick menu calls) answers
+    // in ~1.4s, so it paints the counts first and the list corrects them.
+    const summaryP = (State.profile && State.jobId)
+      ? fetchJobSummary(State.profile.id).catch(() => null)
+      : Promise.resolve(null);
+    let listLanded = false;
+
+    // Render immediately - counts show spinners until the background fetch lands
     root.innerHTML = `
       <div class="mpk-screen">
-        <div class="mpk-screen-header">Job Summary</div>
+        <div class="mpk-screen-header">Job summary</div>
         <div class="mpk-screen-body">
           <div class="mpk-summary-card" style="--mpk-profile-color:${colour}">
             <div class="mpk-summary-profile">
               <span class="mpk-summary-profile-dot"></span>
               ${_esc(profileName)}
+              ${groupId ? '<span class="mpk-badge warn" style="margin-left:auto">Grouped</span>' : ''}
+            </div>
+            <div class="mpk-summary-hero">
+              <div class="mpk-summary-kpi">
+                <div class="mpk-summary-kpi-val" id="mpk-sum-instructions">${SPIN}</div>
+                <div class="mpk-summary-kpi-lbl">Picks</div>
+              </div>
+              <div class="mpk-summary-kpi">
+                <div class="mpk-summary-kpi-val" id="mpk-sum-shipments">${SPIN}</div>
+                <div class="mpk-summary-kpi-lbl">Shipments</div>
+              </div>
+              <div class="mpk-summary-kpi">
+                <div class="mpk-summary-kpi-val" id="mpk-sum-qty">${SPIN}</div>
+                <div class="mpk-summary-kpi-lbl">Units</div>
+              </div>
             </div>
             <div class="mpk-summary-rows">
               <div class="mpk-summary-row">
-                <span class="mpk-summary-label">Starting location</span>
+                <span class="mpk-summary-label">Start at</span>
                 <span class="mpk-summary-value hi">${_esc(startingLocation)}</span>
               </div>
               <div class="mpk-summary-row">
-                <span class="mpk-summary-label">Job type</span>
-                <span class="mpk-summary-value">${_esc(profileName)}</span>
-              </div>
-              <div class="mpk-summary-row">
-                <span class="mpk-summary-label">Shipments</span>
-                <span class="mpk-summary-value" id="mpk-sum-shipments">${SPIN}</span>
-              </div>
-              <div class="mpk-summary-row">
-                <span class="mpk-summary-label">Instructions</span>
-                <span class="mpk-summary-value" id="mpk-sum-instructions">${SPIN}</span>
-              </div>
-              <div class="mpk-summary-row">
-                <span class="mpk-summary-label">Total quantity</span>
-                <span class="mpk-summary-value" id="mpk-sum-qty">${SPIN}</span>
+                <span class="mpk-summary-label">First pick</span>
+                <span class="mpk-summary-value" id="mpk-sum-first">${groupId ? SPIN : _esc(String(displayQty(instruction)))}${sku ? ` <span class="mpk-mono" style="font-weight:500">${_esc(sku)}</span>` : ''}</span>
               </div>
             </div>
           </div>
@@ -2969,7 +3831,7 @@
       </div>
       <div class="mpk-spacer"></div>
       <div class="mpk-btn-stack">
-        <button id="mpk-accept-btn" class="mpk-btn mpk-btn-primary">Accept Job</button>
+        <button id="mpk-accept-btn" class="mpk-btn mpk-btn-primary">Accept job</button>
         <button id="mpk-back-btn"   class="mpk-btn mpk-btn-secondary">&lt;- Back</button>
       </div>`;
 
@@ -2977,106 +3839,141 @@
     R.backBtn   = document.getElementById('mpk-back-btn');
     R.acceptBtn?.addEventListener('click', onAcceptJob);
     R.backBtn?.addEventListener('click', () => {
+      if (_acceptInFlight) return;
       unassignJob(State.jobId);
       State.jobId = null;
       State.instruction = null;
       State.allInstructions = [];
+      _groupCache.clear();
       renderProfileSelect();
     });
     State.screen = 'JOB_SUMMARY';
 
-    // Fetch counts in background - update cells in-place when ready
-    if (State.jobId) {
-      fetchJobInstructions(State.jobId).then(all => {
-        const upd = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
-        if (!document.getElementById('mpk-sum-shipments')) return; // navigated away
-        if (all.length) {
-          State.allInstructions = all; // cache for Fragment 4 pick loop
-          upd('mpk-sum-shipments', new Set(all.map(i => i.reference_number).filter(Boolean)).size);
-          upd('mpk-sum-qty',       all.reduce((s, i) => s + (i.quantity || 0), 0));
-          // Deduplicate by group_id - each group = 1 pick action
-          const seenGroups = new Set();
-          let pickTotal = 0;
-          for (const i of all) {
-            if (i.job_instruction_group_id) {
-              if (!seenGroups.has(i.job_instruction_group_id)) {
-                seenGroups.add(i.job_instruction_group_id);
-                pickTotal++;
-              }
-            } else {
-              pickTotal++;
-            }
-          }
-          // Show deduplicated count on summary (matches progress bar)
-          upd('mpk-sum-instructions', pickTotal);
-          // Set or update pickProgress -- may already exist if Accept Job fired first
-          if (!State.pickProgress || State.pickProgress.total === '?') {
-            State.pickProgress = { current: State.pickProgress?.current || 1, total: pickTotal };
-          } else {
-            State.pickProgress.total = pickTotal; // correct the total with deduped count
-          }
-          // Update progress bar if pick screen is already showing
-          if (State.screen === 'PICK_ITEM' || State.screen === 'SCAN_CONTAINER') {
-            const txt = document.querySelector('.mpk-loc-progress-text');
-            if (txt) txt.textContent = (State.pickProgress.current) + ' / ' + pickTotal + ' instructions';
-            const fill = document.querySelector('.mpk-progress-fill');
-            if (fill) fill.style.width = Math.round(((State.pickProgress.current-1)/pickTotal)*100) + '%';
-          }
-        } else {
-          ['mpk-sum-shipments','mpk-sum-instructions','mpk-sum-qty'].forEach(id => upd(id, '-'));
-        }
-      }).catch(() => {
-        ['mpk-sum-shipments','mpk-sum-instructions','mpk-sum-qty'].forEach(id => {
-          const el = document.getElementById(id); if (el) el.textContent = '-';
-        });
-      });
+    const stillHere = () => State.jobId === jobIdAtRender &&
+      !!document.getElementById('mpk-sum-shipments');
+    const upd = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+
+    // First-pick quantity for a group comes from the group record, which is
+    // the total across every shipment in the group - the number that matters
+    // when deciding whether this is a 2-unit or a 200-unit pick.
+    if (groupId && _groupCache.get(groupId)) {
+      _groupCache.get(groupId).then(rec => {
+        if (!stillHere()) return;
+        const el = document.getElementById('mpk-sum-first');
+        if (!el) return;
+        const units = rec && rec.units;
+        el.innerHTML = (units ? _esc(String(units)) : '-') +
+          (sku ? ` <span class="mpk-mono" style="font-weight:500">${_esc(sku)}</span>` : '');
+      }).catch(() => { if (stillHere()) upd('mpk-sum-first', '-'); });
     }
+
+    // Fast numbers from get-job-summary. Shipments and Units read straight
+    // across. Picks only when the job is NOT grouped - for SIBP/MIBP C7's
+    // instruction count is one per shipment, not one per group, so that tile
+    // waits for the list rather than show a number that then shrinks.
+    let summaryShown = null;
+    summaryP.then(sum => {
+      if (listLanded || !stillHere() || !sum) return;
+      const ti = Number(sum.total_instructions) || 0;
+      if (ti <= 0) return;                           // nothing for this picker - wait for the list
+      summaryShown = sum;
+      State.summary = sum;
+      upd('mpk-sum-shipments', Number(sum.total_shipments) || 0);
+      upd('mpk-sum-qty',       Number(sum.total_quantity) || 0);
+      if (!groupId) upd('mpk-sum-instructions', ti);
+    });
+
+    listP.then(all => {
+      listLanded = true;
+      if (State.jobId !== jobIdAtRender) return;   // a different job now
+      if (all.length) {
+        State.allInstructions = all;
+        const pickTotal = countPickActions(all);
+        // If get-job-summary painted first, check it agreed with the list. It
+        // could not be confirmed job-scoped offline (the service account has no
+        // assigned job), so a mismatch is logged to the error table, not hidden.
+        if (summaryShown) {
+          const ships = new Set(all.map(i => i.reference_number).filter(Boolean)).size;
+          if (Number(summaryShown.total_shipments) !== ships ||
+              Number(summaryShown.total_instructions) !== all.length) {
+            try {
+              reportPickError(new Error(`get-job-summary disagreed with job list: summary ${summaryShown.total_shipments} ships / ${summaryShown.total_instructions} instr, list ${ships} / ${all.length}`));
+            } catch (_) {}
+          }
+        }
+        // Set or update pickProgress -- may already exist if Accept fired first
+        if (!State.pickProgress || State.pickProgress.total === '?') {
+          State.pickProgress = { current: State.pickProgress?.current || 1, total: pickTotal };
+        } else {
+          State.pickProgress.total = pickTotal;
+        }
+        if (stillHere()) {
+          upd('mpk-sum-shipments', new Set(all.map(i => i.reference_number).filter(Boolean)).size);
+          upd('mpk-sum-qty',       all.reduce((s, i) => s + (Number(i.quantity) || 0), 0));
+          upd('mpk-sum-instructions', pickTotal);
+        }
+        // Update progress bar if the pick screen is already showing
+        if (State.screen === 'PICK_ITEM' || State.screen === 'SCAN_CONTAINER') {
+          const txt = document.querySelector('.mpk-loc-progress-text');
+          if (txt) txt.textContent = State.pickProgress.current + ' / ' + pickTotal + ' picks';
+          const fill = document.querySelector('.mpk-progress-fill');
+          if (fill) fill.style.width = Math.round(((State.pickProgress.current - 1) / pickTotal) * 100) + '%';
+        }
+      } else if (stillHere()) {
+        // List failed or empty: keep whatever get-job-summary painted.
+        const ids = summaryShown ? (groupId ? ['mpk-sum-instructions'] : [])
+                                 : ['mpk-sum-shipments', 'mpk-sum-instructions', 'mpk-sum-qty'];
+        ids.forEach(id => upd(id, '-'));
+      }
+    }).catch(() => {
+      listLanded = true;
+      if (stillHere() && !summaryShown) ['mpk-sum-shipments', 'mpk-sum-instructions', 'mpk-sum-qty'].forEach(id => upd(id, '-'));
+    });
   }
 
+  let _acceptInFlight = false;
+
   async function onAcceptJob() {
-    State.screen = 'PICKING';
-    Audio.init();
+    if (_acceptInFlight) return;            // double-tap on Accept
+    _acceptInFlight = true;
+    try {
+      State.screen = 'PICKING';
+      Audio.init();
 
-    // Build barcode->instruction lookup from cached allInstructions
-    State.barcodeMap = {};
-    for (const instr of State.allInstructions) {
-      const refs = instr.item?.itemUnitOfMeasures?.flatMap(
-        u => u.itemUnitOfMeasureReference?.map(r => r.reference?.toLowerCase()) || []
-      ) || [];
-      if (instr.item?.item_code) refs.push(instr.item.item_code.toLowerCase());
-      for (const ref of refs) {
-        if (ref) State.barcodeMap[ref] = instr;
+      if (R.acceptBtn) {
+        R.acceptBtn.disabled = true;
+        R.acceptBtn.innerHTML = '<span class="mpk-spinner" style="width:16px;height:16px;margin-right:8px"></span>Starting...';
       }
+      if (R.backBtn) R.backBtn.disabled = true;
+
+      // Set progress total -- use allInstructions if available,
+      // fall back to summary.total_instructions, then update when allInstrs resolves
+      if (!State.pickProgress) {
+        const total = State.allInstructions.length > 0
+          ? countPickActions(State.allInstructions)
+          : (typeof State.summary?.total_instructions === 'number'
+              ? State.summary.total_instructions
+              : null);
+        State.pickProgress = { current: 1, total: total || '?' };
+      }
+
+      // Build container prefix list for fast O(1) validation
+      State.containerPrefixes = State.containerTypes
+        .map(ct => (ct.container_number_prefix || '').toUpperCase())
+        .filter(Boolean);
+
+      // Grouped first instruction: normally already resolved by the prefetch
+      // started on the summary screen, so this is instant.
+      await loadGroupRecordIfNeeded(State.instruction);
+
+      // Was the job's last tote move cut off mid-flight (reload, crash)?
+      // Reconcile before a single scan is accepted.
+      if (await reconcileInflightOnEntry()) return;
+
+      renderPickScreen(State.instruction);
+    } finally {
+      _acceptInFlight = false;
     }
-
-    // Set progress total -- use allInstructions if available,
-    // fall back to summary.total_instructions, then update when allInstrs resolves
-    if (!State.pickProgress) {
-      const total = State.allInstructions.length > 0
-        ? (() => {
-            const seen = new Set();
-            let n = 0;
-            for (const i of State.allInstructions) {
-              if (i.job_instruction_group_id) {
-                if (!seen.has(i.job_instruction_group_id)) { seen.add(i.job_instruction_group_id); n++; }
-              } else { n++; }
-            }
-            return n;
-          })()
-        : (typeof State.summary?.total_instructions === 'number'
-            ? State.summary.total_instructions
-            : null);
-      State.pickProgress = { current: 1, total: total || '?' };
-    }
-
-    // Build container prefix list for fast O(1) validation
-    State.containerPrefixes = State.containerTypes
-      .map(ct => (ct.container_number_prefix || '').toUpperCase())
-      .filter(Boolean);
-
-    // If first instruction is grouped, fetch group record before showing pick screen
-    await loadGroupRecordIfNeeded(State.instruction);
-    renderPickScreen(State.instruction);
   }
 
   // -- Utility -----------------------------------------------------------------
@@ -3134,7 +4031,7 @@
       window.speechSynthesis.speak(utt);
     },
 
-    announceInstruction(instruction, prevInstruction) {
+    announceInstruction(instruction, prevInstruction, prefix) {
       if (!instruction) return;
       const loc     = instruction.fromLocation?.location_code || '';
       const qty     = displayQty(instruction);
@@ -3148,7 +4045,7 @@
       const prevLoc = prevInstruction?.fromLocation?.location_code || '';
       const locSpoken = _formatLocForSpeech(loc, prevLoc);
       // Just location, quantity and item -- no filler words
-      this.speak(`Go to ${locSpoken}. Pick ${qty}${uomStr} ${desc}`);
+      this.speak(`${prefix ? prefix + '. ' : ''}Go to ${locSpoken}. Pick ${qty}${uomStr} ${desc}`);
     },
 
     announcePosition(positionId) {
@@ -3233,6 +4130,21 @@
         this._tone(180, 0.08, 'square', 0.3, 0.00);
         this._tone(180, 0.08, 'square', 0.3, 0.12);
 
+      } else if (type === 'blocked') {
+        // v4.14.0 - one long low tone: "not now", distinct from the
+        // double-buzz "wrong" so a picker can tell the two apart by ear.
+        if (!this._ctx) return;
+        if (this._ctx.state === 'suspended') this._ctx.resume();
+        this._tone(140, 0.45, 'square', 0.28, 0);
+
+      } else if (type === 'nudge') {
+        // v4.14.0 - soft two-note "you're on the wrong step" (item already
+        // scanned, now scan the tote). Not an error, not a success.
+        if (!this._ctx) return;
+        if (this._ctx.state === 'suspended') this._ctx.resume();
+        this._tone(520, 0.10, 'triangle', 0.3, 0);
+        this._tone(520, 0.10, 'triangle', 0.3, 0.16);
+
       } else if (type === 'error_donkey') {
         // Donkey sound - reserved for short-pick (Fragment 8)
         if (_DONKEY_B64) {
@@ -3257,7 +4169,9 @@
   }
 
   // -- Pick screen ---------------------------------------------------------------
-  function renderPickScreen(instruction) {
+  // prevInstr / donePos (v4.14.0): one combined announcement after a pick -
+  // 4.13 queued two or three overlapping speak() calls that cancelled each other.
+  function renderPickScreen(instruction, prevInstr, donePos) {
     const root = document.getElementById('mpk-root');
     if (!root) return;
     State.screen = 'PICK_ITEM';
@@ -3283,12 +4197,12 @@
           <div class="mpk-loc-header-top">
             <span class="mpk-loc-label">Location</span>
             <div style="display:flex;align-items:center;gap:6px">
-              <span class="mpk-loc-progress-text">${progCurrent} / ${progTotal} instructions</span>
+              <span class="mpk-loc-progress-text">${progCurrent} / ${progTotal} picks</span>
               <button class="mpk-voice-toggle${State.voiceEnabled ? '' : ' muted'}" id="mpk-voice-btn" title="Toggle voice" aria-label="Toggle voice">${State.voiceEnabled ? '\uD83D\uDD0A' : '\uD83D\uDD07'}</button>
             </div>
           </div>
           <div class="mpk-loc-code">${_esc(loc)}</div>
-          ${shipNum ? `<div style="font-size:10px;color:rgba(255,255,255,.7);font-weight:500;margin-top:2px;letter-spacing:.02em">Shipment: ${_esc(shipNum)}</div>` : ''}
+          ${shipNum ? `<div class="mpk-loc-ship">Shipment ${_esc(shipNum)}</div>` : ''}
           <div class="mpk-progress-track">
             <div class="mpk-progress-fill" style="width:${pct}%"></div>
           </div>
@@ -3316,7 +4230,7 @@
               spellcheck="false"
             />
           </div>
-          <div class="mpk-scan-feedback dim" id="mpk-scan-fb">Ready to scan</div>
+          <div class="mpk-scan-feedback dim" id="mpk-scan-fb">Scan the item at this location</div>
         </div>
 
         <div class="mpk-cluster-strip${clusterPos ? ' visible' : ''}" id="mpk-cluster-strip">
@@ -3326,20 +4240,26 @@
         </div>
 
       </div>
+      ${lastPickBannerHtml()}
       <div class="mpk-pick-actions">
         <button id="mpk-shortpick-btn" class="mpk-btn mpk-btn-secondary">Short Pick</button>
+        <button id="mpk-cart-btn" class="mpk-btn mpk-btn-secondary">Cart Positions</button>
       </div>`;
 
     R.scanIn       = document.getElementById('mpk-scan-in');
     R.scanFb       = document.getElementById('mpk-scan-fb');
     R.shortPickBtn = document.getElementById('mpk-shortpick-btn');
+    document.getElementById('mpk-cart-btn')?.addEventListener('click', () => { if (!closeCart()) showCartPositions(); });
 
     if (R.scanIn) {
       R.scanIn.addEventListener('keydown', _onScanKeydown);
       setTimeout(() => R.scanIn?.focus(), 80);
     }
 
-    R.shortPickBtn?.addEventListener('click', () => showShortPickFlow(State.instruction));
+    R.shortPickBtn?.addEventListener('click', () => {
+      if (Busy.isActive() || State.screen !== 'PICK_ITEM') { Busy.blocked('back'); return; }
+      showShortPickFlow(State.instruction);
+    });
 
 
     document.getElementById('mpk-voice-btn')?.addEventListener('click', () => {
@@ -3366,7 +4286,8 @@
 
     setTimeout(measureHeight, 30);
     // Delay ensures no cancellation from DOM operations happening right after
-    setTimeout(() => Voice.announceInstruction(instruction), 150);
+    setTimeout(() => Voice.announceInstruction(instruction, prevInstr,
+      donePos ? `Position ${donePos} done` : ''), 150);
   }
 
   // Scan keydown handler - Fragment 4 will replace _onScan with full logic
@@ -3391,12 +4312,233 @@
   }
 
   // _onScan - master scan router
+  //
+  // v4.14.0 - EVERY scan gets an answer. 4.13 dropped scans silently in
+  // TRANSITIONING and (with the input disabled) during a perform, which is
+  // exactly when a worried picker scans again.
   function _onScan(barcode) {
+    if (Busy.isActive()) { Busy.blocked('scan'); return; }
+    closeCart();                       // a scan always closes Cart Positions, then counts
     const s = State.screen;
-    if (s === 'TRANSITIONING') return; // ignore scans during screen transitions
     if (s === 'PICK_ITEM')           onItemScan(barcode);
     else if (s === 'SCAN_CONTAINER') onContainerScan(barcode);
     else if (s === 'QTY_MODAL')      onQtyModalScan(barcode);
+    else if (s === 'TOTE_CONFIRM') {
+      Audio.chime('nudge');
+      Voice.error('Answer the question on screen');
+    }
+    // PERFORMING / TRANSITIONING: the busy overlay is up; a scan does nothing.
+  }
+
+  // ---------------------------------------------------------------------------
+  // CART POSITIONS (4.17.0)
+  //
+  // Pickers lose track of which tote sits in which cart slot. "Cart Positions"
+  // (beside Short Pick / Back) opens a grid of slots - 4 wide, 5 rows, more rows
+  // if the job uses more positions - each showing its tote. Tap a tote to see
+  // what has gone into it.
+  //
+  // CONTENTS ARE WHAT THIS DEVICE PICKED INTO THE TOTE IN THIS JOB, recorded at
+  // each confirmed perform (State.toteContents) and kept in the resume state.
+  // Canary7's API has no confirmed "what is in container X" read we could use
+  // here, so it is labelled as such rather than passed off as the tote's full
+  // contents.
+  //
+  // Never in the way: closes on X, on a tap outside the card, on Esc, and on
+  // ANY scan - the scan then carries on to the pick exactly as if the window
+  // had not been open.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Tote colour (4.17.1). The colour comes from Canary7's own container types,
+   * which the script already loads: "Tote Blue" (prefix B), "Tote Green" (G),
+   * "Tote Orange" (O), "Tote Purple" (P), "Tote Red" (R), "Tote White" (W) -
+   * confirmed 27 Nov 2026. LONGEST matching prefix wins, so a "B150-" carton
+   * is never mistaken for a blue tote, and a colour added in Canary7 later is
+   * picked up without a script change. Text colour is chosen per fill for
+   * contrast (white on dark fills, navy on light ones).
+   */
+  const _TOTE_PALETTE = {
+    blue:   { bg: '#2f6fdb', fg: '#ffffff' },
+    green:  { bg: '#2e8f55', fg: '#ffffff' },
+    orange: { bg: '#f59a3b', fg: '#14153f' },
+    purple: { bg: '#7b4fc9', fg: '#ffffff' },
+    red:    { bg: '#d63b3b', fg: '#ffffff' },
+    white:  { bg: '#ffffff', fg: '#14153f' },
+    yellow: { bg: '#f5cf3b', fg: '#14153f' },
+    pink:   { bg: '#e86aa8', fg: '#14153f' },
+    black:  { bg: '#24262b', fg: '#ffffff' },
+    grey:   { bg: '#8a8f99', fg: '#ffffff' },
+  };
+  function toteColour(tote) {
+    if (!tote) return null;
+    const up = String(tote).toUpperCase();
+    let best = null;
+    for (const ct of State.containerTypes || []) {
+      const pre = String(ct.container_number_prefix || '').toUpperCase();
+      if (!pre || !up.startsWith(pre)) continue;
+      const m = /\b(blue|green|orange|purple|red|white|yellow|pink|black|gr[ae]y)\b/i
+        .exec(String(ct.name || '') + ' ' + String(ct.description || ''));
+      // A longer prefix always wins, even if it names no colour (a carton).
+      if (!best || pre.length > best.pre.length) best = { pre, colour: m ? m[1].toLowerCase().replace('gray', 'grey') : null };
+      else if (pre.length === best.pre.length && !best.colour && m) best.colour = m[1].toLowerCase().replace('gray', 'grey');
+    }
+    return best && best.colour ? Object.assign({ name: best.colour }, _TOTE_PALETTE[best.colour]) : null;
+  }
+
+  /**
+   * "Last scanned" strip (4.18.0, compact 4.18.1) - a minimal reminder above
+   * Short Pick / Cart Positions. ONE row: qty (with "units" / the UoM under
+   * it), SKU + description, the tote in its colour, and the time. Shows the
+   * last CONFIRMED pick only. Deliberately not tappable - it opens nothing.
+   */
+  function _clock(ts) {
+    const d = new Date(ts);
+    const p = (n) => String(n).padStart(2, '0');
+    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  }
+  function lastPickBannerHtml() {
+    const lp = State.lastPick;
+    if (!lp) return '';
+    const c = toteColour(lp.tote);
+    const unit = lp.uom && lp.uom.toLowerCase() !== 'each'
+      ? lp.uom
+      : (Number(lp.qty) === 1 ? 'unit' : 'units');
+    return `
+      <div class="mpk-last" id="mpk-last" role="status" aria-label="Last scanned">
+        <span class="mpk-last-qty"><b>${_esc(String(lp.qty))}</b><small>${_esc(unit)}</small></span>
+        <span class="mpk-last-what">
+          <span class="mpk-mono">${_esc(lp.sku)}</span>
+          <span class="mpk-last-desc">${_esc(lp.desc)}</span>
+        </span>
+        <span class="mpk-last-tote${c ? ' coloured' : ''}"${c ? ` style="--cart-bg:${c.bg};--cart-fg:${c.fg}"` : ''}>
+          ${lp.pos ? `<span class="mpk-last-pos">${_esc(String(lp.pos))}</span>` : ''}<span class="mpk-mono">${lp.tote ? _esc(lp.tote) : 'Auto'}</span>
+        </span>
+        <span class="mpk-last-k">Last<br><span class="mpk-last-time">${_clock(lp.at)}</span></span>
+      </div>`;
+  }
+
+  function recordToteContents(tote, instr, pos, qty) {
+    if (!tote || !instr) return;
+    const key = String(tote).toUpperCase();
+    const rec = State.toteContents[key] || (State.toteContents[key] = { tote, pos: pos || null, items: [] });
+    if (pos) rec.pos = pos;
+    rec.items.push({
+      sku:  instr.item?.item_code || '-',
+      desc: instr.item?.abc_category || instr.item?.description || '',
+      qty:  qty,
+      uom:  instr.itemUnitOfMeasure?.unitOfMeasure?.name || '',
+      ship: instr.reference_number || '',
+      at:   Date.now(),
+    });
+  }
+
+  /** Slots to draw: cluster positions (1..max, min 20) or, without positions, the totes used. */
+  function cartSlots() {
+    const byPos = State.containersByPosition || {};
+    const posNums = Object.keys(byPos).map(Number).filter(n => n > 0);
+    const curPos = Number(State.instruction?.cluster_position_id) || 0;
+    if (curPos) posNums.push(curPos);
+    const contents = State.toteContents || {};
+    if (posNums.length) {
+      const max = Math.max(...posNums);
+      const count = Math.max(20, Math.ceil(max / 4) * 4);
+      const slots = [];
+      for (let p = 1; p <= count; p++) {
+        const tote = byPos[p] || byPos[String(p)] || '';
+        const rec = tote ? contents[String(tote).toUpperCase()] : null;
+        slots.push({ label: String(p), tote, items: rec ? rec.items : [], current: p === curPos, isPos: true });
+      }
+      return { mode: 'positions', slots };
+    }
+    const slots = Object.values(contents).map((rec, i) => ({
+      label: String(i + 1), tote: rec.tote, items: rec.items, current: false,
+    }));
+    return { mode: 'totes', slots };
+  }
+
+  function closeCart() {
+    const el = document.getElementById('mpk-cart');
+    if (!el) return false;
+    el.remove();
+    setTimeout(() => _refocusScanInput(), 30);
+    return true;
+  }
+
+  function showCartPositions() {
+    if (Busy.isActive()) return;
+    const host = document.getElementById('mpk-pick-screen');
+    if (!host) return;
+    closeCart();
+    const { mode, slots } = cartSlots();
+    const totals = slots.filter(s => s.tote).length;
+    const cells = slots.map((s, i) => {
+      const c = toteColour(s.tote);
+      const style = c ? ` style="--cart-bg:${c.bg};--cart-fg:${c.fg}"` : '';
+      return `
+      <button type="button" class="mpk-cart-cell${s.tote ? ' has' : ''}${c ? ' coloured tote-' + c.name : ''}${s.current ? ' current' : ''}"
+              id="mpk-cart-pos-${_esc(s.label)}" data-i="${i}" ${s.tote ? '' : 'disabled'}${style}>
+        <span class="mpk-cart-pos">${_esc(s.label)}</span>
+        <span class="mpk-cart-tote mpk-mono">${s.tote ? _esc(s.tote) : '-'}</span>
+        <span class="mpk-cart-count">${s.items.length ? s.items.length + (s.items.length === 1 ? ' pick' : ' picks') : ''}</span>
+      </button>`;
+    }).join('');
+
+    const el = document.createElement('div');
+    el.id = 'mpk-cart';
+    el.className = 'mpk-cart-overlay';
+    el.innerHTML = `
+      <div class="mpk-cart-card" role="dialog" aria-label="Cart positions">
+        <div class="mpk-cart-head">
+          <span class="mpk-cart-title">Cart positions</span>
+          <span class="mpk-cart-sub">${totals} ${totals === 1 ? 'tote' : 'totes'}</span>
+          <button type="button" class="mpk-cart-x" id="mpk-cart-close" aria-label="Close">&#10005;</button>
+        </div>
+        ${slots.length
+          ? `<div class="mpk-cart-grid">${cells}</div>`
+          : '<div class="mpk-cart-empty">No totes scanned in this job yet</div>'}
+        <div class="mpk-cart-foot">${mode === 'positions' ? 'Highlighted = this pick\'s position. ' : ''}Tap a tote for its items. Scan to close.</div>
+        <div class="mpk-cart-detail" id="mpk-cart-detail"></div>
+      </div>`;
+    host.appendChild(el);
+
+    // Tap outside the card closes; taps inside stay put.
+    el.addEventListener('click', (e) => {
+      if (e.target === el) { closeCart(); return; }
+      e.stopPropagation();
+      const t = e.target && e.target.closest ? e.target : null;
+      if (t && t.closest('#mpk-cart-close')) { closeCart(); return; }
+      if (t && t.closest('#mpk-cart-back')) { showToteDetail(null); return; }
+      const cell = t && t.closest('.mpk-cart-cell');
+      if (cell && !cell.disabled) showToteDetail(slots[Number(cell.dataset.i)]);
+      _refocusScanInput();               // keep the scanner live while it is open
+    });
+    setTimeout(() => _refocusScanInput(), 30);
+  }
+
+  function showToteDetail(slot) {
+    const d = document.getElementById('mpk-cart-detail');
+    if (!d) return;
+    if (!slot) { d.classList.remove('open'); d.innerHTML = ''; return; }
+    // 4.18.1: just Quantity | SKU | Description, one line each.
+    const rows = slot.items.length
+      ? '<div class="mpk-cart-item head"><span class="mpk-cart-qty">Qty</span><span class="mpk-cart-sku">SKU</span><span class="mpk-cart-desc">Description</span></div>' +
+        slot.items.map(it => `
+          <div class="mpk-cart-item">
+            <span class="mpk-cart-qty">${_esc(String(it.qty))}</span>
+            <span class="mpk-cart-sku mpk-mono">${_esc(it.sku)}</span>
+            <span class="mpk-cart-desc">${_esc(it.desc)}</span>
+          </div>`).join('')
+      : '<div class="mpk-cart-empty">Nothing picked into this tote yet</div>';
+    d.innerHTML = `
+      <div class="mpk-cart-detail-head">
+        <button type="button" class="mpk-cart-x" id="mpk-cart-back" aria-label="Back to grid">&lt;</button>
+        ${(() => { const c = toteColour(slot.tote); return c ? `<span class="mpk-cart-chip" style="--cart-bg:${c.bg}"></span>` : ''; })()}
+        <span class="mpk-cart-title mpk-mono">${_esc(slot.tote)}</span>
+        <span class="mpk-cart-sub">${slot.isPos ? 'Pos ' + _esc(slot.label) : ''}</span>
+      </div>
+      <div class="mpk-cart-items">${rows}</div>`;
+    d.classList.add('open');
   }
 
   function setScanFeedback(msg, type) {
@@ -3405,14 +4547,14 @@
     R.scanFb.className = 'mpk-scan-feedback ' + (type || 'dim');
 
     // Full-screen colour flash - faster to process than text in high-intensity env
-    if (type === 'ok' || type === 'err') {
+    if (type === 'ok' || type === 'err' || type === 'warn') {
       const screen = document.getElementById('mpk-pick-screen');
       if (screen) {
         const flash = document.createElement('div');
-        flash.className = 'mpk-flash ' + (type === 'ok' ? 'flash-ok' : 'flash-err');
+        flash.className = 'mpk-flash flash-' + type;
         screen.style.position = 'relative';
         screen.appendChild(flash);
-        requestAnimationFrame(() => {
+        (window.requestAnimationFrame || ((fn) => setTimeout(fn, 0)))(() => {
           flash.style.opacity = '0.35';
           setTimeout(() => {
             flash.style.opacity = '0';
@@ -3553,16 +4695,16 @@
     const shortPickReasons = State.reasons.filter(r => r.reason_class_id === 5);
 
     // Reason icons
-    const ICONS = { 'Out Of Reach': '?', 'Stock Not Present': '?', 'Damaged': '?' };
+    const ICONS = { 'Out Of Reach': '^', 'Stock Not Present': '0', 'Damaged': 'x' };
 
     const reasonBtns = shortPickReasons.length
       ? shortPickReasons.map(r =>
           `<button class="mpk-reason-btn" data-rid="${r.id}" data-rcode="${_esc(r.reason_code)}">
-            <span class="mpk-reason-icon">${ICONS[r.reason_code] || '[!]'}</span>
+            <span class="mpk-reason-icon">${ICONS[r.reason_code] || '!'}</span>
             ${_esc(r.reason_code)}
            </button>`
         ).join('')
-      : '<div style="color:#9faecb;font-size:13px">No reason codes available</div>';
+      : '<div class="mpk-sp-instruction">No reason codes available</div>';
 
     const overlay = document.createElement('div');
     overlay.className = 'mpk-sp-overlay';
@@ -3598,50 +4740,20 @@
   }
 
   // -- Step 3: Submit short pick ----------------------------------------------
+  // v4.14.0 - pick-short is a stock write like any other: busy lock, no
+  // double submit, and a failure is reconciled before the picker may retry.
   async function onShortPickConfirm(instruction, reasonCode) {
     const screen = document.getElementById('mpk-pick-screen');
     if (!screen) return;
-
-    // Show confirming state
-    State.screen = 'TRANSITIONING';
-    setScanFeedback('Confirming short pick?', 'dim');
-
-    // Short pick: nothing was picked so nothing goes into any tote
-    // Always send empty container_no regardless of cluster position assignment
-    const containerNo = '';
-
-    try {
-      const result = await performShortPick(instruction, reasonCode, 0, containerNo);
-
-      Audio.chime('container_ok');
-      if (navigator.vibrate) navigator.vibrate([30]);
-
-      // Advance progress
-      if (State.pickProgress) State.pickProgress.current++;
-
-      // change-sequence fires after short pick (matches C7 behaviour)
-      changeSequence(instruction.id);
-
-      const isJobDone = result.job_instruction === null;
-
-      if (isJobDone) {
-        renderJobComplete(false);
-      } else {
-        const fullNext = await fetchNextInstruction(result.job_instruction);
-        const nextInstr = fullNext || result.job_instruction;
-        State.instruction = nextInstr;
-        State.jobId = nextInstr.job_id || State.jobId;
-        await loadGroupRecordIfNeeded(nextInstr);
-        renderPickScreen(nextInstr);
-        setTimeout(() => Voice.announceInstruction(nextInstr), 150);
-      }
-
-    } catch (err) {
-      State.screen = 'PICK_ITEM';
-      setScanFeedback(err.message || 'Short pick failed - try again', 'err');
-      Audio.chime('error');
-      setTimeout(() => R.scanIn?.focus(), 100);
-    }
+    // Short pick: nothing was picked so nothing goes into any tote.
+    // Always send empty container_no regardless of cluster position assignment.
+    await runPerform({
+      instruction,
+      backTo: 'PICK_ITEM',
+      title: 'Recording short pick',
+      detail: reasonCode || '',
+      call: () => performShortPick(instruction, reasonCode, 0, ''),
+    });
   }
 
   function _showNotImpl(label) {
@@ -3659,31 +4771,18 @@
 
     const banner = document.createElement('div');
     banner.id = 'mpk-resume-banner';
-    banner.style.cssText = [
-      'position:absolute;inset:0;z-index:500;background:rgba(0,0,0,.7)',
-      'display:flex;flex-direction:column;align-items:center;justify-content:center',
-      'padding:24px;gap:14px;text-align:center',
-    ].join(';');
+    banner.className = 'mpk-block-overlay';
+    banner.style.zIndex = '500';
     banner.innerHTML = `
-      <div style="font-size:20px;font-weight:700;color:#fff">RESUME</div>
-      <div style="font-size:17px;font-weight:700;color:#fff">Resume picking?</div>
-      <div style="font-size:13px;color:rgba(255,255,255,.75);line-height:1.5">
+      <div class="mpk-bo-kicker">Resume</div>
+      <div class="mpk-bo-title">Pick up where you left off?</div>
+      <div class="mpk-bo-text">
         You have an active pick job for<br>
-        <strong style="color:#fabb3d">${_esc(profileName)}</strong><br>
-        <span style="font-size:11px;opacity:.7">
-          Pick ${resumeState.pickProgressCurrent} of ${resumeState.pickProgressTotal}
-        </span>
+        <strong style="color:#fff">${_esc(profileName)}</strong><br>
+        Pick ${_esc(String(resumeState.pickProgressCurrent))} of ${_esc(String(resumeState.pickProgressTotal))}
       </div>
-      <button id="mpk-resume-yes" style="
-        width:100%;padding:14px;background:#20a8d8;color:#fff;border:none;
-        font-size:15px;font-weight:600;font-family:Roboto,sans-serif;
-        cursor:pointer;border-radius:4px;
-      ">Resume Pick</button>
-      <button id="mpk-resume-no" style="
-        width:100%;padding:12px;background:transparent;color:rgba(255,255,255,.6);
-        border:1px solid rgba(255,255,255,.2);font-size:13px;font-weight:500;
-        font-family:Roboto,sans-serif;cursor:pointer;border-radius:4px;
-      ">Start Fresh</button>`;
+      <button id="mpk-resume-yes" class="mpk-btn mpk-btn-primary" style="max-width:340px">Resume pick</button>
+      <button id="mpk-resume-no" class="mpk-btn mpk-btn-secondary" style="max-width:340px">Start fresh</button>`;
 
     root.style.position = 'relative';
     root.appendChild(banner);
@@ -3704,7 +4803,7 @@
     if (!root) return;
 
     // Show loading
-    root.innerHTML = `<div class="mpk-loading"><div class="mpk-spinner"></div>Resuming pick?</div>`;
+    root.innerHTML = `<div class="mpk-loading"><div class="mpk-spinner"></div>Resuming pick...</div>`;
 
     try {
       // Restore profile
@@ -3715,6 +4814,8 @@
 
       // Restore container positions
       State.containersByPosition = resumeState.containersByPosition || {};
+      State.toteContents = resumeState.toteContents || {};
+      State.lastPick = resumeState.lastPick || null;
 
       // Build prefix list
       State.containerPrefixes = State.containerTypes
@@ -3733,17 +4834,11 @@
       State.instruction = instruction;
       State.jobId       = instruction.job_id || resumeState.jobId;
 
-      // Rebuild barcodeMap
+      // Group record and summary list (group sizes for the busy-screen
+      // estimate) - the group fetch runs while the list loads.
+      if (instruction.job_instruction_group_id) prefetchGroupRecord(instruction.job_instruction_group_id);
       if (!State.allInstructions.length) {
         State.allInstructions = await fetchJobInstructions(State.jobId).catch(() => []);
-      }
-      State.barcodeMap = {};
-      for (const instr of State.allInstructions) {
-        const refs = instr.item?.itemUnitOfMeasures?.flatMap(
-          u => u.itemUnitOfMeasureReference?.map(r => r.reference?.toLowerCase()) || []
-        ) || [];
-        if (instr.item?.item_code) refs.push(instr.item.item_code.toLowerCase());
-        for (const ref of refs) { if (ref) State.barcodeMap[ref] = instr; }
       }
 
       // Restore progress
@@ -3754,6 +4849,7 @@
 
       Audio.init();
       await loadGroupRecordIfNeeded(instruction);
+      if (await reconcileInflightOnEntry()) return;
       renderPickScreen(instruction);
 
     } catch(err) {
@@ -3768,14 +4864,15 @@
   // FRAGMENT 5: GROUPED PICK LOOP (SIBP / MIBP)
   // -----------------------------------------------------------------------------
 
-  // Fetch group record for a grouped instruction - stores in State.groupRecord
-  async function loadGroupRecordIfNeeded(instruction) {
-    const groupId = instruction?.job_instruction_group_id;
-    State.groupRecordFailed = false;
-    if (!groupId) {
-      State.groupRecord = null;
-      return;
-    }
+  // v4.14.0 - group records are fetched through a small promise cache so the
+  // summary screen can start the fetch while the picker is still reading it
+  // (Accept used to sit on this call), and the next pick's group can load in
+  // parallel with get-job-instructions instead of after it. A group's entry is
+  // dropped the moment we perform against it - its updated_at is then stale
+  // and is exactly what group-perform sends back as last_updated_at.
+  const _groupCache = new Map();   // groupId -> Promise<record|null>
+
+  function _fetchGroupRecord(groupId) {
     const EXPAND = encodeURIComponent(
       'fromLocation,toLocation,item.itemUnitOfMeasures.unitOfMeasure,' +
       'item.itemUnitOfMeasures.itemUnitOfMeasureReference,batch,license_plate_no,' +
@@ -3784,7 +4881,7 @@
     const _fetch = () => apiGet(
       `shipment/shipment-picking-profile/get-job-instruction-groups&id=${groupId}&expand=${EXPAND}`
     );
-    try {
+    return (async () => {
       let data;
       try {
         data = await _fetch();
@@ -3794,7 +4891,39 @@
         data = await _fetch();
       }
       const arr = Array.isArray(data) ? data : [];
-      State.groupRecord = arr[0] || null;
+      return arr[0] || null;
+    })();
+  }
+
+  function prefetchGroupRecord(groupId) {
+    if (!groupId || _groupCache.has(groupId)) return;
+    const p = _fetchGroupRecord(groupId);
+    // A failed prefetch must not poison the cache - the real load retries.
+    p.catch(() => { if (_groupCache.get(groupId) === p) _groupCache.delete(groupId); });
+    _groupCache.set(groupId, p);
+  }
+
+  function forgetGroupRecord(groupId) {
+    if (groupId) _groupCache.delete(groupId);
+  }
+
+  // Fetch group record for a grouped instruction - stores in State.groupRecord
+  async function loadGroupRecordIfNeeded(instruction) {
+    const groupId = instruction?.job_instruction_group_id;
+    State.groupRecordFailed = false;
+    if (!groupId) {
+      State.groupRecord = null;
+      return;
+    }
+    try {
+      let rec = null;
+      const cached = _groupCache.get(groupId);
+      if (cached) rec = await cached.catch(() => null);
+      if (!rec) {
+        _groupCache.delete(groupId);
+        rec = await _fetchGroupRecord(groupId);
+      }
+      State.groupRecord = rec;
       console.log('[MalpaPick] groupRecord loaded:', State.groupRecord);
     } catch (e) {
       console.warn('[MalpaPick] loadGroupRecordIfNeeded failed:', e.message);
@@ -3904,11 +5033,11 @@
       overlay.id = 'mpk-multitote-modal';
       overlay.innerHTML = `
         <div class="mpk-modal-card">
-          <div class="mpk-modal-header">[!] Container already used</div>
+          <div class="mpk-modal-header">Tote already in use</div>
           <div class="mpk-modal-body">
             <strong>${_esc(containerNo)}</strong> is assigned to Position ${_esc(String(existingPositionId))}.<br><br>
             Use it for Position ${_esc(String(newPositionId))} as well?
-            <br><small style="color:#9faecb;margin-top:4px;display:block">Confirm only if picking multiple orders into the same tote.</small>
+            <small>Confirm only if you are picking several orders into the same tote.</small>
           </div>
           <div class="mpk-modal-actions">
             <button id="mpk-multitote-yes" class="mpk-btn mpk-btn-primary">Yes - multi-tote pick</button>
@@ -3997,31 +5126,35 @@
   }
 
   // -- Fetch next instruction - try cache first, then API -------------------
-  async function fetchNextInstruction(hintInstruction) {
-    // Try to find the full version in State.allInstructions by id
-    if (hintInstruction?.id) {
-      const cached = State.allInstructions.find(i => i.id === hintInstruction.id);
-      if (cached?.fromLocation && cached?.item) return cached;
-    }
-    // Cache miss - fetch fresh from API with full expand
-    const EXPAND = [
-      'fromLocation', 'toLocation',
-      'item.itemUnitOfMeasures.itemUnitOfMeasureReference',
-      'item.itemUnitOfMeasures.unitOfMeasure',
-      'batch', 'license_plate_no', 'shipmentNumber',
-      'itemUnitOfMeasure.unitOfMeasure',
-      'jobInstructionGroup.id',
-      'shipmentDetailChildren', 'item.company', 'custom_field_1',
-    ].join(',');
+  const _INSTR_EXPAND = [
+    'fromLocation', 'toLocation',
+    'item.itemUnitOfMeasures.itemUnitOfMeasureReference',
+    'item.itemUnitOfMeasures.unitOfMeasure',
+    'batch', 'license_plate_no', 'shipmentNumber',
+    'itemUnitOfMeasure.unitOfMeasure',
+    'jobInstructionGroup.id',
+    'shipmentDetailChildren', 'item.company', 'custom_field_1',
+  ].join(',');
+
+  /** The instruction Canary7 says is current for this job right now. */
+  async function fetchCurrentInstruction() {
     let path = `shipment/shipment-picking-profile/get-job-instructions` +
-      `&id=${State.profile.id}&expand=${encodeURIComponent(EXPAND)}`;
+      `&id=${State.profile.id}&expand=${encodeURIComponent(_INSTR_EXPAND)}`;
     if (State.jobId) path += `&job_id=${State.jobId}`;
     const data = await apiGet(path);
     const arr = Array.isArray(data) ? data : [];
     return arr[0] || null;
   }
 
-  // -- Perform pick API call -------------------------------------------------
+  async function fetchNextInstruction(hintInstruction) {
+    // Try to find the full version in State.allInstructions by id
+    if (hintInstruction?.id) {
+      const cached = State.allInstructions.find(i => i.id === hintInstruction.id);
+      if (cached?.fromLocation && cached?.item) return cached;
+    }
+    return fetchCurrentInstruction();
+  }
+
   // -------------------------------------------------------------------------
   // LOCOD FLOW -- profile ID 54, auto_generate_container_check = 1
   // No tote scan required -- container is auto-generated by C7
@@ -4065,91 +5198,44 @@
     ).catch(e => console.warn('[MalpaPick] print-label failed:', e.message));
   }
 
-  // Full LOCOD pick -- called after item verified, bypasses container scan screen
-  async function performLocodPick(instruction) {
-    State.screen = 'TRANSITIONING';
+  // Full LOCOD pick -- called after item verified, bypasses container scan screen.
+  // v4.14.0: the 800ms blind retry of a non-idempotent perform is gone; a
+  // failure is reconciled against Canary7 like every other perform.
+  function performLocodPick(instruction) {
     document.querySelector('.mpk-item-block')?.classList.add('verified');
-    setScanFeedback('Processing...', 'dim');
-
-    try {
-      const pickingQty = effectiveQty(instruction);
-      const shipNo     = instruction.reference_number;
-
-      // Step 1: check for existing container + fire item verification in parallel
-      const [existingContainer] = await Promise.all([
-        fetchPickingContainer(shipNo),
-        Promise.resolve(), // verification already fired on item scan
-      ]);
-
-      // Step 2: get or generate container number
-      let containerNo = existingContainer;
-      if (!containerNo) {
-        containerNo = await autoGenerateContainerNumber();
-      }
-      if (!containerNo) throw new Error('Could not get container number');
-
-      // Step 3: fire label print (non-blocking)
-      printConsignmentLabel(instruction);
-
-      // Step 4: perform with LOCOD-specific fields
-      const _doLocod = () => apiPost(
-        `job/job-instruction/perform&id=${instruction.id}`,
-        {
-          container_no:       containerNo,
-          profile_id:         LOCOD_PROFILE_ID,
-          container_type_id:  LOCOD_CONTAINER_TYPE,
-          ship_no:            shipNo,
-          is_tracking:        null,
-          from_location:      instruction.from_location_id,
-          item_id:            instruction.item_id,
-          picking_qty:        pickingQty,
-          container_location: null,
-          selected_profile_id: LOCOD_PROFILE_ID,
-        }
-      );
-
-      let result;
-      try {
-        result = await _doLocod();
-      } catch(firstErr) {
-        if (firstErr.message?.includes('Session expired')) throw firstErr;
-        await new Promise(r => setTimeout(r, 800));
-        result = await _doLocod();
-      }
-
-      // Success
-      Audio.chime('container_ok');
-      if (navigator.vibrate) navigator.vibrate([30]);
-      if (State.pickProgress) State.pickProgress.current++;
-      savePickResumeState();
-
-      const completedId = instruction.id;
-      const isJobDone   = result.job_instruction === null;
-
-      if (result.job_instruction !== null) {
-        changeSequence(completedId);
-      }
-
-      if (isJobDone) {
-        renderJobComplete(false);
-      } else {
-        const fullNext = await fetchNextInstruction(result.job_instruction);
-        const nextInstr = fullNext || result.job_instruction;
-        State.instruction = nextInstr;
-        State.jobId = nextInstr.job_id || State.jobId;
-        await loadGroupRecordIfNeeded(nextInstr);
-        renderPickScreen(nextInstr);
-        setTimeout(() => Voice.announceInstruction(nextInstr, instruction), 150);
-      }
-
-    } catch(err) {
-      State.screen = 'PICK_ITEM';
-      setScanFeedback(err.message || 'Error - try again', 'err');
-      Audio.chime('error');
-      Voice.error('Error, try again');
-      if (navigator.vibrate) navigator.vibrate([60, 30, 60]);
-      setTimeout(() => R.scanIn?.focus(), 100);
-    }
+    const pickingQty = effectiveQty(instruction);
+    const shipNo     = instruction.reference_number;
+    return runPerform({
+      instruction,
+      title: 'Moving items to container',
+      locod: true,
+      extraMs: 1500,                 // container lookup / generate before the perform
+      backTo: 'PICK_ITEM',
+      call: async () => {
+        // Step 1: existing container for the shipment, else generate one
+        let containerNo = await fetchPickingContainer(shipNo);
+        if (!containerNo) containerNo = await autoGenerateContainerNumber();
+        if (!containerNo) throw new Error('Could not get container number');
+        // Step 2: fire label print (non-blocking)
+        printConsignmentLabel(instruction);
+        // Step 3: perform with LOCOD-specific fields
+        return apiPost(
+          `job/job-instruction/perform&id=${instruction.id}`,
+          {
+            container_no:       containerNo,
+            profile_id:         LOCOD_PROFILE_ID,
+            container_type_id:  LOCOD_CONTAINER_TYPE,
+            ship_no:            shipNo,
+            is_tracking:        null,
+            from_location:      instruction.from_location_id,
+            item_id:            instruction.item_id,
+            picking_qty:        pickingQty,
+            container_location: null,
+            selected_profile_id: LOCOD_PROFILE_ID,
+          }
+        );
+      },
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -4179,14 +5265,301 @@
     );
   }
 
+  // -------------------------------------------------------------------------
+  // SAFE PERFORM                                                  (v4.14.0)
+  //
+  // Every stock-moving write (perform, group-perform, LOCOD perform,
+  // pick-short) goes through runPerform(). See section 1c for why.
+  // -------------------------------------------------------------------------
+
+  const _sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  let _performSeq = 0;
+
+  /**
+   * 'business' - Canary7 answered with a decision (a numeric code, or a 4xx):
+   *              deterministic, one verify is enough.
+   * 'unknown'  - network failure, 502/503/504, or a 5xx with no code: the
+   *              server may still be working on it, so verify patiently.
+   */
+  function classifyPerformError(err) {
+    const st = err && err._status;
+    const code = err && err._body && typeof err._body.code === 'number';
+    if (!st) return 'unknown';                                 // fetch threw
+    if (code) return 'business';
+    if (st === 502 || st === 503 || st === 504 || st >= 500) return 'unknown';
+    return 'business';
+  }
+
+  /**
+   * Has Canary7 already applied the perform for `instr`? Read-only.
+   *   { landed: true,  next }      - the job has moved past it (next may be null = job done)
+   *   { landed: false, current }   - Canary7 still shows this instruction/group as current
+   * Throws if Canary7 cannot be reached - callers treat that as "don't know".
+   */
+  async function verifyPerformLanded(instr) {
+    const cur = await fetchCurrentInstruction();
+    if (!cur) return { landed: true, next: null };
+    const sameInstr = cur.id === instr.id;
+    const gid = instr.job_instruction_group_id;
+    const sameGroup = !!gid && cur.job_instruction_group_id === gid;
+    if (sameInstr || sameGroup) return { landed: false, current: cur };
+    return { landed: true, next: cur };
+  }
+
+  // Measured 2026-11-27 on PuraU (company 153) MIBP jobs 2077877 / 2077905:
+  // group-perform runs ~0.3-0.6s PER INSTRUCTION server-side - a 100-order
+  // group took 46-60s. An "unknown" error (gateway timeout, dropped Wi-Fi)
+  // therefore usually means "still working", so keep checking for up to
+  // RECONCILE_WINDOW_MS before letting the picker scan again.
+  const RECONCILE_WINDOW_MS = 120000;
+
+  async function reconcilePerform(instr, err) {
+    const kind = classifyPerformError(err);
+    const deadline = Date.now() + (kind === 'business' ? 0 : RECONCILE_WINDOW_MS);
+    const attempts = kind === 'business' ? 1 : Math.ceil(RECONCILE_WINDOW_MS / 5000);
+    let last = { landed: false };
+    for (let i = 0; i < attempts; i++) {
+      if (i > 0) { if (Date.now() > deadline) break; await _sleep(5000); }
+      if (i === 0) Busy.update('Checking with Canary7', { indeterminate: true });
+      try {
+        const v = await verifyPerformLanded(instr);
+        if (v.landed) return v;
+        last = v;
+      } catch (e) {
+        if (e.message?.includes('Session expired')) throw e;
+      }
+    }
+    return last;
+  }
+
+  /**
+   * opts: { instruction, title, detail, orders, extraMs, call, clusterPos, tote, backTo }
+   *   orders  - shipments the write fans out to (group size); drives the estimate
+   *   extraMs - fixed extra time before the write (LOCOD container lookup)
+   *   call()  - performs the write, resolves C7's response
+   *   backTo  - screen to return to when the write is confirmed NOT to have landed
+   */
+  async function runPerform(opts) {
+    const instr = opts.instruction;
+    if (Busy.isActive()) { Busy.blocked('scan'); return; }
+
+    const seq = ++_performSeq;
+    let settled = false;
+    const settle = () => { if (settled || seq !== _performSeq) return false; settled = true; return true; };
+
+    State.screen = 'PERFORMING';
+    const extraMs = opts.extraMs || 0;
+    const estMs = Rate.estimate(opts.orders || 1, extraMs);
+    Busy.start('perform', opts.title || 'Moving items to container', {
+      detail: opts.detail || '',
+      estMs,
+      // Manual "Check status" while the request is STILL pending. It can
+      // complete the pick if Canary7 has clearly moved on; it never
+      // unlocks a re-scan while the original request is outstanding.
+      onCheck: async () => {
+        try {
+          const v = await verifyPerformLanded(instr);
+          if (v.landed) {
+            if (!settle()) return;
+            await onLanded(v.next, v.next === null, false, 'Canary7 confirmed the move.');
+          }
+          // Not finished: say nothing new - the bar keeps creeping.
+        } catch (_) { /* still waiting on the original request */ }
+      },
+    });
+    saveInflight({
+      instrId: instr.id,
+      groupId: instr.job_instruction_group_id || null,
+      jobId:   State.jobId,
+      tote:    opts.tote || null,
+    });
+
+    async function onLanded(nextHint, isJobDone, isClusterDone, note) {
+      clearInflight();
+      Busy.complete();
+      Audio.chime('container_ok');
+      if (navigator.vibrate) navigator.vibrate([30]);
+      if (opts.clusterPos && opts.tote) {
+        State.containersByPosition[opts.clusterPos] = opts.tote;
+      }
+      if (opts.tote) State.lastTote = { tote: opts.tote, instrId: instr.id, at: Date.now() };
+      if (opts.tote) recordToteContents(opts.tote, instr, opts.clusterPos, opts.qty);
+      if (opts.tote || opts.locod) {
+        State.lastPick = {
+          sku:  instr.item?.item_code || '-',
+          desc: instr.item?.abc_category || instr.item?.description || '',
+          qty:  opts.qty != null ? opts.qty : displayQty(instr),
+          uom:  instr.itemUnitOfMeasure?.unitOfMeasure?.name || '',
+          tote: opts.tote || null,
+          pos:  opts.clusterPos || null,
+          at:   Date.now(),
+        };
+      }
+      await advanceAfterPerform(instr, nextHint, isJobDone, isClusterDone, opts.clusterPos, note);
+    }
+
+    let result;
+    try {
+      result = await opts.call();
+    } catch (err) {
+      if (!settle()) return;               // already resolved by "Check status"
+      if (err.message?.includes('Session expired')) { clearInflight(); Busy.end(); return; }
+      let rec = { landed: false };
+      try { rec = await reconcilePerform(instr, err); }
+      catch (_) { clearInflight(); Busy.end(); return; }
+      if (rec.landed) {
+        console.warn('[MalpaPick] perform errored but Canary7 shows it landed:', err.message);
+        await onLanded(rec.next, rec.next === null, false,
+          'Canary7 had already moved it - carry on.');
+        return;
+      }
+      // Confirmed NOT landed (or unknown after patient checks) - unlock.
+      clearInflight();
+      Busy.end();
+      State.screen = opts.backTo || 'SCAN_CONTAINER';
+      _showPerformError(err);
+      return;
+    }
+
+    if (!settle()) return;
+    // Teach the estimator - only from a direct answer, never a reconcile.
+    if (Busy.active) Rate.learn(opts.orders || 1, Date.now() - Busy.active.startedAt, extraMs);
+    const isJobDone     = result?.job_instruction === null;
+    const isClusterDone = result?.is_cluster_job === true && isJobDone;
+    await onLanded(result?.job_instruction, isJobDone, isClusterDone, null);
+  }
+
+  function _showPerformError(err) {
+    const msg = err?.message || 'Error - try again';
+    if (msg.includes('belongs to another shipment') || msg.includes('1022')) {
+      setScanFeedback('That tote belongs to another shipment - use a different tote', 'err');
+      Voice.error('Wrong tote');
+    } else if (msg.includes('Less Units Picking')) {
+      setScanFeedback('Canary7 wants the whole group in one go - pick all units, or use Short Pick', 'err');
+      Voice.error('Pick all units');
+    } else {
+      setScanFeedback(msg + ' - nothing was moved, scan again', 'err');
+      Voice.error('Error. Scan again');
+    }
+    Audio.chime('error');
+    if (navigator.vibrate) navigator.vibrate([60, 30, 60]);
+    setTimeout(() => R.scanIn?.focus(), 100);
+  }
+
+  /**
+   * After a CONFIRMED perform: bump progress, load the next instruction and
+   * its group record IN PARALLEL, then paint. The busy lock stays up the whole
+   * time - until 4.13 a scan in this gap hit the old screen's input and could
+   * start a second perform against an instruction that was already done.
+   */
+  async function advanceAfterPerform(prev, nextHint, isJobDone, isClusterDone, clusterPos, note) {
+    if (State.pickProgress) State.pickProgress.current++;
+    forgetGroupRecord(prev.job_instruction_group_id);   // its updated_at is now stale
+    savePickResumeState();
+
+    if (!isJobDone) changeSequence(prev.id);
+
+    if (isJobDone) {
+      Busy.end();
+      if (clusterPos) Voice.announcePosition(clusterPos);
+      renderJobComplete(isClusterDone);
+      return;
+    }
+
+    Busy.update('Loading next pick');
+    if (nextHint?.job_instruction_group_id) prefetchGroupRecord(nextHint.job_instruction_group_id);
+
+    let nextInstr = null;
+    for (let i = 0; i < 3 && !nextInstr; i++) {
+      if (i > 0) await _sleep(800);
+      try { nextInstr = await fetchNextInstruction(nextHint); }
+      catch (e) { if (e.message?.includes('Session expired')) { Busy.end(); return; } }
+    }
+    // Never fall back to `prev` here - repainting the instruction that was
+    // just performed is how a duplicate perform starts.
+    nextInstr = nextInstr || nextHint;
+    if (!nextInstr) { Busy.end(); renderJobComplete(false); return; }
+
+    State.instruction = nextInstr;
+    State.jobId = nextInstr.job_id || State.jobId;
+    await loadGroupRecordIfNeeded(nextInstr);
+    savePickResumeState();
+
+    Busy.end();
+    renderPickScreen(nextInstr, prev, clusterPos);
+    if (note) setScanFeedback(note, 'ok');
+  }
+
+  /**
+   * On Accept / Resume: if this device was interrupted mid-perform, ask
+   * Canary7 where the job is before a single scan is accepted.
+   * Returns true when it took over the screen (advanced or rendered).
+   */
+  async function reconcileInflightOnEntry() {
+    const inf = loadInflight();
+    const cur = State.instruction;
+    if (!inf || !cur) return false;
+    const same = inf.instrId === cur.id ||
+      (!!inf.groupId && inf.groupId === cur.job_instruction_group_id);
+    if (!same) { clearInflight(); return false; }   // C7 has already moved on
+
+    Busy.start('perform', 'Checking your last pick', { detail: inf.tote || '' });
+    for (let i = 0; i < 18; i++) {      // ~90s - see RECONCILE_WINDOW_MS
+      if (i > 0) await _sleep(5000);
+      try {
+        const v = await verifyPerformLanded(cur);
+        if (v.landed) {
+          clearInflight();
+          await advanceAfterPerform(cur, v.next, v.next === null, false,
+            cur.cluster_position_id, 'Your last pick did go through - carry on.');
+          return true;
+        }
+      } catch (e) { if (e.message?.includes('Session expired')) { Busy.end(); return true; } }
+    }
+    clearInflight();
+    Busy.end();
+    renderPickScreen(cur);
+    setScanFeedback('The last move did not go through - pick this one again', 'warn');
+    return true;
+  }
+
   // -- Pick state machine ----------------------------------------------------
-  // States: PICK_ITEM -> PICK_QTY_MODAL (qty>1) -> SCAN_CONTAINER -> (loop or complete)
+  // States: PICK_ITEM -> QTY_MODAL (qty>1) -> SCAN_CONTAINER -> PERFORMING
+  //         -> (loop or complete)
+
+  /** Item verified and qty settled - move straight to the tote step. */
+  function goToToteStep(barcode) {
+    fireItemVerification(State.instruction, barcode);
+    if (isLocod()) { performLocodPick(State.instruction); return; }
+    document.querySelector('.mpk-item-block')?.classList.add('verified');
+    // v4.14.0 - render NOW. 4.13 waited 300-500ms in a TRANSITIONING state
+    // that silently ate scans, so a quick tote scan simply vanished.
+    renderContainerScan();
+    const pos = State.instruction?.cluster_position_id;
+    Voice.speak(pos ? `Position ${pos}. Scan tote` : 'Scan tote');
+  }
 
   function onItemScan(barcode) {
     if (!verifyItem(barcode)) {
+      // A tote label on the item step: usually the tote from the pick that
+      // just finished, scanned again because the picker was not sure.
+      if (validateContainerLabel(barcode)) {
+        const lt = State.lastTote;
+        if (lt && lt.tote.toUpperCase() === barcode.trim().toUpperCase() && Date.now() - lt.at < 120000) {
+          setScanFeedback(`${lt.tote} is already done. Scan the ITEM for this location`, 'warn');
+          Voice.error('Already done. Scan the item');
+        } else {
+          setScanFeedback('That is a tote - scan the ITEM first', 'warn');
+          Voice.error('Scan the item first');
+        }
+        Audio.chime('nudge');
+        if (navigator.vibrate) navigator.vibrate([40, 40, 40]);
+        return;
+      }
       setScanFeedback('Wrong item - scan again', 'err');
       Audio.chime('error');
       Voice.error('Wrong item');
+      if (navigator.vibrate) navigator.vibrate([60, 30, 60]);
       return;
     }
 
@@ -4203,28 +5576,13 @@
     // Display units, not raw eaches: a factor-6 carton pick of 6 is ONE
     // carton to the picker and must not open the numpad.
     const qty = displayQty(State.instruction);
+    State.lastItemScan = { instrId: State.instruction?.id, at: Date.now() };
 
     if (qty === 1) {
-      setScanFeedback('Item verified v', 'ok');
+      setScanFeedback('Item verified', 'ok');
       Audio.chime('item_done');
-      fireItemVerification(State.instruction, barcode);
       State.scanCount = 1;
-      State.screen = 'TRANSITIONING';
-
-      if (isLocod()) {
-        // LOCOD: auto-generate container, no tote scan needed
-        performLocodPick(State.instruction);
-      } else {
-        document.querySelector('.mpk-item-block')?.classList.add('verified');
-        const clusterPosNow = State.instruction?.cluster_position_id;
-        if (clusterPosNow) {
-          Voice.announcePosition(clusterPosNow);
-          setTimeout(() => Voice.speak('Scan tote'), 600);
-        } else {
-          setTimeout(() => Voice.speak('Scan tote'), 150);
-        }
-        setTimeout(() => renderContainerScan(), 500);
-      }
+      goToToteStep(barcode);
     } else {
       // Multiple units - show qty modal
       State.scanCount = 1;
@@ -4241,36 +5599,39 @@
 
     const clusterPos = State.instruction?.cluster_position_id;
     const existingContainer = clusterPos ? State.containersByPosition[clusterPos] : null;
+    const total = State.pickProgress?.total || '?';
+    const cur   = State.pickProgress?.current || 1;
+    const pct   = State.pickProgress?.total ? Math.round(((cur - 1) / State.pickProgress.total) * 100) : 0;
 
     root.innerHTML = `
       <div class="mpk-pick-screen" id="mpk-pick-screen">
         <div class="mpk-loc-header">
           <div class="mpk-loc-header-top">
-            <span class="mpk-loc-label">${State.instruction?.cluster_position_id ? `Pos ${State.instruction.cluster_position_id} - Scan Container` : 'Scan Container'}</span>
-            <span class="mpk-loc-progress-text">${State.pickProgress?.current || 1} / ${State.pickProgress?.total || '?'} instructions</span>
+            <span class="mpk-loc-label">${clusterPos ? `Pos ${clusterPos} - Scan tote` : 'Scan tote'}</span>
+            <span class="mpk-loc-progress-text">${cur} / ${total} picks</span>
           </div>
           <div class="mpk-loc-code">${_esc(State.instruction?.fromLocation?.location_code || '-')}</div>
           <div class="mpk-progress-track">
-            <div class="mpk-progress-fill" style="width:${State.pickProgress?.total ? Math.round(((State.pickProgress.current-1)/State.pickProgress.total)*100) : 0}%"></div>
+            <div class="mpk-progress-fill" style="width:${pct}%"></div>
           </div>
         </div>
 
         <div class="mpk-item-block verified">
           <div class="mpk-qty-label">Picked</div>
-          <div class="mpk-qty-value" style="color:#79c447">${State.scanCount}</div>
+          <div class="mpk-qty-value">${State.scanCount}</div>
           <div class="mpk-item-sku">${_esc(State.instruction?.item?.item_code || '-')}</div>
           <div class="mpk-item-desc">${_esc(State.instruction?.item?.abc_category || State.instruction?.item?.description || '')}</div>
         </div>
 
         <div class="mpk-scan-area">
-          <div class="mpk-scan-zone" id="mpk-scan-zone">
-            <div class="mpk-scan-zone-label" style="font-size:13px;font-weight:700">SCAN TOTE NOW</div>
-            ${existingContainer ? `<div style="font-size:11px;color:#20a8d8;font-weight:600;margin-top:2px">Last used: ${_esc(existingContainer)}</div>` : ''}
+          <div class="mpk-scan-zone tote" id="mpk-scan-zone">
+            <div class="mpk-scan-zone-label">Scan tote now</div>
+            ${existingContainer ? `<div class="mpk-scan-hint">Last used: ${_esc(existingContainer)}</div>` : ''}
             <div class="mpk-scan-arrows">&gt;&gt;&gt;</div>
             <input id="mpk-scan-in" type="text" inputmode="none"
               autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"/>
           </div>
-          <div class="mpk-scan-feedback dim" id="mpk-scan-fb">Ready to scan</div>
+          <div class="mpk-scan-feedback ok" id="mpk-scan-fb">Item verified - now scan the tote</div>
         </div>
 
         <div class="mpk-cluster-strip${clusterPos ? ' visible' : ''}" id="mpk-cluster-strip">
@@ -4282,18 +5643,28 @@
       </div>
       <div class="mpk-pick-actions">
         <button id="mpk-back-btn" class="mpk-btn mpk-btn-secondary">&lt;- Back</button>
+        <button id="mpk-cart-btn" class="mpk-btn mpk-btn-secondary">Cart Positions</button>
       </div>`;
 
     R.scanIn = document.getElementById('mpk-scan-in');
     R.scanFb = document.getElementById('mpk-scan-fb');
+    document.getElementById('mpk-cart-btn')?.addEventListener('click', () => { if (!closeCart()) showCartPositions(); });
     document.getElementById('mpk-back-btn')?.addEventListener('click', () => {
+      if (Busy.isActive() || State.screen !== 'SCAN_CONTAINER') { Busy.blocked('back'); return; }
       State.scanCount = 0;
       renderPickScreen(State.instruction);
     });
 
+    // Refocus the scanner on any tap in the screen (the tote screen had no
+    // handler in 4.13, so a stray tap there lost the scanner until the 2.5s poll)
+    document.getElementById('mpk-pick-screen')?.addEventListener('click', (e) => {
+      if (e.target.closest && e.target.closest('button')) return;
+      setTimeout(() => document.getElementById('mpk-scan-in')?.focus(), 50);
+    });
+
     if (R.scanIn) {
       R.scanIn.addEventListener('keydown', _onScanKeydown);
-      // Longer delay - confirm button may hold focus briefly
+      R.scanIn.focus();
       setTimeout(() => { R.scanIn?.focus(); }, 200);
     }
 
@@ -4303,16 +5674,26 @@
 
   async function onContainerScan(containerNo) {
     const label = containerNo.trim();
+    const instr = State.instruction;
 
-    // Client-side prefix validation
+    // The item scanned again on the tote step - the picker is unsure the
+    // first scan took. Tell them it did, rather than "tote does not exist".
     if (!validateContainerLabel(label)) {
-      setScanFeedback('Tote does not exist', 'err');
+      if (verifyItem(label)) {
+        setScanFeedback('Item already scanned - now scan the TOTE', 'warn');
+        Audio.chime('nudge');
+        Voice.error('Item done. Scan tote');
+        if (navigator.vibrate) navigator.vibrate([40, 40, 40]);
+        return;
+      }
+      setScanFeedback(`Not a tote: ${label}`, 'err');
       Audio.chime('error');
       Voice.error('Wrong tote');
+      if (navigator.vibrate) navigator.vibrate([60, 30, 60]);
       return;
     }
 
-    const clusterPos = State.instruction?.cluster_position_id;
+    const clusterPos = instr?.cluster_position_id;
 
     // Cluster: check if container already assigned to a DIFFERENT position
     if (clusterPos && State.containersByPosition) {
@@ -4321,114 +5702,49 @@
                State.containersByPosition[pos]?.toUpperCase() === label.toUpperCase()
       );
       if (conflictPos) {
+        // While the question is open, scans are answered, not acted on.
+        State.screen = 'TOTE_CONFIRM';
         const proceed = await showMultiToteModal(label, conflictPos, clusterPos);
+        State.screen = 'SCAN_CONTAINER';
         if (!proceed) {
-          setScanFeedback('Scan a different container', 'dim');
-          setTimeout(() => { if (R.scanIn) { R.scanIn.disabled = false; R.scanIn.focus(); } }, 100);
+          setScanFeedback('Scan a different tote', 'dim');
+          setTimeout(() => R.scanIn?.focus(), 100);
           return;
         }
       }
     }
 
-    if (R.scanIn) R.scanIn.disabled = true;
-    setScanFeedback('Confirming?', 'dim');
-
-    try {
-      if (groupQtyUnavailable(State.instruction)) {
-        setScanFeedback('Group qty unavailable - back out and re-open the job', 'err');
-        Audio.chime('error');
-        Voice.error('Group quantity unavailable');
-        if (R.scanIn) { R.scanIn.disabled = false; R.scanIn.focus(); }
-        return;
-      }
-      // scanCount is in DISPLAY units; C7 wants raw eaches.
-      const pickQty = State.scanCount
-        ? toRawQty(State.instruction, State.scanCount)
-        : effectiveQty(State.instruction);
-      const _doPerform = () => State.instruction.job_instruction_group_id
-        ? groupPerform(State.instruction, label, pickQty)
-        : performPick(State.instruction, label, pickQty);
-      let result;
-      try {
-        result = await _doPerform();
-      } catch (firstErr) {
-        if (firstErr.message?.includes('Session expired')) throw firstErr;
-        await new Promise(r => setTimeout(r, 800));
-        result = await _doPerform();
-      }
-
-      // Success
-      Audio.chime('container_ok');
-      if (navigator.vibrate) navigator.vibrate([30]);
-
-      if (clusterPos) {
-        State.containersByPosition[clusterPos] = label;
-        const stripCont = document.getElementById('mpk-cluster-container');
-        if (stripCont) { stripCont.textContent = label; stripCont.classList.add('assigned'); }
-      }
-
-      const completedId = State.instruction.id;
-
-      // Advance progress
-      if (State.pickProgress) State.pickProgress.current++;
-
-      // Save resume state after each completed pick
-      savePickResumeState();
-
-      // change-sequence only when NOT the final pick
-      if (result.job_instruction !== null) {
-        changeSequence(completedId);
-      }
-
-      // Check completion
-      const isClusterDone = result.is_cluster_job === true && result.job_instruction === null;
-      const isJobDone     = result.job_instruction === null;
-
-      if (isJobDone) {
-        // Announce completion - no next instruction to load
-        if (clusterPos) Voice.announcePosition(clusterPos);
-        renderJobComplete(isClusterDone);
-      } else {
-        // Resolve full next instruction + group record first
-        const fullNext  = await fetchNextInstruction(result.job_instruction);
-        const nextInstr = fullNext || result.job_instruction;
-        State.instruction = nextInstr;
-        State.jobId = nextInstr.job_id || State.jobId;
-        await loadGroupRecordIfNeeded(nextInstr);
-
-        // Now announce with correct qty (groupRecord loaded for SIBP/MIBP)
-        // Cluster: announce position first, then after a beat announce next location
-        if (clusterPos) {
-          Voice.announcePosition(clusterPos);
-          setTimeout(() => Voice.announceInstruction(nextInstr), 900);
-        }
-
-        renderPickScreen(nextInstr);
-        // Announce AFTER render - prevents Voice.cancel() in renderPickScreen killing it
-        if (clusterPos) {
-          setTimeout(() => Voice.announceInstruction(nextInstr, State.instruction), 200);
-        } else {
-          setTimeout(() => Voice.announceInstruction(nextInstr, State.instruction), 150);
-        }
-      }
-
-    } catch (err) {
-      if (R.scanIn) R.scanIn.disabled = false;
-
-      // Container conflict (code 1022)
-      if (err.message?.includes('belongs to another shipment') || err.message?.includes('1022')) {
-        setScanFeedback('Container belongs to another shipment', 'err');
-        Voice.error('Wrong tote');
-      } else {
-        setScanFeedback(err.message || 'Error - try again', 'err');
-        Voice.error('Error, try again');
-      }
+    if (groupQtyUnavailable(instr)) {
+      setScanFeedback('Group qty unavailable - back out and re-open the job', 'err');
       Audio.chime('error');
-      if (navigator.vibrate) navigator.vibrate([60, 30, 60]);
-      setTimeout(() => {
-        if (R.scanIn) { R.scanIn.disabled = false; R.scanIn?.focus(); }
-      }, 100);
+      Voice.error('Group quantity unavailable');
+      return;
     }
+
+    // scanCount is in DISPLAY units; C7 wants raw eaches.
+    const pickQty = State.scanCount
+      ? toRawQty(instr, State.scanCount)
+      : effectiveQty(instr);
+    const isGroup = !!instr.job_instruction_group_id;
+    // How many orders this group fans out to - from the summary list - so the
+    // busy screen can say up front how long Canary7 will take.
+    const orders  = isGroup
+      ? State.allInstructions.filter(i => i.job_instruction_group_id === instr.job_instruction_group_id).length
+      : 0;
+
+    await runPerform({
+      instruction: instr,
+      tote: label,
+      clusterPos,
+      qty: State.scanCount || displayQty(instr),
+      backTo: 'SCAN_CONTAINER',
+      title: 'Moving items to container',
+      detail: label,
+      orders: isGroup ? Math.max(1, orders) : 1,
+      call: () => isGroup
+        ? groupPerform(instr, label, pickQty)
+        : performPick(instr, label, pickQty),
+    });
   }
 
   // -- Qty numpad overlay (floats over pick screen) -------------------------
@@ -4451,16 +5767,19 @@
     // screen's own feedback strip, so anything reported via setScanFeedback()
     // while the numpad is open is invisible to the picker -- it has to surface
     // here or nowhere.
-    const _showQtyError = (msg) => {
+    const _showQtyError = (msg, tone) => {
       const el = overlay.querySelector('#mpk-numpad-err');
       if (el) {
         el.textContent = msg;
+        el.className = 'mpk-numpad-err' + (tone === 'warn' ? ' warn' : '');
         el.style.display = 'block';
       }
+      if (tone === 'warn') { Audio.chime('nudge'); return; }
       Audio.chime('error');
       Voice.error('Pick all units');
       if (navigator.vibrate) navigator.vibrate([60, 30, 60]);
     };
+    overlay._note = _showQtyError;
 
     const render = () => {
       const requiredQty = displayQty(State.instruction);
@@ -4481,7 +5800,7 @@
             ${_esc(display)}
             <span class="mpk-numpad-target">of ${requiredQty} required</span>
           </div>
-          <div id="mpk-numpad-err" style="display:none;margin:2px 8px 4px;padding:6px 8px;border-radius:4px;background:#3a1416;color:#ff6b6b;font-size:12px;font-weight:700;text-align:center;line-height:1.3"></div>
+          <div id="mpk-numpad-err" class="mpk-numpad-err"></div>
           <div class="mpk-numpad-grid">
             <button class="mpk-numpad-key" data-k="1">1</button>
             <button class="mpk-numpad-key" data-k="2">2</button>
@@ -4522,22 +5841,10 @@
               _showQtyError(`All ${requiredQty} required - a grouped pick cannot be split. Short? Use Short Pick.`);
               return;
             }
+            if (State.screen !== 'QTY_MODAL') return;   // double-tap on Confirm
             overlay.remove();
             State.scanCount = val;
-            fireItemVerification(State.instruction);
-            if (isLocod()) {
-              performLocodPick(State.instruction);
-            } else {
-              document.querySelector('.mpk-item-block')?.classList.add('verified');
-              const _cPos = State.instruction?.cluster_position_id;
-              if (_cPos) {
-                Voice.announcePosition(_cPos);
-                setTimeout(() => Voice.speak('Scan tote'), 600);
-              } else {
-                setTimeout(() => Voice.speak('Scan tote'), 150);
-              }
-              setTimeout(() => renderContainerScan(), 300);
-            }
+            goToToteStep();
           } else {
             let candidate;
             if (_firstKey) { candidate = k; }
@@ -4565,6 +5872,12 @@
       entered = String(newCount);
       render();
     };
+    // The quantity the Confirm key would send right now (4.18.2).
+    overlay._current = () => {
+      const req = displayQty(State.instruction);
+      const v = entered ? parseInt(entered, 10) : req;
+      return Math.min(isNaN(v) ? 0 : v, req);
+    };
     screen.appendChild(overlay);
 
     // Re-focus hidden scan input so scanner can still increment by scanning
@@ -4579,13 +5892,37 @@
     // multi-each UoM.
     const qty = displayQty(State.instruction);
 
+    // 4.18.2 - a TOTE scanned while the keypad is still open. Fast pickers do
+    // this straight after the last unit; 4.18.1 said "Wrong item", and 4.13
+    // dropped it. If the keypad already holds the full quantity, that is what
+    // Confirm would send anyway: confirm it and carry the tote scan straight on.
+    // If it holds less, never guess a partial pick - say what is missing.
+    if (validateContainerLabel(barcode) && !verifyItem(barcode)) {
+      const ov = document.getElementById('mpk-numpad-overlay');
+      const have = ov && ov._current ? ov._current() : State.scanCount;
+      if (have >= qty) {
+        ov?.remove();
+        State.scanCount = qty;
+        goToToteStep();
+        if (!isLocod()) onContainerScan(barcode);
+      } else {
+        if (ov && ov._note) ov._note(`Confirm the quantity first - ${have} of ${qty} counted`, 'warn');
+        Voice.error('Confirm quantity first');
+        if (navigator.vibrate) navigator.vibrate([40, 40, 40]);
+      }
+      return;
+    }
+
     // Block further scans once target reached -- prevents overscan
     if (State.scanCount >= qty) {
-      setScanFeedback('Target already reached', 'dim');
+      const ov = document.getElementById('mpk-numpad-overlay');
+      if (ov && ov._note) ov._note(`All ${qty} already counted - tap Confirm`, 'warn');
       return;
     }
 
     if (!verifyItem(barcode)) {
+      const ov = document.getElementById('mpk-numpad-overlay');
+      if (ov && ov._note) ov._note('Wrong item - that scan was not counted', 'warn');
       Audio.chime('error');
       Voice.error('Wrong item');
       if (navigator.vibrate) navigator.vibrate([60, 30, 60]);
@@ -4604,21 +5941,8 @@
     if (State.scanCount >= qty) {
       // All scanned - auto-confirm after brief pause
       Audio.chime('item_done');
-      fireItemVerification(State.instruction);
       overlay?.remove();
-      if (isLocod()) {
-        performLocodPick(State.instruction);
-      } else {
-        document.querySelector('.mpk-item-block')?.classList.add('verified');
-        const clusterPosMod = State.instruction?.cluster_position_id;
-        if (clusterPosMod) {
-          Voice.announcePosition(clusterPosMod);
-          setTimeout(() => Voice.speak('Scan tote'), 600);
-        } else {
-          setTimeout(() => Voice.speak('Scan tote'), 150);
-        }
-        setTimeout(() => renderContainerScan(), 400);
-      }
+      goToToteStep();
     }
   }
 
@@ -4628,24 +5952,23 @@
     if (!root) return;
     State.screen = 'JOB_COMPLETE';
     clearPickResumeState(); // job done - no need to resume
+    clearInflight();
 
     const total = State.pickProgress?.total || '?';
 
     root.innerHTML = `
       <div class="mpk-screen">
-        <div class="mpk-screen-header">Job Complete</div>
-        <div class="mpk-screen-body" style="align-items:center;justify-content:center;text-align:center;gap:12px">
-          <div style="font-size:56px;line-height:1">v</div>
-          <div style="font-size:20px;font-weight:700;color:#79c447">
-            ${isCluster ? 'Cluster complete' : 'Job complete'}
+        <div class="mpk-screen-body" style="justify-content:center">
+          <div class="mpk-empty-queue">
+            <div class="mpk-empty-queue-icon ok">&#10003;</div>
+            <div class="mpk-empty-queue-title">${isCluster ? 'Cluster complete' : 'Job complete'}</div>
+            <div class="mpk-empty-queue-sub">${total} ${total === 1 ? 'pick' : 'picks'} - ${_esc(State.profile?.name || '')}</div>
           </div>
-          <div style="font-size:14px;color:#9faecb">${total} instructions picked</div>
-          <div style="font-size:13px;color:#9faecb;margin-top:4px">${_esc(State.profile?.name || '')}</div>
         </div>
       </div>
       <div class="mpk-spacer"></div>
       <div class="mpk-btn-stack">
-        <button id="mpk-newjob-btn" class="mpk-btn mpk-btn-primary">Start Next Job</button>
+        <button id="mpk-newjob-btn" class="mpk-btn mpk-btn-primary">Start next job</button>
       </div>`;
 
     Voice.speak(isCluster ? 'Cluster complete' : 'Job complete');
@@ -4662,7 +5985,10 @@
   // FOCUS RECOVERY -- keeps scan input focused on TC51 after sleep/notification
   // -----------------------------------------------------------------------------
 
-  const _SCAN_SCREENS = ['PICK_ITEM', 'SCAN_CONTAINER', 'QTY_MODAL', 'SHORT_PICK_LOCATION'];
+  // PERFORMING / TOTE_CONFIRM included on purpose (v4.14.0): the scan input must
+  // keep focus while busy so stray scans are caught and answered, not lost.
+  const _SCAN_SCREENS = ['PICK_ITEM', 'SCAN_CONTAINER', 'QTY_MODAL', 'SHORT_PICK_LOCATION',
+                         'PERFORMING', 'TOTE_CONFIRM'];
 
   function _refocusScanInput() {
     if (!_SCAN_SCREENS.includes(State.screen)) return;
@@ -4696,6 +6022,9 @@
   // -----------------------------------------------------------------------------
 
   function closeUI() {
+    // v4.14.0 - closing mid-perform threw away the only screen that knew a
+    // write was in flight. Refuse; the ledger + reconcile handle crashes.
+    if (Busy.isActive()) { Busy.blocked('close'); return false; }
     // Unassign job if picker closes during summary (job assigned but not accepted)
     const preAcceptScreens = ['JOB_SUMMARY', 'JOB_NUM_ENTRY'];
     const activePickScreens = ['PICK_ITEM','SCAN_CONTAINER','QTY_MODAL','TRANSITIONING',
@@ -4781,6 +6110,15 @@
 
   function onGlobalKey(e) {
     if (!document.getElementById('mpk-tab-view')) return;
+    // A scan that landed outside our input while busy (focus lost) - still
+    // answer it. Scans from our own input are already handled by _onScan.
+    if (Busy.isActive() && (e.key === 'Enter' || e.keyCode === 13) &&
+        !(e.target && e.target.id === 'mpk-scan-in')) {
+      e.preventDefault();
+      Busy.blocked('scan');
+      return;
+    }
+    if (e.key === 'Escape' && closeCart()) { e.preventDefault(); return; }
     if (e.key === 'Escape') {
       e.preventDefault();
       closeUI();
@@ -4815,7 +6153,7 @@
   // -----------------------------------------------------------------------------
   // Exposed for on-device troubleshooting and the offline test harness.
   // -----------------------------------------------------------------------------
-  // v4.11.0 — this script now takes a @grant, so bare `window` here is the
+  // v4.11.0 - this script now takes a @grant, so bare `window` here is the
   // Tampermonkey sandbox window, not the page's. Without unsafeWindow this
   // handle is invisible to the on-device console, which on a TC51 is the only
   // debugging available.
@@ -4825,7 +6163,7 @@
     // '4.10.0' on a 4.10.1 file, so anyone checking the running build was told
     // the wrong answer. GM_info is absent in the Node test harness, hence the
     // literal fallback.
-    VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '4.11.0',
+    VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '4.18.2',
     reportPickError,
     currentOperatorName,
     ERROR_LOG_URL,
@@ -4833,6 +6171,13 @@
     openPick, closeUI, injectNav,
     showOurs, hideOurs, syncTabs, restoreOtherPanels,
     getToken, hasToken: () => !!getToken(),
+    // v4.14.0 - offline harness (malpa-pick.test.js)
+    Busy, Rate, progressAt, runPerform, loadQueueStats, paintQueueStats, renderProfileSelect, orderProfiles, fetchJobInstructionsFast, showCartPositions, closeCart, recordToteContents, cartSlots, toteColour, lastPickBannerHtml, verifyPerformLanded, classifyPerformError, reconcilePerform,
+    reconcileInflightOnEntry, loadInflight, saveInflight, clearInflight,
+    fetchJobInstructions, countPickActions, prefetchGroupRecord, loadGroupRecordIfNeeded,
+    get groupCache() { return _groupCache; },
+    _onScan, onItemScan, onContainerScan, renderPickScreen, renderContainerScan,
+    renderJobSummary, onAcceptJob, onStartPicking, onShortPickConfirm, injectCSS,
   };
 
   // -----------------------------------------------------------------------------
