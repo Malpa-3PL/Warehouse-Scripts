@@ -388,6 +388,8 @@ const tick = async (k = 6) => { for (let i = 0; i < k; i++) await flush(); };
      /id="mpk-last"[\s\S]*?GUT-FIBRE-1[\s\S]*?B197[\s\S]*?mpk-pick-actions[\s\S]*?mpk-shortpick-btn/
        .test(sandbox.document.getElementById('mpk-root')._html));
   ok('banner shows an HH:MM:SS time', /mpk-last-time">\d\d:\d\d:\d\d</.test(sandbox.document.getElementById('mpk-root')._html));
+  ok('banner shows units under the quantity', /<b>100<\/b><small>units<\/small>/.test(sandbox.document.getElementById('mpk-root')._html));
+  ok('banner is a reminder, not a button', /<div class="mpk-last" id="mpk-last"/.test(sandbox.document.getElementById('mpk-root')._html));
   ok('the move is recorded against the tote for Cart Positions',
      T.State.toteContents.B197 && T.State.toteContents.B197.items[0].qty === 100 &&
      T.State.toteContents.B197.items[0].sku === 'GUT-FIBRE-1');
