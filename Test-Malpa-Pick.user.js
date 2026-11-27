@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Pick TEST
 // @namespace    https://malpa.canary7.com/test
-// @version      4.18.0
+// @version      4.18.1
 // @description  TEST BUILD of Malpa Pick (scan guards, faster summary, portal styling). Disable "Malpa Pick" in Tampermonkey on any device running this.
 // @author       Malpa 3PL
 // @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/Test-Malpa-Pick.user.js
@@ -1573,7 +1573,10 @@
                role="progressbar" aria-valuemin="0" aria-valuemax="100">
             <div class="mpk-busy-fill" id="mpk-busy-fill"></div>
           </div>
-          <div class="mpk-busy-left" id="mpk-busy-left"></div>
+          <div class="mpk-busy-meta">
+            <span class="mpk-busy-pct" id="mpk-busy-pct"></span>
+            <span class="mpk-busy-left" id="mpk-busy-left"></span>
+          </div>
         </div>
         <div class="mpk-busy-actions" id="mpk-busy-actions">
           <button id="mpk-busy-check" class="mpk-btn mpk-btn-secondary">Check with Canary7</button>
@@ -1597,9 +1600,15 @@
       const fill  = document.getElementById('mpk-busy-fill');
       const track = document.getElementById('mpk-busy-track');
       const left  = document.getElementById('mpk-busy-left');
+      const pctEl = document.getElementById('mpk-busy-pct');
+      if (!a.estMs && !a.done && pctEl) pctEl.textContent = '';   // sliding bar: no fake %
       if (a.estMs || a.done) {
         const p = a.done ? 1 : progressAt(t, a.estMs);
-        if (track) { track.classList.remove('indeterminate'); track.setAttribute('aria-valuenow', String(Math.round(p * 100))); }
+        // 4.18.1: the % is the bar's own position (estimate-driven), shown as a
+        // whole number. It tops out at 99% until Canary7 actually answers.
+        const pct = a.done ? 100 : Math.min(99, Math.floor(p * 100));
+        if (pctEl) pctEl.textContent = pct + '%';
+        if (track) { track.classList.remove('indeterminate'); track.setAttribute('aria-valuenow', String(pct)); }
         if (fill) fill.style.width = (p * 100).toFixed(1) + '%';
         if (left) {
           const secs = Math.ceil((a.estMs - t) / 1000);
@@ -2931,8 +2940,21 @@
         animation: mpk-slide 1.2s var(--mpk-ease) infinite;
       }
       @keyframes mpk-slide { to { left: 100%; } }
+      #mpk-busy .mpk-busy-meta {
+        width: 100%;
+        min-height: 22px;
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 8px;
+      }
+      #mpk-busy .mpk-busy-pct {
+        font-size: 18px;
+        font-weight: 700;
+        color: var(--mpk-text);
+        font-variant-numeric: tabular-nums;
+      }
       #mpk-busy .mpk-busy-left {
-        min-height: 18px;
         font-size: 13px;
         color: var(--mpk-muted);
         font-variant-numeric: tabular-nums;
@@ -6124,7 +6146,7 @@
     // '4.10.0' on a 4.10.1 file, so anyone checking the running build was told
     // the wrong answer. GM_info is absent in the Node test harness, hence the
     // literal fallback.
-    VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '4.18.0',
+    VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '4.18.1',
     reportPickError,
     currentOperatorName,
     ERROR_LOG_URL,
