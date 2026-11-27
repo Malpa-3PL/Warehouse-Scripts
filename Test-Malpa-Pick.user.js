@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Pick TEST
 // @namespace    https://malpa.canary7.com/test
-// @version      4.17.1
+// @version      4.18.0
 // @description  TEST BUILD of Malpa Pick (scan guards, faster summary, portal styling). Disable "Malpa Pick" in Tampermonkey on any device running this.
 // @author       Malpa 3PL
 // @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/Test-Malpa-Pick.user.js
@@ -1318,6 +1318,7 @@
         pickProgressTotal:    State.pickProgress?.total   || 1,
         containersByPosition: State.containersByPosition,
         toteContents:         State.toteContents,
+        lastPick:             State.lastPick,
         savedAt:              Date.now(),
       };
       sessionStorage.setItem(_RESUME_KEY, JSON.stringify(snapshot));
@@ -1647,6 +1648,7 @@
     barcodeMap: {},          // barcode -> instruction_id lookup, built at accept
     containerPrefixes: [],   // valid container prefixes for O(1) validation
     toteContents: {},        // 4.17.0: TOTE -> { tote, pos, items[] } picked on this device this job
+    lastPick: null,          // 4.18.0: { sku, desc, qty, uom, tote, pos, at } for the Last scanned banner
 
     reset() {
       this.screen = 'PROFILE_SELECT';
@@ -1665,6 +1667,7 @@
       this.containerPrefixes = [];
       this.lastItemScan = null;
       this.toteContents = {};
+      this.lastPick = null;
       try { _groupCache.clear(); } catch (_) {}
     },
   };
@@ -2380,6 +2383,48 @@
       .mpk-reason-btn .mpk-reason-icon { font-size: 14px; flex-shrink: 0; color: var(--mpk-warn-fg); font-weight: 700; }
 
       /* -- Bottom action bar -- */
+      /* -- Last scanned banner (4.18.0) -- */
+      .mpk-last {
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+        width: 100%;
+        padding: 7px 12px 8px;
+        background: var(--mpk-subtle);
+        border: none;
+        border-top: 1px solid var(--mpk-border);
+        text-align: left;
+        font-family: var(--mpk-font);
+        color: var(--mpk-text);
+        flex-shrink: 0;
+        cursor: pointer;
+        -webkit-tap-highlight-color: transparent;
+        touch-action: manipulation;
+      }
+      .mpk-last:active { background: var(--mpk-hover); }
+      .mpk-last-k {
+        display: flex; justify-content: space-between;
+        font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+        color: var(--mpk-muted);
+      }
+      .mpk-last-time { font-family: var(--mpk-mono); font-weight: 500; letter-spacing: 0; text-transform: none; font-variant-numeric: tabular-nums; }
+      .mpk-last-row { display: flex; align-items: center; gap: 10px; min-width: 0; }
+      .mpk-last-qty { font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+      .mpk-last-what { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+      .mpk-last-what .mpk-mono { font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .mpk-last-desc { font-size: 11px; color: var(--mpk-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .mpk-last-tote {
+        display: inline-flex; align-items: center; gap: 6px;
+        flex-shrink: 0;
+        padding: 4px 8px;
+        border-radius: var(--mpk-r-sm);
+        border: 1px solid var(--mpk-border-strong);
+        background: var(--mpk-surface);
+        font-size: 13px;
+        font-weight: 600;
+      }
+      .mpk-last-tote.coloured { background: var(--cart-bg); color: var(--cart-fg); border-color: rgb(20 21 63 / 0.18); }
+      .mpk-last-pos { font-weight: 800; }
       .mpk-pick-actions {
         display: flex;
         gap: 8px;
@@ -4175,6 +4220,7 @@
         </div>
 
       </div>
+      ${lastPickBannerHtml()}
       <div class="mpk-pick-actions">
         <button id="mpk-shortpick-btn" class="mpk-btn mpk-btn-secondary">Short Pick</button>
         <button id="mpk-cart-btn" class="mpk-btn mpk-btn-secondary">Cart Positions</button>
@@ -4183,6 +4229,13 @@
     R.scanIn       = document.getElementById('mpk-scan-in');
     R.scanFb       = document.getElementById('mpk-scan-fb');
     R.shortPickBtn = document.getElementById('mpk-shortpick-btn');
+    document.getElementById('mpk-last')?.addEventListener('click', () => {
+      if (Busy.isActive()) return;
+      showCartPositions();
+      const lp = State.lastPick;
+      const slot = lp && lp.tote ? cartSlots().slots.find(x => x.tote && x.tote.toUpperCase() === lp.tote.toUpperCase()) : null;
+      if (slot) showToteDetail(slot);
+    });
     document.getElementById('mpk-cart-btn')?.addEventListener('click', () => { if (!closeCart()) showCartPositions(); });
 
     if (R.scanIn) {
@@ -4318,6 +4371,38 @@
       else if (pre.length === best.pre.length && !best.colour && m) best.colour = m[1].toLowerCase().replace('gray', 'grey');
     }
     return best && best.colour ? Object.assign({ name: best.colour }, _TOTE_PALETTE[best.colour]) : null;
+  }
+
+  /**
+   * "Last scanned" banner (4.18.0) - above Short Pick / Cart Positions. Shows
+   * the last CONFIRMED pick: quantity, item, the tote it went into (in the
+   * tote's colour) and the time. Tapping it opens Cart Positions on that tote.
+   */
+  function _clock(ts) {
+    const d = new Date(ts);
+    const p = (n) => String(n).padStart(2, '0');
+    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  }
+  function lastPickBannerHtml() {
+    const lp = State.lastPick;
+    if (!lp) return '';
+    const c = toteColour(lp.tote);
+    const uom = lp.uom && lp.uom.toLowerCase() !== 'each' ? ' ' + _esc(lp.uom) : '';
+    return `
+      <button type="button" class="mpk-last" id="mpk-last" aria-label="Last scanned">
+        <span class="mpk-last-k">Last scanned <span class="mpk-last-time">${_clock(lp.at)}</span></span>
+        <span class="mpk-last-row">
+          <span class="mpk-last-qty">${_esc(String(lp.qty))}${uom}</span>
+          <span class="mpk-last-what">
+            <span class="mpk-mono">${_esc(lp.sku)}</span>
+            <span class="mpk-last-desc">${_esc(lp.desc)}</span>
+          </span>
+          <span class="mpk-last-tote${c ? ' coloured' : ''}"${c ? ` style="--cart-bg:${c.bg};--cart-fg:${c.fg}"` : ''}>
+            ${lp.pos ? `<span class="mpk-last-pos">${_esc(String(lp.pos))}</span>` : ''}
+            <span class="mpk-mono">${lp.tote ? _esc(lp.tote) : 'Auto'}</span>
+          </span>
+        </span>
+      </button>`;
   }
 
   function recordToteContents(tote, instr, pos, qty) {
@@ -4718,6 +4803,7 @@
       // Restore container positions
       State.containersByPosition = resumeState.containersByPosition || {};
       State.toteContents = resumeState.toteContents || {};
+      State.lastPick = resumeState.lastPick || null;
 
       // Build prefix list
       State.containerPrefixes = State.containerTypes
@@ -5110,6 +5196,7 @@
     return runPerform({
       instruction,
       title: 'Moving items to container',
+      locod: true,
       extraMs: 1500,                 // container lookup / generate before the perform
       backTo: 'PICK_ITEM',
       call: async () => {
@@ -5285,6 +5372,17 @@
       }
       if (opts.tote) State.lastTote = { tote: opts.tote, instrId: instr.id, at: Date.now() };
       if (opts.tote) recordToteContents(opts.tote, instr, opts.clusterPos, opts.qty);
+      if (opts.tote || opts.locod) {
+        State.lastPick = {
+          sku:  instr.item?.item_code || '-',
+          desc: instr.item?.abc_category || instr.item?.description || '',
+          qty:  opts.qty != null ? opts.qty : displayQty(instr),
+          uom:  instr.itemUnitOfMeasure?.unitOfMeasure?.name || '',
+          tote: opts.tote || null,
+          pos:  opts.clusterPos || null,
+          at:   Date.now(),
+        };
+      }
       await advanceAfterPerform(instr, nextHint, isJobDone, isClusterDone, opts.clusterPos, note);
     }
 
@@ -6026,7 +6124,7 @@
     // '4.10.0' on a 4.10.1 file, so anyone checking the running build was told
     // the wrong answer. GM_info is absent in the Node test harness, hence the
     // literal fallback.
-    VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '4.17.1',
+    VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '4.18.0',
     reportPickError,
     currentOperatorName,
     ERROR_LOG_URL,
@@ -6035,7 +6133,7 @@
     showOurs, hideOurs, syncTabs, restoreOtherPanels,
     getToken, hasToken: () => !!getToken(),
     // v4.14.0 - offline harness (malpa-pick.test.js)
-    Busy, Rate, progressAt, runPerform, loadQueueStats, paintQueueStats, renderProfileSelect, orderProfiles, fetchJobInstructionsFast, showCartPositions, closeCart, recordToteContents, cartSlots, toteColour, verifyPerformLanded, classifyPerformError, reconcilePerform,
+    Busy, Rate, progressAt, runPerform, loadQueueStats, paintQueueStats, renderProfileSelect, orderProfiles, fetchJobInstructionsFast, showCartPositions, closeCart, recordToteContents, cartSlots, toteColour, lastPickBannerHtml, verifyPerformLanded, classifyPerformError, reconcilePerform,
     reconcileInflightOnEntry, loadInflight, saveInflight, clearInflight,
     fetchJobInstructions, countPickActions, prefetchGroupRecord, loadGroupRecordIfNeeded,
     get groupCache() { return _groupCache; },

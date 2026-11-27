@@ -381,6 +381,13 @@ const tick = async (k = 6) => { for (let i = 0; i < k; i++) await flush(); };
   ok('ledger cleared', !T.loadInflight());
   eq('still exactly one group-perform', n('group-perform', 'POST'), 1);
   eq('picking_qty is the whole group', posted.find(x => x.url.includes('group-perform')).body.picking_qty, 100);
+  ok('last scanned = the confirmed pick (qty, item, tote, time)',
+     T.State.lastPick && T.State.lastPick.qty === 100 && T.State.lastPick.tote === 'B197' &&
+     T.State.lastPick.sku === 'GUT-FIBRE-1' && Date.now() - T.State.lastPick.at < 60000);
+  ok('banner sits above Short Pick on the next pick screen',
+     /id="mpk-last"[\s\S]*?GUT-FIBRE-1[\s\S]*?B197[\s\S]*?mpk-pick-actions[\s\S]*?mpk-shortpick-btn/
+       .test(sandbox.document.getElementById('mpk-root')._html));
+  ok('banner shows an HH:MM:SS time', /mpk-last-time">\d\d:\d\d:\d\d</.test(sandbox.document.getElementById('mpk-root')._html));
   ok('the move is recorded against the tote for Cart Positions',
      T.State.toteContents.B197 && T.State.toteContents.B197.items[0].qty === 100 &&
      T.State.toteContents.B197.items[0].sku === 'GUT-FIBRE-1');
@@ -566,6 +573,9 @@ const tick = async (k = 6) => { for (let i = 0; i < k; i++) await flush(); };
      ['MIBP', 'SIBP', 'Group 1 Clusters', 'Group 6 Clusters', 'Wholesale Cluster']);
 
   console.log('\n14. Cart Positions');
+  T.State.reset();
+  T.renderPickScreen(I2);
+  ok('no banner before the first pick of a job', !/id="mpk-last"/.test(sandbox.document.getElementById('mpk-root')._html));
   T.State.reset();
   T.State.profile = { id: 40, name: 'Group 1 Clusters' };
   T.State.jobId = 1;
