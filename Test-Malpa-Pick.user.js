@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Pick TEST
 // @namespace    https://malpa.canary7.com/test
-// @version      4.15.0
+// @version      4.15.1
 // @description  TEST BUILD of Malpa Pick (scan guards, faster summary, portal styling). Disable "Malpa Pick" in Tampermonkey on any device running this.
 // @author       Malpa 3PL
 // @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/Test-Malpa-Pick.user.js
@@ -3193,6 +3193,8 @@
     return _queues.inflight;
   }
 
+  function _plural(n, word) { return n === 1 ? word : word + 's'; }
+
   function _fmtInt(n) {
     return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
   }
@@ -3218,8 +3220,8 @@
       row.classList.toggle('empty', s.remaining === 0);
       if (meta) {
         meta.textContent = s.remaining === 0
-          ? (s.picked_today ? `All picked - ${_fmtInt(s.picked_today)} today` : 'No shipments')
-          : `${_fmtInt(s.remaining)} left to pick`;
+          ? (s.picked_today ? `All picked - ${_fmtInt(s.picked_today)} ${_plural(s.picked_today, 'shipment')} today` : 'No shipments')
+          : `${_fmtInt(s.remaining)} ${_plural(s.remaining, 'shipment')} left to pick`;
       }
       if (pct)  pct.textContent = s.pct == null ? '' : s.pct + '%';
       if (fill) fill.style.width = (s.pct == null ? 0 : s.pct) + '%';
@@ -5644,7 +5646,7 @@
     // '4.10.0' on a 4.10.1 file, so anyone checking the running build was told
     // the wrong answer. GM_info is absent in the Node test harness, hence the
     // literal fallback.
-    VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '4.15.0',
+    VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '4.15.1',
     reportPickError,
     currentOperatorName,
     ERROR_LOG_URL,

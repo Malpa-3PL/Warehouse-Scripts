@@ -516,7 +516,7 @@ const tick = async (k = 6) => { for (let i = 0; i < k; i++) await flush(); };
   await tick(10);
   const g = (id) => (sandbox.document.getElementById(id) || {}).textContent;
   ok('asked the LAN proxy, not Canary7 or Metabase', gmCalls.some(u => u === 'http://192.168.1.27:8790/pick-queues'));
-  eq('MIBP shows shipments left (thousands separator)', g('mpk-q-meta-48'), '1,908 left to pick');
+  eq('MIBP shows shipments left (thousands separator)', g('mpk-q-meta-48'), '1,908 shipments left to pick');
   eq('and % picked today', [g('mpk-q-pct-47'), g('mpk-q-pct-48')], ['61%', '51%']);
   eq('an empty queue says so, with no fake %', [g('mpk-q-meta-53'), g('mpk-q-pct-53')], ['No shipments', '']);
   ok('freshness shown', /Updated just now/.test(g('mpk-q-updated')));
