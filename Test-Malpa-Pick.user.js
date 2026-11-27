@@ -3154,9 +3154,10 @@
   //   GET http://192.168.1.27:8790/pick-queues
   //   -> { ok, as_of, age_s, stale, queues: { "<profile_id>":
   //        { remaining, picked_today, pct } } }
-  // remaining    = shipments in Pick Pending with an open instruction in the
-  //                profile's job types
-  // picked_today = shipments in those job types fully picked today (Brisbane)
+  // Counted in JOB INSTRUCTIONS (4.15.1):
+  // remaining    = open (status 1/2) instructions in the profile's job types,
+  //                on shipments still in Pick Pending
+  // picked_today = instructions in those job types completed today (Brisbane)
   // pct          = picked_today / (picked_today + remaining); null when both 0
   //
   // Purely informational: if the proxy is down the list simply shows no
@@ -3211,7 +3212,7 @@
       const fill = document.getElementById('mpk-q-fill-' + p.id);
       const pct  = document.getElementById('mpk-q-pct-' + p.id);
       if (!s) {
-        if (meta) meta.textContent = q ? 'No shipments' : '';
+        if (meta) meta.textContent = q ? 'Nothing to pick' : '';
         if (pct) pct.textContent = '';
         if (fill) fill.style.width = '0%';
         row.classList.toggle('empty', !!q);
@@ -3220,8 +3221,8 @@
       row.classList.toggle('empty', s.remaining === 0);
       if (meta) {
         meta.textContent = s.remaining === 0
-          ? (s.picked_today ? `All picked - ${_fmtInt(s.picked_today)} ${_plural(s.picked_today, 'shipment')} today` : 'No shipments')
-          : `${_fmtInt(s.remaining)} ${_plural(s.remaining, 'shipment')} left to pick`;
+          ? (s.picked_today ? `All picked - ${_fmtInt(s.picked_today)} ${_plural(s.picked_today, 'instruction')} today` : 'Nothing to pick')
+          : `${_fmtInt(s.remaining)} ${_plural(s.remaining, 'instruction')} left to pick`;
       }
       if (pct)  pct.textContent = s.pct == null ? '' : s.pct + '%';
       if (fill) fill.style.width = (s.pct == null ? 0 : s.pct) + '%';
