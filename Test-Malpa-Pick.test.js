@@ -381,6 +381,9 @@ const tick = async (k = 6) => { for (let i = 0; i < k; i++) await flush(); };
   ok('ledger cleared', !T.loadInflight());
   eq('still exactly one group-perform', n('group-perform', 'POST'), 1);
   eq('picking_qty is the whole group', posted.find(x => x.url.includes('group-perform')).body.picking_qty, 100);
+  ok('the move is recorded against the tote for Cart Positions',
+     T.State.toteContents.B197 && T.State.toteContents.B197.items[0].qty === 100 &&
+     T.State.toteContents.B197.items[0].sku === 'GUT-FIBRE-1');
 
   console.log('\n5. Gateway timeout, but Canary7 DID finish -> no retry, carry on');
   stubFetch({
@@ -561,6 +564,37 @@ const tick = async (k = 6) => { for (let i = 0; i < k; i++) await flush(); };
        47: { remaining: 693, picked_today: 1257, pct: 64 },
        48: { remaining: 4837, picked_today: 3791, pct: 44 } } })),   // 53 missing = nothing
      ['MIBP', 'SIBP', 'Group 1 Clusters', 'Group 6 Clusters', 'Wholesale Cluster']);
+
+  console.log('\n14. Cart Positions');
+  T.State.reset();
+  T.State.profile = { id: 40, name: 'Group 1 Clusters' };
+  T.State.jobId = 1;
+  T.State.containersByPosition = { 3: 'B197', 7: 'W128' };
+  T.State.containerPrefixes = ['B', 'W'];
+  const C = Object.assign({}, I2, { cluster_position_id: 3 });
+  T.State.instruction = C;
+  T.State.groupRecord = { units: 40 };
+  T.recordToteContents('B197', C, 3, 2);
+  T.recordToteContents('B197', I1, 3, 1);
+  T.renderPickScreen(C);
+  const rootHtml = sandbox.document.getElementById('mpk-root')._html;
+  ok('Short Pick and Cart Positions share the action bar',
+     /mpk-shortpick-btn[\s\S]*mpk-cart-btn/.test(rootHtml));
+  T.showCartPositions();
+  const cart = sandbox.document.getElementById('mpk-cart');
+  ok('opens', !!cart);
+  const html = cart ? cart._html : '';
+  eq('4 x 5 grid for up to 20 positions', (html.match(/class="mpk-cart-cell/g) || []).length, 20);
+  ok('position 3 shows its tote and pick count', /mpk-cart-pos-3"[\s\S]*?B197[\s\S]*?2 picks/.test(html));
+  ok('current pick\'s position highlighted', /mpk-cart-cell has current" *\n? *id="mpk-cart-pos-3"/.test(html));
+  T.State.containersByPosition[23] = 'B300';
+  eq('more positions -> more rows (24 slots for position 23)', T.cartSlots().slots.length, 24);
+  T._onScan('9300000000011');
+  ok('any scan closes it...', !sandbox.document.getElementById('mpk-cart'));
+  eq('...and still counts as the item scan', T.State.screen === 'SCAN_CONTAINER' || T.State.screen === 'QTY_MODAL', true);
+  T.State.containersByPosition = {};
+  T.State.instruction = Object.assign({}, I2, { cluster_position_id: null });
+  eq('no cluster positions: lists the totes used', T.cartSlots().slots.map(x => x.tote), ['B197']);
 
   console.log('\n11. Short pick goes through the same lock');
   stubFetch({ 'pick-short': { job_instruction: null } });
