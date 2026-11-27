@@ -388,6 +388,8 @@ const tick = async (k = 6) => { for (let i = 0; i < k; i++) await flush(); };
      /id="mpk-last"[\s\S]*?GUT-FIBRE-1[\s\S]*?B197[\s\S]*?mpk-pick-actions[\s\S]*?mpk-shortpick-btn/
        .test(sandbox.document.getElementById('mpk-root')._html));
   ok('banner shows an HH:MM:SS time', /mpk-last-time">\d\d:\d\d:\d\d</.test(sandbox.document.getElementById('mpk-root')._html));
+  ok('banner shows units under the quantity', /<b>100<\/b><small>units<\/small>/.test(sandbox.document.getElementById('mpk-root')._html));
+  ok('banner is a reminder, not a button', /<div class="mpk-last" id="mpk-last"/.test(sandbox.document.getElementById('mpk-root')._html));
   ok('the move is recorded against the tote for Cart Positions',
      T.State.toteContents.B197 && T.State.toteContents.B197.items[0].qty === 100 &&
      T.State.toteContents.B197.items[0].sku === 'GUT-FIBRE-1');
@@ -465,6 +467,23 @@ const tick = async (k = 6) => { for (let i = 0; i < k; i++) await flush(); };
   await s1; await s2; await tick();
   eq('one get-job-instructions call', n('get-job-instructions'), 1);
   ok('group record prefetched from the summary screen', T.groupCache.has(75831));
+
+  console.log('\n4c. Percentage on the wait bar');
+  T.Busy.start('perform', 'Moving items to container', { estMs: 10000 });
+  T.Busy.active.startedAt = Date.now() - 5000;          // half way to the estimate
+  T.Busy._refresh();
+  const pctTxt = () => (sandbox.document.getElementById('mpk-busy-pct') || {}).textContent;
+  eq('half the estimate -> 45%', pctTxt(), '45%');
+  T.Busy.active.startedAt = Date.now() - 1e9;           // far past the estimate
+  T.Busy._refresh();
+  eq('never shows 100% while still waiting', pctTxt(), '99%');
+  T.Busy.complete();
+  eq('100% once Canary7 answers', pctTxt(), '100%');
+  T.Busy.update('Checking with Canary7', { indeterminate: true });
+  T.Busy.active.done = false;
+  T.Busy._refresh();
+  eq('no % on the sliding (checking) bar', pctTxt(), '');
+  T.Busy.end();
 
   console.log('\n4b. Progress estimate');
   const P = T.progressAt;

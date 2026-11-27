@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Pick TEST
 // @namespace    https://malpa.canary7.com/test
-// @version      4.18.0
+// @version      4.18.1
 // @description  TEST BUILD of Malpa Pick (scan guards, faster summary, portal styling). Disable "Malpa Pick" in Tampermonkey on any device running this.
 // @author       Malpa 3PL
 // @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/Test-Malpa-Pick.user.js
@@ -1573,7 +1573,10 @@
                role="progressbar" aria-valuemin="0" aria-valuemax="100">
             <div class="mpk-busy-fill" id="mpk-busy-fill"></div>
           </div>
-          <div class="mpk-busy-left" id="mpk-busy-left"></div>
+          <div class="mpk-busy-meta">
+            <span class="mpk-busy-pct" id="mpk-busy-pct"></span>
+            <span class="mpk-busy-left" id="mpk-busy-left"></span>
+          </div>
         </div>
         <div class="mpk-busy-actions" id="mpk-busy-actions">
           <button id="mpk-busy-check" class="mpk-btn mpk-btn-secondary">Check with Canary7</button>
@@ -1597,9 +1600,15 @@
       const fill  = document.getElementById('mpk-busy-fill');
       const track = document.getElementById('mpk-busy-track');
       const left  = document.getElementById('mpk-busy-left');
+      const pctEl = document.getElementById('mpk-busy-pct');
+      if (!a.estMs && !a.done && pctEl) pctEl.textContent = '';   // sliding bar: no fake %
       if (a.estMs || a.done) {
         const p = a.done ? 1 : progressAt(t, a.estMs);
-        if (track) { track.classList.remove('indeterminate'); track.setAttribute('aria-valuenow', String(Math.round(p * 100))); }
+        // 4.18.1: the % is the bar's own position (estimate-driven), shown as a
+        // whole number. It tops out at 99% until Canary7 actually answers.
+        const pct = a.done ? 100 : Math.min(99, Math.floor(p * 100));
+        if (pctEl) pctEl.textContent = pct + '%';
+        if (track) { track.classList.remove('indeterminate'); track.setAttribute('aria-valuenow', String(pct)); }
         if (fill) fill.style.width = (p * 100).toFixed(1) + '%';
         if (left) {
           const secs = Math.ceil((a.estMs - t) / 1000);
@@ -2383,48 +2392,45 @@
       .mpk-reason-btn .mpk-reason-icon { font-size: 14px; flex-shrink: 0; color: var(--mpk-warn-fg); font-weight: 700; }
 
       /* -- Bottom action bar -- */
-      /* -- Last scanned banner (4.18.0) -- */
+      /* -- Last scanned strip (4.18.0, compact 4.18.1) -- */
       .mpk-last {
         display: flex;
-        flex-direction: column;
-        gap: 3px;
-        width: 100%;
-        padding: 7px 12px 8px;
+        align-items: center;
+        gap: 8px;
+        padding: 3px 12px;
+        min-height: 32px;
         background: var(--mpk-subtle);
-        border: none;
         border-top: 1px solid var(--mpk-border);
-        text-align: left;
         font-family: var(--mpk-font);
         color: var(--mpk-text);
         flex-shrink: 0;
-        cursor: pointer;
-        -webkit-tap-highlight-color: transparent;
-        touch-action: manipulation;
+        pointer-events: none;            /* a reminder, not a control */
       }
-      .mpk-last:active { background: var(--mpk-hover); }
-      .mpk-last-k {
-        display: flex; justify-content: space-between;
-        font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
-        color: var(--mpk-muted);
-      }
-      .mpk-last-time { font-family: var(--mpk-mono); font-weight: 500; letter-spacing: 0; text-transform: none; font-variant-numeric: tabular-nums; }
-      .mpk-last-row { display: flex; align-items: center; gap: 10px; min-width: 0; }
-      .mpk-last-qty { font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; flex-shrink: 0; }
-      .mpk-last-what { display: flex; flex-direction: column; min-width: 0; flex: 1; }
-      .mpk-last-what .mpk-mono { font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .mpk-last-qty { display: flex; flex-direction: column; align-items: center; line-height: 1; flex-shrink: 0; min-width: 32px; }
+      .mpk-last-qty b { font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; }
+      .mpk-last-qty small { font-size: 9px; font-weight: 600; color: var(--mpk-muted); text-transform: uppercase; letter-spacing: .04em; margin-top: 1px; }
+      .mpk-last-what { display: flex; align-items: baseline; gap: 6px; min-width: 0; flex: 1; overflow: hidden; }
+      .mpk-last-what .mpk-mono { font-size: 12px; font-weight: 500; white-space: nowrap; flex-shrink: 0; }
       .mpk-last-desc { font-size: 11px; color: var(--mpk-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .mpk-last-tote {
-        display: inline-flex; align-items: center; gap: 6px;
+        display: inline-flex; align-items: center; gap: 4px;
         flex-shrink: 0;
-        padding: 4px 8px;
+        padding: 2px 6px;
         border-radius: var(--mpk-r-sm);
         border: 1px solid var(--mpk-border-strong);
         background: var(--mpk-surface);
-        font-size: 13px;
+        font-size: 12px;
         font-weight: 600;
       }
       .mpk-last-tote.coloured { background: var(--cart-bg); color: var(--cart-fg); border-color: rgb(20 21 63 / 0.18); }
       .mpk-last-pos { font-weight: 800; }
+      .mpk-last-k {
+        flex-shrink: 0;
+        font-size: 9px; line-height: 1.15; font-weight: 700;
+        letter-spacing: .06em; text-transform: uppercase; text-align: right;
+        color: var(--mpk-muted);
+      }
+      .mpk-last-time { font-family: var(--mpk-mono); font-weight: 500; letter-spacing: 0; font-size: 10px; font-variant-numeric: tabular-nums; }
       .mpk-pick-actions {
         display: flex;
         gap: 8px;
@@ -2843,24 +2849,27 @@
         border-radius: 12px 12px 0 0;
       }
       .mpk-cart-detail.open { display: flex; }
-      .mpk-cart-items { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; border-top: 1px solid var(--mpk-border); }
+      .mpk-cart-items { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; }
       .mpk-cart-item {
-        display: flex;
-        align-items: center;
-        gap: 12px;
-        padding: 10px 4px;
+        display: grid;
+        grid-template-columns: 40px minmax(0, auto) minmax(0, 1fr);
+        align-items: baseline;
+        gap: 10px;
+        padding: 5px 4px;
         border-bottom: 1px solid var(--mpk-border);
+        font-size: 13px;
       }
-      .mpk-cart-qty {
-        min-width: 48px;
-        font-size: 18px;
-        font-weight: 700;
-        text-align: right;
-        font-variant-numeric: tabular-nums;
+      .mpk-cart-item.head {
+        font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
+        color: var(--mpk-muted);
+        padding-top: 0;
       }
-      .mpk-cart-what { display: flex; flex-direction: column; min-width: 0; }
-      .mpk-cart-what .mpk-mono { font-size: 14px; font-weight: 500; }
-      .mpk-cart-desc { font-size: 12px; color: var(--mpk-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .mpk-cart-qty { font-weight: 700; text-align: right; font-variant-numeric: tabular-nums; }
+      .mpk-cart-item:not(.head) .mpk-cart-qty { font-size: 15px; }
+      .mpk-cart-sku { font-size: 12px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .mpk-cart-desc { color: var(--mpk-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .mpk-cart-detail { gap: 6px; padding: 10px 12px 8px; }
+      .mpk-cart-detail .mpk-cart-x { min-width: 40px; min-height: 40px; }
 
       /* == BUSY LOCK (v4.14.0, card + progress bar 4.14.2) ================
          Covers the whole panel - scan zone, Back, Short Pick - while
@@ -2931,8 +2940,21 @@
         animation: mpk-slide 1.2s var(--mpk-ease) infinite;
       }
       @keyframes mpk-slide { to { left: 100%; } }
+      #mpk-busy .mpk-busy-meta {
+        width: 100%;
+        min-height: 22px;
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 8px;
+      }
+      #mpk-busy .mpk-busy-pct {
+        font-size: 18px;
+        font-weight: 700;
+        color: var(--mpk-text);
+        font-variant-numeric: tabular-nums;
+      }
       #mpk-busy .mpk-busy-left {
-        min-height: 18px;
         font-size: 13px;
         color: var(--mpk-muted);
         font-variant-numeric: tabular-nums;
@@ -4229,13 +4251,6 @@
     R.scanIn       = document.getElementById('mpk-scan-in');
     R.scanFb       = document.getElementById('mpk-scan-fb');
     R.shortPickBtn = document.getElementById('mpk-shortpick-btn');
-    document.getElementById('mpk-last')?.addEventListener('click', () => {
-      if (Busy.isActive()) return;
-      showCartPositions();
-      const lp = State.lastPick;
-      const slot = lp && lp.tote ? cartSlots().slots.find(x => x.tote && x.tote.toUpperCase() === lp.tote.toUpperCase()) : null;
-      if (slot) showToteDetail(slot);
-    });
     document.getElementById('mpk-cart-btn')?.addEventListener('click', () => { if (!closeCart()) showCartPositions(); });
 
     if (R.scanIn) {
@@ -4374,9 +4389,10 @@
   }
 
   /**
-   * "Last scanned" banner (4.18.0) - above Short Pick / Cart Positions. Shows
-   * the last CONFIRMED pick: quantity, item, the tote it went into (in the
-   * tote's colour) and the time. Tapping it opens Cart Positions on that tote.
+   * "Last scanned" strip (4.18.0, compact 4.18.1) - a minimal reminder above
+   * Short Pick / Cart Positions. ONE row: qty (with "units" / the UoM under
+   * it), SKU + description, the tote in its colour, and the time. Shows the
+   * last CONFIRMED pick only. Deliberately not tappable - it opens nothing.
    */
   function _clock(ts) {
     const d = new Date(ts);
@@ -4387,22 +4403,21 @@
     const lp = State.lastPick;
     if (!lp) return '';
     const c = toteColour(lp.tote);
-    const uom = lp.uom && lp.uom.toLowerCase() !== 'each' ? ' ' + _esc(lp.uom) : '';
+    const unit = lp.uom && lp.uom.toLowerCase() !== 'each'
+      ? lp.uom
+      : (Number(lp.qty) === 1 ? 'unit' : 'units');
     return `
-      <button type="button" class="mpk-last" id="mpk-last" aria-label="Last scanned">
-        <span class="mpk-last-k">Last scanned <span class="mpk-last-time">${_clock(lp.at)}</span></span>
-        <span class="mpk-last-row">
-          <span class="mpk-last-qty">${_esc(String(lp.qty))}${uom}</span>
-          <span class="mpk-last-what">
-            <span class="mpk-mono">${_esc(lp.sku)}</span>
-            <span class="mpk-last-desc">${_esc(lp.desc)}</span>
-          </span>
-          <span class="mpk-last-tote${c ? ' coloured' : ''}"${c ? ` style="--cart-bg:${c.bg};--cart-fg:${c.fg}"` : ''}>
-            ${lp.pos ? `<span class="mpk-last-pos">${_esc(String(lp.pos))}</span>` : ''}
-            <span class="mpk-mono">${lp.tote ? _esc(lp.tote) : 'Auto'}</span>
-          </span>
+      <div class="mpk-last" id="mpk-last" role="status" aria-label="Last scanned">
+        <span class="mpk-last-qty"><b>${_esc(String(lp.qty))}</b><small>${_esc(unit)}</small></span>
+        <span class="mpk-last-what">
+          <span class="mpk-mono">${_esc(lp.sku)}</span>
+          <span class="mpk-last-desc">${_esc(lp.desc)}</span>
         </span>
-      </button>`;
+        <span class="mpk-last-tote${c ? ' coloured' : ''}"${c ? ` style="--cart-bg:${c.bg};--cart-fg:${c.fg}"` : ''}>
+          ${lp.pos ? `<span class="mpk-last-pos">${_esc(String(lp.pos))}</span>` : ''}<span class="mpk-mono">${lp.tote ? _esc(lp.tote) : 'Auto'}</span>
+        </span>
+        <span class="mpk-last-k">Last<br><span class="mpk-last-time">${_clock(lp.at)}</span></span>
+      </div>`;
   }
 
   function recordToteContents(tote, instr, pos, qty) {
@@ -4434,7 +4449,7 @@
       for (let p = 1; p <= count; p++) {
         const tote = byPos[p] || byPos[String(p)] || '';
         const rec = tote ? contents[String(tote).toUpperCase()] : null;
-        slots.push({ label: String(p), tote, items: rec ? rec.items : [], current: p === curPos });
+        slots.push({ label: String(p), tote, items: rec ? rec.items : [], current: p === curPos, isPos: true });
       }
       return { mode: 'positions', slots };
     }
@@ -4484,7 +4499,7 @@
         ${slots.length
           ? `<div class="mpk-cart-grid">${cells}</div>`
           : '<div class="mpk-cart-empty">No totes scanned in this job yet</div>'}
-        <div class="mpk-cart-foot">${mode === 'positions' ? 'Highlighted = this pick\'s position. ' : ''}Tap a tote to see what is in it. Scan anything to close.</div>
+        <div class="mpk-cart-foot">${mode === 'positions' ? 'Highlighted = this pick\'s position. ' : ''}Tap a tote for its items. Scan to close.</div>
         <div class="mpk-cart-detail" id="mpk-cart-detail"></div>
       </div>`;
     host.appendChild(el);
@@ -4507,25 +4522,24 @@
     const d = document.getElementById('mpk-cart-detail');
     if (!d) return;
     if (!slot) { d.classList.remove('open'); d.innerHTML = ''; return; }
+    // 4.18.1: just Quantity | SKU | Description, one line each.
     const rows = slot.items.length
-      ? slot.items.map(it => `
+      ? '<div class="mpk-cart-item head"><span class="mpk-cart-qty">Qty</span><span class="mpk-cart-sku">SKU</span><span class="mpk-cart-desc">Description</span></div>' +
+        slot.items.map(it => `
           <div class="mpk-cart-item">
-            <span class="mpk-cart-qty">${_esc(String(it.qty))}${it.uom && it.uom.toLowerCase() !== 'each' ? ' ' + _esc(it.uom) : ''}</span>
-            <span class="mpk-cart-what">
-              <span class="mpk-mono">${_esc(it.sku)}</span>
-              <span class="mpk-cart-desc">${_esc(it.desc)}${it.ship ? ' - ' + _esc(it.ship) : ''}</span>
-            </span>
+            <span class="mpk-cart-qty">${_esc(String(it.qty))}</span>
+            <span class="mpk-cart-sku mpk-mono">${_esc(it.sku)}</span>
+            <span class="mpk-cart-desc">${_esc(it.desc)}</span>
           </div>`).join('')
-      : '<div class="mpk-cart-empty">Nothing picked into this tote on this device yet</div>';
+      : '<div class="mpk-cart-empty">Nothing picked into this tote yet</div>';
     d.innerHTML = `
       <div class="mpk-cart-detail-head">
         <button type="button" class="mpk-cart-x" id="mpk-cart-back" aria-label="Back to grid">&lt;</button>
         ${(() => { const c = toteColour(slot.tote); return c ? `<span class="mpk-cart-chip" style="--cart-bg:${c.bg}"></span>` : ''; })()}
         <span class="mpk-cart-title mpk-mono">${_esc(slot.tote)}</span>
-        <span class="mpk-cart-sub">Position ${_esc(slot.label)}</span>
+        <span class="mpk-cart-sub">${slot.isPos ? 'Pos ' + _esc(slot.label) : ''}</span>
       </div>
-      <div class="mpk-cart-items">${rows}</div>
-      <div class="mpk-cart-foot">Picked on this device in this job</div>`;
+      <div class="mpk-cart-items">${rows}</div>`;
     d.classList.add('open');
   }
 
@@ -6124,7 +6138,7 @@
     // '4.10.0' on a 4.10.1 file, so anyone checking the running build was told
     // the wrong answer. GM_info is absent in the Node test harness, hence the
     // literal fallback.
-    VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '4.18.0',
+    VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '4.18.1',
     reportPickError,
     currentOperatorName,
     ERROR_LOG_URL,
