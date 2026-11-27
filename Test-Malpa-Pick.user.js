@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Pick TEST
 // @namespace    https://malpa.canary7.com/test
-// @version      4.16.0
+// @version      4.18.0
 // @description  TEST BUILD of Malpa Pick (scan guards, faster summary, portal styling). Disable "Malpa Pick" in Tampermonkey on any device running this.
 // @author       Malpa 3PL
 // @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/Test-Malpa-Pick.user.js
@@ -1317,6 +1317,8 @@
         pickProgressCurrent:  State.pickProgress?.current || 1,
         pickProgressTotal:    State.pickProgress?.total   || 1,
         containersByPosition: State.containersByPosition,
+        toteContents:         State.toteContents,
+        lastPick:             State.lastPick,
         savedAt:              Date.now(),
       };
       sessionStorage.setItem(_RESUME_KEY, JSON.stringify(snapshot));
@@ -1645,6 +1647,8 @@
     allInstructions: [],     // cached from summary fetchJobInstructions call
     barcodeMap: {},          // barcode -> instruction_id lookup, built at accept
     containerPrefixes: [],   // valid container prefixes for O(1) validation
+    toteContents: {},        // 4.17.0: TOTE -> { tote, pos, items[] } picked on this device this job
+    lastPick: null,          // 4.18.0: { sku, desc, qty, uom, tote, pos, at } for the Last scanned banner
 
     reset() {
       this.screen = 'PROFILE_SELECT';
@@ -1662,6 +1666,8 @@
       this.barcodeMap = {};
       this.containerPrefixes = [];
       this.lastItemScan = null;
+      this.toteContents = {};
+      this.lastPick = null;
       try { _groupCache.clear(); } catch (_) {}
     },
   };
@@ -2377,6 +2383,48 @@
       .mpk-reason-btn .mpk-reason-icon { font-size: 14px; flex-shrink: 0; color: var(--mpk-warn-fg); font-weight: 700; }
 
       /* -- Bottom action bar -- */
+      /* -- Last scanned banner (4.18.0) -- */
+      .mpk-last {
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+        width: 100%;
+        padding: 7px 12px 8px;
+        background: var(--mpk-subtle);
+        border: none;
+        border-top: 1px solid var(--mpk-border);
+        text-align: left;
+        font-family: var(--mpk-font);
+        color: var(--mpk-text);
+        flex-shrink: 0;
+        cursor: pointer;
+        -webkit-tap-highlight-color: transparent;
+        touch-action: manipulation;
+      }
+      .mpk-last:active { background: var(--mpk-hover); }
+      .mpk-last-k {
+        display: flex; justify-content: space-between;
+        font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+        color: var(--mpk-muted);
+      }
+      .mpk-last-time { font-family: var(--mpk-mono); font-weight: 500; letter-spacing: 0; text-transform: none; font-variant-numeric: tabular-nums; }
+      .mpk-last-row { display: flex; align-items: center; gap: 10px; min-width: 0; }
+      .mpk-last-qty { font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+      .mpk-last-what { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+      .mpk-last-what .mpk-mono { font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .mpk-last-desc { font-size: 11px; color: var(--mpk-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .mpk-last-tote {
+        display: inline-flex; align-items: center; gap: 6px;
+        flex-shrink: 0;
+        padding: 4px 8px;
+        border-radius: var(--mpk-r-sm);
+        border: 1px solid var(--mpk-border-strong);
+        background: var(--mpk-surface);
+        font-size: 13px;
+        font-weight: 600;
+      }
+      .mpk-last-tote.coloured { background: var(--cart-bg); color: var(--cart-fg); border-color: rgb(20 21 63 / 0.18); }
+      .mpk-last-pos { font-weight: 800; }
       .mpk-pick-actions {
         display: flex;
         gap: 8px;
@@ -2689,6 +2737,130 @@
         font-variant-numeric: tabular-nums;
         color: var(--mpk-text);
       }
+
+      /* -- Cart positions (4.17.0) -- */
+      .mpk-cart-overlay {
+        position: absolute;
+        inset: 0;
+        z-index: 120;
+        background: rgb(20 21 63 / 0.35);
+        display: flex;
+        align-items: flex-end;
+        -webkit-tap-highlight-color: transparent;
+      }
+      .mpk-cart-card {
+        position: relative;
+        width: 100%;
+        max-height: 92%;
+        display: flex;
+        flex-direction: column;
+        background: var(--mpk-surface);
+        border-radius: 12px 12px 0 0;
+        box-shadow: var(--mpk-pop-shadow);
+        padding: 12px 12px 10px;
+        gap: 10px;
+        overflow: hidden;
+      }
+      .mpk-cart-head, .mpk-cart-detail-head { display: flex; align-items: center; gap: 8px; }
+      .mpk-cart-title { font-size: 17px; font-weight: 700; color: var(--mpk-text); }
+      .mpk-cart-sub { font-size: 13px; color: var(--mpk-muted); flex: 1; }
+      .mpk-cart-x {
+        min-width: 44px; min-height: 44px;
+        border: 1px solid var(--mpk-border);
+        border-radius: var(--mpk-r);
+        background: var(--mpk-subtle);
+        color: var(--mpk-text);
+        font-size: 18px;
+        font-weight: 700;
+        cursor: pointer;
+        -webkit-tap-highlight-color: transparent;
+      }
+      .mpk-cart-grid {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 6px;
+        overflow-y: auto;
+        -webkit-overflow-scrolling: touch;
+      }
+      .mpk-cart-cell {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 1px;
+        min-height: 64px;
+        padding: 6px 4px;
+        border: 1px solid var(--mpk-border);
+        border-radius: var(--mpk-r);
+        background: var(--mpk-subtle);
+        color: var(--mpk-faint);
+        font-family: var(--mpk-font);
+        cursor: default;
+        -webkit-tap-highlight-color: transparent;
+        touch-action: manipulation;
+      }
+      .mpk-cart-cell.has {
+        background: var(--mpk-surface);
+        border-color: var(--mpk-border-strong);
+        color: var(--mpk-text);
+        cursor: pointer;
+      }
+      .mpk-cart-cell.has:active { background: var(--mpk-hover); }
+      .mpk-cart-cell.current { border: 2px solid var(--mpk-brand); background: var(--mpk-brand-subtle); }
+      /* Tote colour fills (4.17.1) */
+      .mpk-cart-cell.coloured { background: var(--cart-bg); color: var(--cart-fg); border-color: rgb(20 21 63 / 0.18); }
+      .mpk-cart-cell.coloured .mpk-cart-pos,
+      .mpk-cart-cell.coloured .mpk-cart-count { color: var(--cart-fg); }
+      .mpk-cart-cell.coloured .mpk-cart-count { opacity: .85; }
+      .mpk-cart-cell.tote-white { border-color: var(--mpk-border-strong); }
+      .mpk-cart-cell.coloured:active { filter: brightness(.92); }
+      /* "This pick" on a coloured cell: a navy ring + offset, readable on every fill */
+      .mpk-cart-cell.coloured.current {
+        background: var(--cart-bg);
+        border: 2px solid #ffffff;
+        box-shadow: 0 0 0 3px var(--mpk-navy);
+      }
+      .mpk-cart-chip {
+        width: 16px; height: 16px; border-radius: 4px; flex-shrink: 0;
+        background: var(--cart-bg);
+        box-shadow: inset 0 0 0 1px rgb(20 21 63 / 0.25);
+      }
+      .mpk-cart-pos { font-size: 18px; font-weight: 700; line-height: 1.1; }
+      .mpk-cart-cell:not(.has) .mpk-cart-pos { color: var(--mpk-muted); }
+      .mpk-cart-tote { font-size: 12px; font-weight: 500; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .mpk-cart-count { font-size: 11px; color: var(--mpk-muted); min-height: 13px; }
+      .mpk-cart-foot { font-size: 12px; color: var(--mpk-muted); text-align: center; }
+      .mpk-cart-empty { padding: 24px 8px; text-align: center; color: var(--mpk-muted); font-size: 14px; }
+      /* Tote contents slide over the grid inside the same card */
+      .mpk-cart-detail {
+        position: absolute;
+        inset: 0;
+        display: none;
+        flex-direction: column;
+        gap: 10px;
+        padding: 12px 12px 10px;
+        background: var(--mpk-surface);
+        border-radius: 12px 12px 0 0;
+      }
+      .mpk-cart-detail.open { display: flex; }
+      .mpk-cart-items { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; border-top: 1px solid var(--mpk-border); }
+      .mpk-cart-item {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 10px 4px;
+        border-bottom: 1px solid var(--mpk-border);
+      }
+      .mpk-cart-qty {
+        min-width: 48px;
+        font-size: 18px;
+        font-weight: 700;
+        text-align: right;
+        font-variant-numeric: tabular-nums;
+      }
+      .mpk-cart-what { display: flex; flex-direction: column; min-width: 0; }
+      .mpk-cart-what .mpk-mono { font-size: 14px; font-weight: 500; }
+      .mpk-cart-desc { font-size: 12px; color: var(--mpk-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
       /* == BUSY LOCK (v4.14.0, card + progress bar 4.14.2) ================
          Covers the whole panel - scan zone, Back, Short Pick - while
@@ -4048,13 +4220,23 @@
         </div>
 
       </div>
+      ${lastPickBannerHtml()}
       <div class="mpk-pick-actions">
         <button id="mpk-shortpick-btn" class="mpk-btn mpk-btn-secondary">Short Pick</button>
+        <button id="mpk-cart-btn" class="mpk-btn mpk-btn-secondary">Cart Positions</button>
       </div>`;
 
     R.scanIn       = document.getElementById('mpk-scan-in');
     R.scanFb       = document.getElementById('mpk-scan-fb');
     R.shortPickBtn = document.getElementById('mpk-shortpick-btn');
+    document.getElementById('mpk-last')?.addEventListener('click', () => {
+      if (Busy.isActive()) return;
+      showCartPositions();
+      const lp = State.lastPick;
+      const slot = lp && lp.tote ? cartSlots().slots.find(x => x.tote && x.tote.toUpperCase() === lp.tote.toUpperCase()) : null;
+      if (slot) showToteDetail(slot);
+    });
+    document.getElementById('mpk-cart-btn')?.addEventListener('click', () => { if (!closeCart()) showCartPositions(); });
 
     if (R.scanIn) {
       R.scanIn.addEventListener('keydown', _onScanKeydown);
@@ -4123,6 +4305,7 @@
   // exactly when a worried picker scans again.
   function _onScan(barcode) {
     if (Busy.isActive()) { Busy.blocked('scan'); return; }
+    closeCart();                       // a scan always closes Cart Positions, then counts
     const s = State.screen;
     if (s === 'PICK_ITEM')           onItemScan(barcode);
     else if (s === 'SCAN_CONTAINER') onContainerScan(barcode);
@@ -4132,6 +4315,218 @@
       Voice.error('Answer the question on screen');
     }
     // PERFORMING / TRANSITIONING: the busy overlay is up; a scan does nothing.
+  }
+
+  // ---------------------------------------------------------------------------
+  // CART POSITIONS (4.17.0)
+  //
+  // Pickers lose track of which tote sits in which cart slot. "Cart Positions"
+  // (beside Short Pick / Back) opens a grid of slots - 4 wide, 5 rows, more rows
+  // if the job uses more positions - each showing its tote. Tap a tote to see
+  // what has gone into it.
+  //
+  // CONTENTS ARE WHAT THIS DEVICE PICKED INTO THE TOTE IN THIS JOB, recorded at
+  // each confirmed perform (State.toteContents) and kept in the resume state.
+  // Canary7's API has no confirmed "what is in container X" read we could use
+  // here, so it is labelled as such rather than passed off as the tote's full
+  // contents.
+  //
+  // Never in the way: closes on X, on a tap outside the card, on Esc, and on
+  // ANY scan - the scan then carries on to the pick exactly as if the window
+  // had not been open.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Tote colour (4.17.1). The colour comes from Canary7's own container types,
+   * which the script already loads: "Tote Blue" (prefix B), "Tote Green" (G),
+   * "Tote Orange" (O), "Tote Purple" (P), "Tote Red" (R), "Tote White" (W) -
+   * confirmed 27 Nov 2026. LONGEST matching prefix wins, so a "B150-" carton
+   * is never mistaken for a blue tote, and a colour added in Canary7 later is
+   * picked up without a script change. Text colour is chosen per fill for
+   * contrast (white on dark fills, navy on light ones).
+   */
+  const _TOTE_PALETTE = {
+    blue:   { bg: '#2f6fdb', fg: '#ffffff' },
+    green:  { bg: '#2e8f55', fg: '#ffffff' },
+    orange: { bg: '#f59a3b', fg: '#14153f' },
+    purple: { bg: '#7b4fc9', fg: '#ffffff' },
+    red:    { bg: '#d63b3b', fg: '#ffffff' },
+    white:  { bg: '#ffffff', fg: '#14153f' },
+    yellow: { bg: '#f5cf3b', fg: '#14153f' },
+    pink:   { bg: '#e86aa8', fg: '#14153f' },
+    black:  { bg: '#24262b', fg: '#ffffff' },
+    grey:   { bg: '#8a8f99', fg: '#ffffff' },
+  };
+  function toteColour(tote) {
+    if (!tote) return null;
+    const up = String(tote).toUpperCase();
+    let best = null;
+    for (const ct of State.containerTypes || []) {
+      const pre = String(ct.container_number_prefix || '').toUpperCase();
+      if (!pre || !up.startsWith(pre)) continue;
+      const m = /\b(blue|green|orange|purple|red|white|yellow|pink|black|gr[ae]y)\b/i
+        .exec(String(ct.name || '') + ' ' + String(ct.description || ''));
+      // A longer prefix always wins, even if it names no colour (a carton).
+      if (!best || pre.length > best.pre.length) best = { pre, colour: m ? m[1].toLowerCase().replace('gray', 'grey') : null };
+      else if (pre.length === best.pre.length && !best.colour && m) best.colour = m[1].toLowerCase().replace('gray', 'grey');
+    }
+    return best && best.colour ? Object.assign({ name: best.colour }, _TOTE_PALETTE[best.colour]) : null;
+  }
+
+  /**
+   * "Last scanned" banner (4.18.0) - above Short Pick / Cart Positions. Shows
+   * the last CONFIRMED pick: quantity, item, the tote it went into (in the
+   * tote's colour) and the time. Tapping it opens Cart Positions on that tote.
+   */
+  function _clock(ts) {
+    const d = new Date(ts);
+    const p = (n) => String(n).padStart(2, '0');
+    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  }
+  function lastPickBannerHtml() {
+    const lp = State.lastPick;
+    if (!lp) return '';
+    const c = toteColour(lp.tote);
+    const uom = lp.uom && lp.uom.toLowerCase() !== 'each' ? ' ' + _esc(lp.uom) : '';
+    return `
+      <button type="button" class="mpk-last" id="mpk-last" aria-label="Last scanned">
+        <span class="mpk-last-k">Last scanned <span class="mpk-last-time">${_clock(lp.at)}</span></span>
+        <span class="mpk-last-row">
+          <span class="mpk-last-qty">${_esc(String(lp.qty))}${uom}</span>
+          <span class="mpk-last-what">
+            <span class="mpk-mono">${_esc(lp.sku)}</span>
+            <span class="mpk-last-desc">${_esc(lp.desc)}</span>
+          </span>
+          <span class="mpk-last-tote${c ? ' coloured' : ''}"${c ? ` style="--cart-bg:${c.bg};--cart-fg:${c.fg}"` : ''}>
+            ${lp.pos ? `<span class="mpk-last-pos">${_esc(String(lp.pos))}</span>` : ''}
+            <span class="mpk-mono">${lp.tote ? _esc(lp.tote) : 'Auto'}</span>
+          </span>
+        </span>
+      </button>`;
+  }
+
+  function recordToteContents(tote, instr, pos, qty) {
+    if (!tote || !instr) return;
+    const key = String(tote).toUpperCase();
+    const rec = State.toteContents[key] || (State.toteContents[key] = { tote, pos: pos || null, items: [] });
+    if (pos) rec.pos = pos;
+    rec.items.push({
+      sku:  instr.item?.item_code || '-',
+      desc: instr.item?.abc_category || instr.item?.description || '',
+      qty:  qty,
+      uom:  instr.itemUnitOfMeasure?.unitOfMeasure?.name || '',
+      ship: instr.reference_number || '',
+      at:   Date.now(),
+    });
+  }
+
+  /** Slots to draw: cluster positions (1..max, min 20) or, without positions, the totes used. */
+  function cartSlots() {
+    const byPos = State.containersByPosition || {};
+    const posNums = Object.keys(byPos).map(Number).filter(n => n > 0);
+    const curPos = Number(State.instruction?.cluster_position_id) || 0;
+    if (curPos) posNums.push(curPos);
+    const contents = State.toteContents || {};
+    if (posNums.length) {
+      const max = Math.max(...posNums);
+      const count = Math.max(20, Math.ceil(max / 4) * 4);
+      const slots = [];
+      for (let p = 1; p <= count; p++) {
+        const tote = byPos[p] || byPos[String(p)] || '';
+        const rec = tote ? contents[String(tote).toUpperCase()] : null;
+        slots.push({ label: String(p), tote, items: rec ? rec.items : [], current: p === curPos });
+      }
+      return { mode: 'positions', slots };
+    }
+    const slots = Object.values(contents).map((rec, i) => ({
+      label: String(i + 1), tote: rec.tote, items: rec.items, current: false,
+    }));
+    return { mode: 'totes', slots };
+  }
+
+  function closeCart() {
+    const el = document.getElementById('mpk-cart');
+    if (!el) return false;
+    el.remove();
+    setTimeout(() => _refocusScanInput(), 30);
+    return true;
+  }
+
+  function showCartPositions() {
+    if (Busy.isActive()) return;
+    const host = document.getElementById('mpk-pick-screen');
+    if (!host) return;
+    closeCart();
+    const { mode, slots } = cartSlots();
+    const totals = slots.filter(s => s.tote).length;
+    const cells = slots.map((s, i) => {
+      const c = toteColour(s.tote);
+      const style = c ? ` style="--cart-bg:${c.bg};--cart-fg:${c.fg}"` : '';
+      return `
+      <button type="button" class="mpk-cart-cell${s.tote ? ' has' : ''}${c ? ' coloured tote-' + c.name : ''}${s.current ? ' current' : ''}"
+              id="mpk-cart-pos-${_esc(s.label)}" data-i="${i}" ${s.tote ? '' : 'disabled'}${style}>
+        <span class="mpk-cart-pos">${_esc(s.label)}</span>
+        <span class="mpk-cart-tote mpk-mono">${s.tote ? _esc(s.tote) : '-'}</span>
+        <span class="mpk-cart-count">${s.items.length ? s.items.length + (s.items.length === 1 ? ' pick' : ' picks') : ''}</span>
+      </button>`;
+    }).join('');
+
+    const el = document.createElement('div');
+    el.id = 'mpk-cart';
+    el.className = 'mpk-cart-overlay';
+    el.innerHTML = `
+      <div class="mpk-cart-card" role="dialog" aria-label="Cart positions">
+        <div class="mpk-cart-head">
+          <span class="mpk-cart-title">Cart positions</span>
+          <span class="mpk-cart-sub">${totals} ${totals === 1 ? 'tote' : 'totes'}</span>
+          <button type="button" class="mpk-cart-x" id="mpk-cart-close" aria-label="Close">&#10005;</button>
+        </div>
+        ${slots.length
+          ? `<div class="mpk-cart-grid">${cells}</div>`
+          : '<div class="mpk-cart-empty">No totes scanned in this job yet</div>'}
+        <div class="mpk-cart-foot">${mode === 'positions' ? 'Highlighted = this pick\'s position. ' : ''}Tap a tote to see what is in it. Scan anything to close.</div>
+        <div class="mpk-cart-detail" id="mpk-cart-detail"></div>
+      </div>`;
+    host.appendChild(el);
+
+    // Tap outside the card closes; taps inside stay put.
+    el.addEventListener('click', (e) => {
+      if (e.target === el) { closeCart(); return; }
+      e.stopPropagation();
+      const t = e.target && e.target.closest ? e.target : null;
+      if (t && t.closest('#mpk-cart-close')) { closeCart(); return; }
+      if (t && t.closest('#mpk-cart-back')) { showToteDetail(null); return; }
+      const cell = t && t.closest('.mpk-cart-cell');
+      if (cell && !cell.disabled) showToteDetail(slots[Number(cell.dataset.i)]);
+      _refocusScanInput();               // keep the scanner live while it is open
+    });
+    setTimeout(() => _refocusScanInput(), 30);
+  }
+
+  function showToteDetail(slot) {
+    const d = document.getElementById('mpk-cart-detail');
+    if (!d) return;
+    if (!slot) { d.classList.remove('open'); d.innerHTML = ''; return; }
+    const rows = slot.items.length
+      ? slot.items.map(it => `
+          <div class="mpk-cart-item">
+            <span class="mpk-cart-qty">${_esc(String(it.qty))}${it.uom && it.uom.toLowerCase() !== 'each' ? ' ' + _esc(it.uom) : ''}</span>
+            <span class="mpk-cart-what">
+              <span class="mpk-mono">${_esc(it.sku)}</span>
+              <span class="mpk-cart-desc">${_esc(it.desc)}${it.ship ? ' - ' + _esc(it.ship) : ''}</span>
+            </span>
+          </div>`).join('')
+      : '<div class="mpk-cart-empty">Nothing picked into this tote on this device yet</div>';
+    d.innerHTML = `
+      <div class="mpk-cart-detail-head">
+        <button type="button" class="mpk-cart-x" id="mpk-cart-back" aria-label="Back to grid">&lt;</button>
+        ${(() => { const c = toteColour(slot.tote); return c ? `<span class="mpk-cart-chip" style="--cart-bg:${c.bg}"></span>` : ''; })()}
+        <span class="mpk-cart-title mpk-mono">${_esc(slot.tote)}</span>
+        <span class="mpk-cart-sub">Position ${_esc(slot.label)}</span>
+      </div>
+      <div class="mpk-cart-items">${rows}</div>
+      <div class="mpk-cart-foot">Picked on this device in this job</div>`;
+    d.classList.add('open');
   }
 
   function setScanFeedback(msg, type) {
@@ -4407,6 +4802,8 @@
 
       // Restore container positions
       State.containersByPosition = resumeState.containersByPosition || {};
+      State.toteContents = resumeState.toteContents || {};
+      State.lastPick = resumeState.lastPick || null;
 
       // Build prefix list
       State.containerPrefixes = State.containerTypes
@@ -4799,6 +5196,7 @@
     return runPerform({
       instruction,
       title: 'Moving items to container',
+      locod: true,
       extraMs: 1500,                 // container lookup / generate before the perform
       backTo: 'PICK_ITEM',
       call: async () => {
@@ -4973,6 +5371,18 @@
         State.containersByPosition[opts.clusterPos] = opts.tote;
       }
       if (opts.tote) State.lastTote = { tote: opts.tote, instrId: instr.id, at: Date.now() };
+      if (opts.tote) recordToteContents(opts.tote, instr, opts.clusterPos, opts.qty);
+      if (opts.tote || opts.locod) {
+        State.lastPick = {
+          sku:  instr.item?.item_code || '-',
+          desc: instr.item?.abc_category || instr.item?.description || '',
+          qty:  opts.qty != null ? opts.qty : displayQty(instr),
+          uom:  instr.itemUnitOfMeasure?.unitOfMeasure?.name || '',
+          tote: opts.tote || null,
+          pos:  opts.clusterPos || null,
+          at:   Date.now(),
+        };
+      }
       await advanceAfterPerform(instr, nextHint, isJobDone, isClusterDone, opts.clusterPos, note);
     }
 
@@ -5221,10 +5631,12 @@
       </div>
       <div class="mpk-pick-actions">
         <button id="mpk-back-btn" class="mpk-btn mpk-btn-secondary">&lt;- Back</button>
+        <button id="mpk-cart-btn" class="mpk-btn mpk-btn-secondary">Cart Positions</button>
       </div>`;
 
     R.scanIn = document.getElementById('mpk-scan-in');
     R.scanFb = document.getElementById('mpk-scan-fb');
+    document.getElementById('mpk-cart-btn')?.addEventListener('click', () => { if (!closeCart()) showCartPositions(); });
     document.getElementById('mpk-back-btn')?.addEventListener('click', () => {
       if (Busy.isActive() || State.screen !== 'SCAN_CONTAINER') { Busy.blocked('back'); return; }
       State.scanCount = 0;
@@ -5312,6 +5724,7 @@
       instruction: instr,
       tote: label,
       clusterPos,
+      qty: State.scanCount || displayQty(instr),
       backTo: 'SCAN_CONTAINER',
       title: 'Moving items to container',
       detail: label,
@@ -5666,6 +6079,7 @@
       Busy.blocked('scan');
       return;
     }
+    if (e.key === 'Escape' && closeCart()) { e.preventDefault(); return; }
     if (e.key === 'Escape') {
       e.preventDefault();
       closeUI();
@@ -5710,7 +6124,7 @@
     // '4.10.0' on a 4.10.1 file, so anyone checking the running build was told
     // the wrong answer. GM_info is absent in the Node test harness, hence the
     // literal fallback.
-    VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '4.16.0',
+    VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '4.18.0',
     reportPickError,
     currentOperatorName,
     ERROR_LOG_URL,
@@ -5719,7 +6133,7 @@
     showOurs, hideOurs, syncTabs, restoreOtherPanels,
     getToken, hasToken: () => !!getToken(),
     // v4.14.0 - offline harness (malpa-pick.test.js)
-    Busy, Rate, progressAt, runPerform, loadQueueStats, paintQueueStats, renderProfileSelect, orderProfiles, fetchJobInstructionsFast, verifyPerformLanded, classifyPerformError, reconcilePerform,
+    Busy, Rate, progressAt, runPerform, loadQueueStats, paintQueueStats, renderProfileSelect, orderProfiles, fetchJobInstructionsFast, showCartPositions, closeCart, recordToteContents, cartSlots, toteColour, lastPickBannerHtml, verifyPerformLanded, classifyPerformError, reconcilePerform,
     reconcileInflightOnEntry, loadInflight, saveInflight, clearInflight,
     fetchJobInstructions, countPickActions, prefetchGroupRecord, loadGroupRecordIfNeeded,
     get groupCache() { return _groupCache; },

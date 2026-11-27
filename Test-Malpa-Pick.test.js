@@ -381,6 +381,16 @@ const tick = async (k = 6) => { for (let i = 0; i < k; i++) await flush(); };
   ok('ledger cleared', !T.loadInflight());
   eq('still exactly one group-perform', n('group-perform', 'POST'), 1);
   eq('picking_qty is the whole group', posted.find(x => x.url.includes('group-perform')).body.picking_qty, 100);
+  ok('last scanned = the confirmed pick (qty, item, tote, time)',
+     T.State.lastPick && T.State.lastPick.qty === 100 && T.State.lastPick.tote === 'B197' &&
+     T.State.lastPick.sku === 'GUT-FIBRE-1' && Date.now() - T.State.lastPick.at < 60000);
+  ok('banner sits above Short Pick on the next pick screen',
+     /id="mpk-last"[\s\S]*?GUT-FIBRE-1[\s\S]*?B197[\s\S]*?mpk-pick-actions[\s\S]*?mpk-shortpick-btn/
+       .test(sandbox.document.getElementById('mpk-root')._html));
+  ok('banner shows an HH:MM:SS time', /mpk-last-time">\d\d:\d\d:\d\d</.test(sandbox.document.getElementById('mpk-root')._html));
+  ok('the move is recorded against the tote for Cart Positions',
+     T.State.toteContents.B197 && T.State.toteContents.B197.items[0].qty === 100 &&
+     T.State.toteContents.B197.items[0].sku === 'GUT-FIBRE-1');
 
   console.log('\n5. Gateway timeout, but Canary7 DID finish -> no retry, carry on');
   stubFetch({
@@ -561,6 +571,61 @@ const tick = async (k = 6) => { for (let i = 0; i < k; i++) await flush(); };
        47: { remaining: 693, picked_today: 1257, pct: 64 },
        48: { remaining: 4837, picked_today: 3791, pct: 44 } } })),   // 53 missing = nothing
      ['MIBP', 'SIBP', 'Group 1 Clusters', 'Group 6 Clusters', 'Wholesale Cluster']);
+
+  console.log('\n14. Cart Positions');
+  T.State.reset();
+  T.renderPickScreen(I2);
+  ok('no banner before the first pick of a job', !/id="mpk-last"/.test(sandbox.document.getElementById('mpk-root')._html));
+  T.State.reset();
+  T.State.profile = { id: 40, name: 'Group 1 Clusters' };
+  T.State.jobId = 1;
+  T.State.containersByPosition = { 3: 'B197', 7: 'W128' };
+  T.State.containerPrefixes = ['B', 'W'];
+  const C = Object.assign({}, I2, { cluster_position_id: 3 });
+  T.State.instruction = C;
+  T.State.groupRecord = { units: 40 };
+  T.recordToteContents('B197', C, 3, 2);
+  T.recordToteContents('B197', I1, 3, 1);
+  T.renderPickScreen(C);
+  const rootHtml = sandbox.document.getElementById('mpk-root')._html;
+  ok('Short Pick and Cart Positions share the action bar',
+     /mpk-shortpick-btn[\s\S]*mpk-cart-btn/.test(rootHtml));
+  T.showCartPositions();
+  const cart = sandbox.document.getElementById('mpk-cart');
+  ok('opens', !!cart);
+  const html = cart ? cart._html : '';
+  eq('4 x 5 grid for up to 20 positions', (html.match(/class="mpk-cart-cell/g) || []).length, 20);
+  ok('position 3 shows its tote and pick count', /mpk-cart-pos-3"[\s\S]*?B197[\s\S]*?2 picks/.test(html));
+  ok('current pick\'s position highlighted', /mpk-cart-cell has current" *\n? *id="mpk-cart-pos-3"/.test(html));
+  T.State.containersByPosition[23] = 'B300';
+  eq('more positions -> more rows (24 slots for position 23)', T.cartSlots().slots.length, 24);
+  T._onScan('9300000000011');
+  ok('any scan closes it...', !sandbox.document.getElementById('mpk-cart'));
+  eq('...and still counts as the item scan', T.State.screen === 'SCAN_CONTAINER' || T.State.screen === 'QTY_MODAL', true);
+  T.State.containersByPosition = {};
+  T.State.instruction = Object.assign({}, I2, { cluster_position_id: null });
+  T.State.containerTypes = [
+    { name: 'Tote Blue', description: 'Blue Totes', container_number_prefix: 'B' },
+    { name: 'EBPak B150 Diecut', description: '{E-669.4.1}', container_number_prefix: 'B150-' },
+    { name: 'Tote', description: 'Picking Tote', container_number_prefix: 'R' },
+    { name: 'Tote Red', description: 'Red Totes', container_number_prefix: 'R' },
+    { name: 'Tote White', description: 'White Totes', container_number_prefix: 'W' },
+    { name: 'Lou Lou Carton', description: 'LLCs', container_number_prefix: 'L' },
+  ];
+  eq('B tote is blue (from Canary7\'s "Tote Blue" type)', (T.toteColour('B197') || {}).name, 'blue');
+  eq('longest prefix wins: a B150- carton is not blue', T.toteColour('B150-0001'), null);
+  eq('generic "Tote" and "Tote Red" share R -> red', (T.toteColour('R057') || {}).name, 'red');
+  eq('white tote gets dark text', (T.toteColour('W128') || {}).fg, '#14153f');
+  eq('cartons stay uncoloured', T.toteColour('L0001'), null);
+  T.State.containersByPosition = { 3: 'B197' };
+  T.State.instruction = C;
+  T.renderPickScreen(C);
+  T.showCartPositions();
+  ok('cell painted with the tote colour', /mpk-cart-cell has coloured tote-blue current"[\s\S]*?--cart-bg:#2f6fdb/.test(sandbox.document.getElementById('mpk-cart')._html));
+  T.closeCart();
+  T.State.containersByPosition = {};
+  T.State.instruction = Object.assign({}, I2, { cluster_position_id: null });
+  eq('no cluster positions: lists the totes used', T.cartSlots().slots.map(x => x.tote), ['B197']);
 
   console.log('\n11. Short pick goes through the same lock');
   stubFetch({ 'pick-short': { job_instruction: null } });
