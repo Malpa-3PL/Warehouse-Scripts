@@ -445,6 +445,31 @@ const tick = async (k = 6) => { for (let i = 0; i < k; i++) await flush(); };
   eq('one get-job-instructions call', n('get-job-instructions'), 1);
   ok('group record prefetched from the summary screen', T.groupCache.has(75831));
 
+  console.log('\n10b. Summary counts paint from get-job-summary before the slow list');
+  stubFetch({
+    'get-job-summary': { total_shipments: 100, total_instructions: 100, total_quantity: 112 },
+    'job/job-instruction&job_id': [],
+    'get-job-instruction-groups': [{ units: 100 }],
+  });
+  T.State.reset();
+  T.State.profile = { id: 48, name: 'MIBP' };
+  T.State.jobId = 2077877;
+  T.State.instruction = I1;
+  reset();
+  deferred('job/job-instruction&job_id');
+  T.renderJobSummary({}, I1, T.State.profile);
+  await tick(20);
+  const txt = (id) => (sandbox.document.getElementById(id) || {}).textContent;
+  eq('shipments + units shown while the list is still loading',
+     [txt('mpk-sum-shipments'), txt('mpk-sum-qty')], ['100', '112']);
+  ok('grouped job: Picks waits for the list (C7 counts one instruction per shipment)',
+     txt('mpk-sum-instructions') !== '100');
+  const listRows = Array.from({ length: 100 }, (_, i) => ({
+    id: i + 1, reference_number: '#' + i, quantity: i === 0 ? 13 : 1, job_instruction_group_id: 75831 }));
+  release('job/job-instruction&job_id', listRows);
+  await tick(20);
+  eq('list lands: the whole group is 1 pick', txt('mpk-sum-instructions'), '1');
+
   console.log('\n11. Short pick goes through the same lock');
   stubFetch({ 'pick-short': { job_instruction: null } });
   setupGroupPick();
