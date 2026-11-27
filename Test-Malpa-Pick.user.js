@@ -2657,6 +2657,8 @@
       .mpk-q-row:active { background: var(--mpk-hover); }
       .mpk-q-row.selected { background: var(--mpk-brand-subtle); border-left-color: var(--mpk-brand); }
       .mpk-q-row.empty .mpk-q-name { color: var(--mpk-muted); }
+      .mpk-q-row.empty { background: var(--mpk-subtle); }
+      .mpk-q-row.first-idle { border-top: 6px solid var(--mpk-bg); }
       .mpk-q-dot {
         width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
         background: var(--mpk-profile-color, var(--mpk-brand));
@@ -3194,6 +3196,25 @@
     return _queues.inflight;
   }
 
+  /**
+   * Queue order (4.15.1): queues with work left first, then queues with
+   * nothing left (empty or 100% done) - each group A-Z by name. Before the
+   * counts arrive everything counts as "has work", so the list starts A-Z.
+   */
+  function orderProfiles(profiles, stats) {
+    const q = stats && stats.queues;
+    const hasWork = (p) => {
+      if (!q) return true;
+      const s = q[String(p.id)];
+      return !!(s && s.remaining > 0);
+    };
+    return profiles.slice().sort((a, b) => {
+      const wa = hasWork(a), wb = hasWork(b);
+      if (wa !== wb) return wa ? -1 : 1;
+      return String(a.name || '').localeCompare(String(b.name || ''), undefined, { sensitivity: 'base', numeric: true });
+    });
+  }
+
   function _plural(n, word) { return n === 1 ? word : word + 's'; }
 
   function _fmtInt(n) {
@@ -3218,14 +3239,26 @@
         row.classList.toggle('empty', !!q);
         continue;
       }
-      row.classList.toggle('empty', s.remaining === 0);
+      row.classList.toggle('empty', !(s.remaining > 0));
       if (meta) {
         meta.textContent = s.remaining === 0
           ? (s.picked_today ? `All picked - ${_fmtInt(s.picked_today)} ${_plural(s.picked_today, 'instruction')} today` : 'Nothing to pick')
-          : `${_fmtInt(s.remaining)} ${_plural(s.remaining, 'instruction')} left to pick`;
+          : `${_fmtInt(s.remaining)} ${s.remaining === 1 ? 'Instruction' : 'Instructions'} to Pick`;
       }
       if (pct)  pct.textContent = s.pct == null ? '' : s.pct + '%';
       if (fill) fill.style.width = (s.pct == null ? 0 : s.pct) + '%';
+    }
+    const list = document.getElementById('mpk-q-list');
+    if (list && q) {
+      let firstIdle = true;
+      for (const p of orderProfiles(State.profiles, stats)) {
+        const row = document.getElementById('mpk-q-' + p.id);
+        if (!row) continue;
+        list.appendChild(row);                       // moves the node
+        const idle = row.classList.contains('empty');
+        row.classList.toggle('first-idle', idle && firstIdle);
+        if (idle) firstIdle = false;
+      }
     }
     const upd = document.getElementById('mpk-q-updated');
     if (upd) {
@@ -3252,7 +3285,7 @@
     setTimeout(measureHeight, 30);
 
     const selId = State.profile ? String(State.profile.id) : '';
-    const rows = State.profiles.map(p => `
+    const rows = orderProfiles(State.profiles, _queues.data).map(p => `
       <button type="button" class="mpk-q-row${String(p.id) === selId ? ' selected' : ''}"
               id="mpk-q-${p.id}" data-pid="${p.id}" style="--mpk-profile-color:${profileColour(p)}">
         <span class="mpk-q-dot"></span>
@@ -5656,7 +5689,7 @@
     showOurs, hideOurs, syncTabs, restoreOtherPanels,
     getToken, hasToken: () => !!getToken(),
     // v4.14.0 - offline harness (malpa-pick.test.js)
-    Busy, Rate, progressAt, runPerform, loadQueueStats, paintQueueStats, renderProfileSelect, verifyPerformLanded, classifyPerformError, reconcilePerform,
+    Busy, Rate, progressAt, runPerform, loadQueueStats, paintQueueStats, renderProfileSelect, orderProfiles, verifyPerformLanded, classifyPerformError, reconcilePerform,
     reconcileInflightOnEntry, loadInflight, saveInflight, clearInflight,
     fetchJobInstructions, countPickActions, prefetchGroupRecord, loadGroupRecordIfNeeded,
     get groupCache() { return _groupCache; },

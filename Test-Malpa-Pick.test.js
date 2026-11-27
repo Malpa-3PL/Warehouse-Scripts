@@ -516,7 +516,7 @@ const tick = async (k = 6) => { for (let i = 0; i < k; i++) await flush(); };
   await tick(10);
   const g = (id) => (sandbox.document.getElementById(id) || {}).textContent;
   ok('asked the LAN proxy, not Canary7 or Metabase', gmCalls.some(u => u === 'http://192.168.1.27:8790/pick-queues'));
-  eq('MIBP shows instructions left (thousands separator)', g('mpk-q-meta-48'), '1,908 instructions left to pick');
+  eq('MIBP shows instructions left (thousands separator)', g('mpk-q-meta-48'), '1,908 Instructions to Pick');
   eq('and % picked today', [g('mpk-q-pct-47'), g('mpk-q-pct-48')], ['61%', '51%']);
   eq('an empty queue says so, with no fake %', [g('mpk-q-meta-53'), g('mpk-q-pct-53')], ['Nothing to pick', '']);
   ok('freshness shown', /Updated just now/.test(g('mpk-q-updated')));
@@ -528,6 +528,18 @@ const tick = async (k = 6) => { for (let i = 0; i < k; i++) await flush(); };
   T.paintQueueStats(null);
   eq('proxy down: says so, nothing breaks', g('mpk-q-updated'), 'Queue counts unavailable');
   delete sandbox.GM_xmlhttpRequest;
+  const names = (arr) => arr.map(p => p.name);
+  const PROF = [{ id: 53, name: 'Wholesale Cluster' }, { id: 48, name: 'MIBP' }, { id: 47, name: 'SIBP' },
+                { id: 40, name: 'Group 1 Clusters' }, { id: 46, name: 'Group 6 Clusters' }];
+  eq('no counts yet: plain A-Z', names(T.orderProfiles(PROF, null)),
+     ['Group 1 Clusters', 'Group 6 Clusters', 'MIBP', 'SIBP', 'Wholesale Cluster']);
+  eq('queues with work A-Z first, then empty / 100% done A-Z',
+     names(T.orderProfiles(PROF, { queues: {
+       40: { remaining: 0, picked_today: 540, pct: 100 },     // done
+       46: { remaining: 0, picked_today: 0, pct: null },      // empty
+       47: { remaining: 693, picked_today: 1257, pct: 64 },
+       48: { remaining: 4837, picked_today: 3791, pct: 44 } } })),   // 53 missing = nothing
+     ['MIBP', 'SIBP', 'Group 1 Clusters', 'Group 6 Clusters', 'Wholesale Cluster']);
 
   console.log('\n11. Short pick goes through the same lock');
   stubFetch({ 'pick-short': { job_instruction: null } });
