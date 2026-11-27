@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Malpa Pick TEST
 // @namespace    https://malpa.canary7.com/test
-// @version      4.15.1
+// @version      4.16.0
 // @description  TEST BUILD of Malpa Pick (scan guards, faster summary, portal styling). Disable "Malpa Pick" in Tampermonkey on any device running this.
 // @author       Malpa 3PL
 // @updateURL    https://raw.githubusercontent.com/Malpa-3PL/Warehouse-Scripts/main/Test-Malpa-Pick.user.js
@@ -3088,7 +3088,37 @@
   // so a big SIBP/MIBP job under-counted. Page 1 asks for 400 (C7's own cap)
   // and any further pages named by x-pagination-page-count are read in turn.
   const _SUMMARY_FIELDS = 'id,reference_number,quantity,job_instruction_group_id';
+
+  // 4.16.0 - the same four columns straight from the Canary7 database via the
+  // LAN canary7-proxy (Metabase card 1146, job_instruction.job_id index):
+  // ~1s instead of the API's 6-8s. Null on any failure or an empty answer
+  // (e.g. a brand-new job not visible to Metabase yet) -> the caller falls
+  // back to the API list, so the summary is never worse than before.
+  const JOB_INSTR_URL = 'http://192.168.1.27:8790/job-instructions?job_id=';
+  function fetchJobInstructionsFast(jobId) {
+    return new Promise((resolve) => {
+      try {
+        if (typeof GM_xmlhttpRequest !== 'function' || !/^\d+$/.test(String(jobId))) { resolve(null); return; }
+        GM_xmlhttpRequest({
+          method: 'GET',
+          url: JOB_INSTR_URL + encodeURIComponent(String(jobId)),
+          timeout: 5000,
+          onload: (r) => {
+            try {
+              const j = JSON.parse(r.responseText);
+              resolve(j && j.ok && Array.isArray(j.rows) && j.rows.length ? j.rows : null);
+            } catch (_) { resolve(null); }
+          },
+          onerror: () => resolve(null),
+          ontimeout: () => resolve(null),
+        });
+      } catch (_) { resolve(null); }
+    });
+  }
+
   async function fetchJobInstructions(jobId) {
+    const fast = await fetchJobInstructionsFast(jobId);
+    if (fast) return fast;
     const base = `job/job-instruction&job_id=${jobId}&per-page=400` +
                  `&fields=${encodeURIComponent(_SUMMARY_FIELDS)}`;
     const asArr = (d) => Array.isArray(d) ? d : (d && Array.isArray(d.items) ? d.items : []);
@@ -5680,7 +5710,7 @@
     // '4.10.0' on a 4.10.1 file, so anyone checking the running build was told
     // the wrong answer. GM_info is absent in the Node test harness, hence the
     // literal fallback.
-    VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '4.15.1',
+    VERSION: (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '4.16.0',
     reportPickError,
     currentOperatorName,
     ERROR_LOG_URL,
@@ -5689,7 +5719,7 @@
     showOurs, hideOurs, syncTabs, restoreOtherPanels,
     getToken, hasToken: () => !!getToken(),
     // v4.14.0 - offline harness (malpa-pick.test.js)
-    Busy, Rate, progressAt, runPerform, loadQueueStats, paintQueueStats, renderProfileSelect, orderProfiles, verifyPerformLanded, classifyPerformError, reconcilePerform,
+    Busy, Rate, progressAt, runPerform, loadQueueStats, paintQueueStats, renderProfileSelect, orderProfiles, fetchJobInstructionsFast, verifyPerformLanded, classifyPerformError, reconcilePerform,
     reconcileInflightOnEntry, loadInflight, saveInflight, clearInflight,
     fetchJobInstructions, countPickActions, prefetchGroupRecord, loadGroupRecordIfNeeded,
     get groupCache() { return _groupCache; },

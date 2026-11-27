@@ -528,6 +528,27 @@ const tick = async (k = 6) => { for (let i = 0; i < k; i++) await flush(); };
   T.paintQueueStats(null);
   eq('proxy down: says so, nothing breaks', g('mpk-q-updated'), 'Queue counts unavailable');
   delete sandbox.GM_xmlhttpRequest;
+  console.log('\n13. Summary list comes from the proxy, not the slow API');
+  let gmUrls = [];
+  sandbox.GM_xmlhttpRequest = (o) => {
+    gmUrls.push(o.url);
+    if (o.url.includes('/job-instructions?job_id=77'))
+      setImmediate(() => o.onload({ responseText: JSON.stringify({ ok: true, rows: [
+        { id: 1, reference_number: '#1', quantity: 4, job_instruction_group_id: 9 },
+        { id: 2, reference_number: '#2', quantity: 1, job_instruction_group_id: 9 }] }) }));
+    else if (o.url.includes('/job-instructions?job_id=78'))
+      setImmediate(() => o.onerror());
+  };
+  stubFetch({ 'job/job-instruction&job_id=78': [{ id: 5, reference_number: '#5', quantity: 2, job_instruction_group_id: null }] });
+  reset();
+  const fastRows = await T.fetchJobInstructions(77);
+  eq('proxy rows used', fastRows.map(r => r.id), [1, 2]);
+  eq('Canary7 list NOT called when the proxy answers', n('job/job-instruction&job_id'), 0);
+  const slowRows = await T.fetchJobInstructions(78);
+  eq('proxy down -> falls back to the Canary7 list', slowRows.map(r => r.id), [5]);
+  ok('asked the LAN proxy', gmUrls.includes('http://192.168.1.27:8790/job-instructions?job_id=77'));
+  delete sandbox.GM_xmlhttpRequest;
+
   const names = (arr) => arr.map(p => p.name);
   const PROF = [{ id: 53, name: 'Wholesale Cluster' }, { id: 48, name: 'MIBP' }, { id: 47, name: 'SIBP' },
                 { id: 40, name: 'Group 1 Clusters' }, { id: 46, name: 'Group 6 Clusters' }];
