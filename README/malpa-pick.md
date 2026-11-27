@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| Current version | **4.10.1** |
+| Current version | **4.18.2** |
 | File | `malpa-pick.user.js` (~4,650 lines, one file, pure ASCII) |
 | Runs on | `https://*.canary7.com/*` — Firefox on Android (TC51), also works on desktop |
 | Talks to | Canary7 WMS REST API at `stgauth.canary7.com` |
@@ -193,6 +193,9 @@ scan tote ─▶ onContainerScan()
 - **Don't hide other C7 tab panes with `style.display` unless we are the active tab, and restore them the moment we're not.** Angular only toggles `.active`; an inline `display:none` permanently kills the pane. See "TAB CO-EXISTENCE" comment block ~line 2300.
 - **Job is NOT unassigned if the picker closes mid-pick.** State is saved to `sessionStorage['mpk_resume']` (8h TTL) and a Resume banner appears next open.
 - **`get-job-instructions` with no `job_id` assigns a job immediately.** Don't call it casually.
+- **Never retry a perform / group-perform / pick-short blindly (4.14+).** They are not idempotent, and a group-perform runs ~0.3-0.6s per instruction server-side (PuraU MIBP, 27 Nov 2026: 100-order groups took 46-60s). Every stock write goes through `runPerform()`: busy lock, in-flight ledger in `sessionStorage['mpk_inflight']`, and on error `reconcilePerform()` reads `get-job-instructions&job_id=` to see whether Canary7 already moved on before letting the picker scan again.
+- **Never disable the scan input while busy, and never drop a scan.** A disabled input loses focus, so scans vanish; 4.13 also ignored scans during a 0.3-0.5s TRANSITIONING delay after the item scan. Since 4.14 the tote screen renders immediately and every scan is caught (repeat scans during a move are swallowed by the busy lock).
+- **Summary, queue counts and job rows come from canary7-proxy on 192.168.1.27:8790** (`/pick-queues`, `/job-instructions`, Metabase cards 1145/1146). The Metabase key lives on the VM, never in this public script. If the proxy is down the script falls back to Canary7's API (slower) or shows no queue counts.
 
 ---
 
@@ -254,7 +257,9 @@ All console output is prefixed `[MalpaPick]`.
 
 ## Testing a change before pushing
 
-There's no automated test suite. Minimum manual pass on a TC51 or desktop Firefox against staging:
+**Offline suite first:** `node malpa-pick.test.js` must print `ALL n CHECKS PASSED` (114 at 4.18.2). Section 4 reproduces the SIBP/MIBP re-scan incident: six tote scans during a slow group-perform must produce exactly one POST.
+
+Then a manual pass on a TC51 or desktop Firefox against staging:
 
 1. Open tab, close tab — other C7 tabs still clickable afterwards.
 2. Wholesale profile (method=2): enter shipment number, pick one qty=1 item and one qty>1 item, complete job.
